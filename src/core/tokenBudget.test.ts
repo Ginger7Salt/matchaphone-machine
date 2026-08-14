@@ -42,3 +42,19 @@ describe("internal token budget", () => {
     expect(fitted.removedSections).toContain("history");
   });
 });
+
+
+describe("required chat context",()=>{
+ it("keeps the actual latest user message when a protocol request is appended",()=>{
+  const items=[
+   {role:"system" as const,content:"CORE_PROTOCOL"},
+   ...Array.from({length:180},(_,index)=>({role:"assistant" as const,content:("OLD_"+index).repeat(900)})),
+   {role:"user" as const,content:"ACTUAL_LATEST_USER_MESSAGE"},
+   {role:"user" as const,content:"FINAL_JSON_CONTRACT"},
+  ];
+  const fitted=fitChatItemsToInternalBudget(items,{requiredIndexes:[items.length-2,items.length-1]});
+  expect(fitted.removed).toBeGreaterThan(0);
+  expect(fitted.items.some(item=>item.content==="ACTUAL_LATEST_USER_MESSAGE")).toBe(true);
+  expect(fitted.items.at(-1)?.content).toBe("FINAL_JSON_CONTRACT");
+ });
+});

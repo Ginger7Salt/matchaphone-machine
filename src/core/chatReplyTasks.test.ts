@@ -569,3 +569,239 @@ describe("mounted reply stickers", () => {
   });
 });
 
+
+
+describe("chat reply provider budget and lease fencing",()=>{
+ beforeEach(async()=>{
+  vi.restoreAllMocks();
+  await db.delete();
+  await db.open();
+  await setSetting("provider",provider);
+  await db.characters.add(character);
+  await db.conversations.add(privateConversation);
+ });
+ it("never makes a third provider call after two malformed responses",async()=>{
+  const fetchMock=vi.fn().mockResolvedValue(new Response(JSON.stringify({id:"unknown",metadata:{shape:true}}),{status:200,headers:{"Content-Type":"application/json"}}));
+  vi.stubGlobal("fetch",fetchMock);
+  const queued=await enqueueChatReply({conversationId:privateConversation.id,mode:"private"});
+  const claimed=await claimNextChatReplyTask();
+  await processChatReplyTask(claimed!);
+  const stored=await db.backgroundTasks.get(queued.id);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(stored?.state).toBe("failed");
+  expect((stored?.payload as any).providerCallCount).toBe(2);
+  expect((stored?.payload as any).providerCallTrace).toHaveLength(2);
+  expect(await claimNextChatReplyTask()).toBeUndefined();
+ });
+ it("shares the two-call limit across automatic task resume",async()=>{
+  const fetchMock=vi.fn().mockRejectedValue(new TypeError("offline"));
+  vi.stubGlobal("fetch",fetchMock);
+  const queued=await enqueueChatReply({conversationId:privateConversation.id,mode:"private"});
+  await processChatReplyTask((await claimNextChatReplyTask())!);
+  await db.backgroundTasks.update(queued.id,{nextAttemptAt:0});
+  await processChatReplyTask((await claimNextChatReplyTask())!);
+  const stored=await db.backgroundTasks.get(queued.id);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect((stored?.payload as any).providerCallCount).toBe(2);
+  expect(stored?.nextAttemptAt).toBe(Number.MAX_SAFE_INTEGER);
+  expect(await claimNextChatReplyTask()).toBeUndefined();
+ });
+ it("does not allow post-processing to make a third model call",async()=>{
+  await db.characters.update(character.id,{chatSettings:{...(character.chatSettings as any),strategyMode:{enabled:true}} as any,updatedAt:t+1});
+  await db.messages.add({id:"source",schemaVersion:SCHEMA_VERSION,createdAt:t+2,updatedAt:t+2,conversationId:privateConversation.id,senderType:"user",content:"hello",status:"complete"} as Message);
+  const turn=JSON.stringify({messages:[{content:"\u4f60\u597d"},{content:"\u518d\u8bf4\u4e00\u53e5"}],innerVoice:{sections:{physicalState:"\u547c\u5438\u5e73\u7a33",emotionAndMind:"\u6b63\u5728\u601d\u8003",unspokenWords:"\u8fd8\u6709\u8bdd\u60f3\u8bf4",selfDeception:"\u5047\u88c5\u4e0d\u5728\u610f",triggeredMemory:"\u60f3\u8d77\u4e00\u4ef6\u5c0f\u4e8b",angelThought:"\u6e29\u548c\u4e00\u70b9",devilThought:"\u76f4\u63a5\u4e00\u70b9"},continuity:{emotion:"\u5e73\u9759"}}});
+  const fetchMock=vi.fn()
+   .mockResolvedValueOnce(new Response(JSON.stringify({id:"unknown"}),{status:200,headers:{"Content-Type":"application/json"}}))
+   .mockResolvedValueOnce(new Response(JSON.stringify({choices:[{message:{content:turn}}]}),{status:200,headers:{"Content-Type":"application/json"}}))
+   .mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:'{"intimacyDelta":0,"trustDelta":0,"reason":"ok"}'}}]}),{status:200,headers:{"Content-Type":"application/json"}}));
+  vi.stubGlobal("fetch",fetchMock);
+  const queued=await enqueueChatReply({conversationId:privateConversation.id,mode:"private"});
+  await processChatReplyTask((await claimNextChatReplyTask())!);
+  await new Promise(resolve=>setTimeout(resolve,100));
+  const stored=await db.backgroundTasks.get(queued.id);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect((stored?.payload as any).providerCallCount).toBe(2);
+  expect(stored?.state).toBe("completed");
+ });
+  it("lazily preserves legacy group call usage without a Dexie migration", async () => {
+    await db.conversations.add(groupConversation);
+    const completeTurn = JSON.stringify({
+      messages: [{ content: "你好" }],
+      innerVoice: {
+        sections: {
+          physicalState: "呼吸平稳",
+          emotionAndMind: "正在思考",
+          unspokenWords: "还有话想说",
+          selfDeception: "假装不在意",
+          triggeredMemory: "想起一件小事",
+          angelThought: "温和一点",
+          devilThought: "直接一点",
+        },
+        continuity: { emotion: "平静" },
+      },
+    });
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
+      new Response(JSON.stringify({ choices: [{ message: { content: completeTurn } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    const queued = await enqueueChatReply({
+      conversationId: groupConversation.id,
+      mode: "group",
+      speakerOrder: [character.id],
+    });
+    const legacyPayload = { ...(queued.payload as any) };
+    delete legacyPayload.groupProviderCallBudgets;
+    legacyPayload.providerCallCount = 1;
+    legacyPayload.providerCallTrace = [{
+      ordinal: 1,
+      purpose: "generation",
+      state: "failed",
+      errorKind: "network",
+      providerCode: "network_error",
+    }];
+    await db.backgroundTasks.update(queued.id, { payload: legacyPayload });
+    await processChatReplyTask((await claimNextChatReplyTask())!);
+    const stored = await db.backgroundTasks.get(queued.id);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(stored?.state).toBe("completed");
+    expect((stored?.payload as any).groupProviderCallBudgets[character.id]).toMatchObject({
+      providerCallCount: 2,
+      state: "completed",
+    });
+    expect((stored?.payload as any).groupProviderCallBudgets[character.id].providerCallTrace).toHaveLength(2);
+  });
+  it("gives every group speaker an independent two-call budget", async () => {
+    const character2 = { ...character, id: "c2", name: "角色二", createdAt: t + 1, updatedAt: t + 1 } as Character;
+    const character3 = { ...character, id: "c3", name: "角色三", createdAt: t + 2, updatedAt: t + 2 } as Character;
+    await db.characters.bulkAdd([character2, character3]);
+    await db.conversations.add({ ...groupConversation, memberIds: [character.id, character2.id, character3.id] });
+    const completeTurn = JSON.stringify({
+      messages: [{ content: "你好" }, { content: "再说一句" }],
+      innerVoice: {
+        sections: {
+          physicalState: "呼吸平稳",
+          emotionAndMind: "正在思考",
+          unspokenWords: "还有话想说",
+          selfDeception: "假装不在意",
+          triggeredMemory: "想起一件小事",
+          angelThought: "温和一点",
+          devilThought: "直接一点",
+        },
+        continuity: { emotion: "平静" },
+      },
+    });
+    const response = (content: string) => new Response(
+      JSON.stringify({ choices: [{ message: { content } }] }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response('{"messages":['))
+      .mockImplementation(() => Promise.resolve(response(completeTurn)));
+    vi.stubGlobal("fetch", fetchMock);
+    const queued = await enqueueChatReply({
+      conversationId: groupConversation.id,
+      mode: "group",
+      speakerOrder: [character.id, character2.id, character3.id],
+    });
+    await processChatReplyTask((await claimNextChatReplyTask())!);
+    const stored = await db.backgroundTasks.get(queued.id);
+    const budgets = (stored?.payload as any).groupProviderCallBudgets;
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(stored?.state).toBe("completed");
+    expect((stored?.payload as any).providerCallCount).toBe(0);
+    expect(budgets[character.id]).toMatchObject({ providerCallLimit: 2, providerCallCount: 2, state: "completed" });
+    expect(budgets[character2.id]).toMatchObject({ providerCallLimit: 2, providerCallCount: 1, state: "completed" });
+    expect(budgets[character3.id]).toMatchObject({ providerCallLimit: 2, providerCallCount: 1, state: "completed" });
+    expect(budgets[character.id].providerCallTrace).toHaveLength(2);
+    expect(budgets[character2.id].providerCallTrace).toHaveLength(1);
+    expect(budgets[character3.id].providerCallTrace).toHaveLength(1);
+  });
+  it("keeps completed group speakers and their budgets across automatic resume", async () => {
+    const character2 = { ...character, id: "c2", name: "角色二", createdAt: t + 1, updatedAt: t + 1 } as Character;
+    await db.characters.add(character2);
+    await db.conversations.add({
+      ...groupConversation,
+      memberIds: [character.id, character2.id],
+    });
+    const completeTurn = JSON.stringify({
+      messages: [{ content: "你好" }, { content: "再说一句" }],
+      innerVoice: {
+        sections: {
+          physicalState: "呼吸平稳",
+          emotionAndMind: "正在思考",
+          unspokenWords: "还有话想说",
+          selfDeception: "假装不在意",
+          triggeredMemory: "想起一件小事",
+          angelThought: "温和一点",
+          devilThought: "直接一点",
+        },
+        continuity: { emotion: "平静" },
+      },
+    });
+    const response = () => new Response(
+      JSON.stringify({ choices: [{ message: { content: completeTurn } }] }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(response()))
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockImplementation(() => Promise.resolve(response()));
+    vi.stubGlobal("fetch", fetchMock);
+    const queued = await enqueueChatReply({
+      conversationId: groupConversation.id,
+      mode: "group",
+      speakerOrder: [character.id, character2.id],
+    });
+    await processChatReplyTask((await claimNextChatReplyTask())!);
+    let stored = await db.backgroundTasks.get(queued.id);
+    expect(stored?.state).toBe("failed");
+    expect((stored?.payload as any).nextSpeakerIndex).toBe(1);
+    expect((stored?.payload as any).groupProviderCallBudgets[character.id]).toMatchObject({
+      providerCallCount: 1,
+      state: "completed",
+    });
+    const firstSpeakerIdsBeforeResume = (
+      await db.messages.where("conversationId").equals(groupConversation.id).toArray()
+    )
+      .filter((message) => message.senderId === character.id)
+      .map((message) => message.id)
+      .sort();
+    await db.backgroundTasks.update(queued.id, { nextAttemptAt: 0 });
+    await processChatReplyTask((await claimNextChatReplyTask())!);
+    stored = await db.backgroundTasks.get(queued.id);
+    const budgets = (stored?.payload as any).groupProviderCallBudgets;
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(stored?.state).toBe("completed");
+    expect(budgets[character.id]).toMatchObject({ providerCallCount: 1, state: "completed" });
+    expect(budgets[character2.id]).toMatchObject({ providerCallCount: 2, state: "completed" });
+    const rows = await db.messages.where("conversationId").equals(groupConversation.id).toArray();
+    const firstSpeakerRows = rows.filter((message) => message.senderId === character.id);
+    const resumedSpeakerRows = rows.filter((message) => message.senderId === character2.id);
+    expect(firstSpeakerRows.map((message) => message.id).sort()).toEqual(firstSpeakerIdsBeforeResume);
+    expect(firstSpeakerRows.every((message) => message.status === "complete")).toBe(true);
+    expect(resumedSpeakerRows.length).toBeGreaterThan(0);
+    expect(resumedSpeakerRows.every((message) => message.status === "complete")).toBe(true);
+  });
+  it("rejects stale lease generations before they can call or save",async()=>{
+  const turn=JSON.stringify({messages:[{content:"\u4f60\u597d"},{content:"\u518d\u8bf4\u4e00\u53e5"}],innerVoice:{sections:{physicalState:"\u547c\u5438\u5e73\u7a33",emotionAndMind:"\u6b63\u5728\u601d\u8003",unspokenWords:"\u8fd8\u6709\u8bdd\u60f3\u8bf4",selfDeception:"\u5047\u88c5\u4e0d\u5728\u610f",triggeredMemory:"\u60f3\u8d77\u4e00\u4ef6\u5c0f\u4e8b",angelThought:"\u6e29\u548c\u4e00\u70b9",devilThought:"\u76f4\u63a5\u4e00\u70b9"},continuity:{emotion:"\u5e73\u9759"}}});
+  const fetchMock=vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:turn}}]}),{status:200,headers:{"Content-Type":"application/json"}}));
+  vi.stubGlobal("fetch",fetchMock);
+  const queued=await enqueueChatReply({conversationId:privateConversation.id,mode:"private"});
+  const stale=(await claimNextChatReplyTask())!;
+  await db.backgroundTasks.update(queued.id,{leaseExpiresAt:0});
+  const current=(await claimNextChatReplyTask())!;
+  expect(current.leaseGeneration).toBeGreaterThan(stale.leaseGeneration??0);
+  await processChatReplyTask(stale);
+  expect(fetchMock).not.toHaveBeenCalled();
+  await processChatReplyTask(current);
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const stored=await db.backgroundTasks.get(queued.id);
+  const reply=await db.messages.get(queued.entityId);
+  expect(stored?.state).toBe("completed");
+  expect(reply).toMatchObject({status:"complete",content:"\u4f60\u597d"});
+  expect(reply?.innerVoice).toBeTruthy();
+ });
+});

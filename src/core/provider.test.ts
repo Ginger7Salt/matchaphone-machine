@@ -140,3 +140,12 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
  });
 
 });
+
+
+describe("chat timeout override",()=>{
+ it("allows chat tasks to disable the provider-owned timeout",async()=>{
+  const slowSettings={...settings,timeoutMs:1};
+  vi.stubGlobal("fetch",vi.fn().mockImplementation(()=>new Promise(resolve=>setTimeout(()=>resolve(new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})),20))));
+  await expect(new OpenAIProvider(slowSettings).chat([{role:"user",content:"hi"}],{stream:false,timeoutMs:null})).resolves.toBe("OK");
+ });
+});

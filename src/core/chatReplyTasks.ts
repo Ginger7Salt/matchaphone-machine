@@ -15,12 +15,16 @@ import { forumInteropContextForChat } from "./forum";
 import { chatSettingsOf } from "./character";
 import { canCharacterInteract } from "./conversationSettings";
 import { conversationInnerVoiceEnabled, createMessageInnerVoice, innerVoiceContinuityContext, type GeneratedInnerVoice } from "./innerVoice";
-import {
-  prepareRoleplayResources,
-  reviewCharacterReply,
-} from "./personaEngine";
+import { reviewCharacterReply } from "./personaEngine";
 import { resolveSecondaryProvider } from "./modelServices";
-import { apiErrorInfoOf, createApiErrorInfo, ProviderError } from "./provider";
+import {
+  apiErrorInfoOf,
+  createApiErrorInfo,
+  OpenAIProvider,
+  ProviderError,
+  type ProviderChatInvoker,
+  type ProviderChatResult,
+} from "./provider";
 import { groupActors, type GroupActor } from "./groupNpcs";
 import {
   generateCharacterReplyTurn,
@@ -49,6 +53,9 @@ import {
   type AppSettings,
   type BackgroundTask,
   type Character,
+  type ChatGroupProviderCallBudget,
+  type ChatProviderCallPurpose,
+  type ChatProviderCallTrace,
   type ChatReplyTaskPayload,
   type Conversation,
   type LoreBook,
@@ -61,7 +68,9 @@ import {
 } from "./types";
 
 const CHAT_REPLY_LEASE_MS = 30_000;
+const CHAT_PROVIDER_CALL_LIMIT = 2 as const;
 const AUTO_RESUME_DELAY_MS = 2_000;
+const CHAT_REPLY_OWNER_ID = uid();
 const activeControllers = new Map<string, AbortController>();
 export type ChatReplyGuidance = {
   reasons: RegenerationReason[];
@@ -94,6 +103,206 @@ function emit() {
 }
 function taskPayload(task: BackgroundTask) {
   return task.payload as ChatReplyTaskPayload;
+}
+class ChatReplyLeaseLostError extends Error {
+  constructor() {
+    super("聊天回复任务已由其他页面接管");
+    this.name = "ChatReplyLeaseLostError";
+  }
+}
+function taskOwnsLease(stored: BackgroundTask | undefined, claimed: BackgroundTask) {
+  return Boolean(
+    stored &&
+      stored.state === "running" &&
+      stored.leaseOwnerId === claimed.leaseOwnerId &&
+      stored.leaseGeneration === claimed.leaseGeneration,
+  );
+}
+function taskOwnsExecution(
+  stored: BackgroundTask | undefined,
+  claimed: BackgroundTask,
+  allowCompleted = false,
+) {
+  return Boolean(
+    stored &&
+      (stored.state === "running" || (allowCompleted && stored.state === "completed")) &&
+      stored.leaseOwnerId === claimed.leaseOwnerId &&
+      stored.leaseGeneration === claimed.leaseGeneration,
+  );
+}
+async function assertTaskLease(task: BackgroundTask) {
+  const stored = await db.backgroundTasks.get(task.id);
+  if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
+  return stored!;
+}
+function providerBudgetError(actorId?: string) {
+  return new ProviderError(
+    "format",
+    actorId
+      ? "该群聊角色本轮模型调用已达到两次上限，请手动重试该角色回复"
+      : "本轮模型调用已达到两次上限，请手动重试新一轮生成",
+    "",
+    createApiErrorInfo("format", { providerCode: "call_budget_exhausted" }),
+  );
+}
+function groupBudgetOf(
+  payload: ChatReplyTaskPayload,
+  actorId: string,
+): ChatGroupProviderCallBudget {
+  const current = payload.groupProviderCallBudgets?.[actorId];
+  if (current) return current;
+  const legacyCount = payload.groupProviderCallBudgets
+    ? 0
+    : Math.min(payload.providerCallCount ?? 0, CHAT_PROVIDER_CALL_LIMIT);
+  return {
+    providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
+    providerCallCount: legacyCount,
+    providerCallTrace: legacyCount ? (payload.providerCallTrace ?? []) : [],
+    state: "pending",
+  };
+}
+async function reserveProviderCall(
+  task: BackgroundTask,
+  purpose: ChatProviderCallPurpose,
+  allowCompleted = false,
+  actorId?: string,
+) {
+  let ordinal: 1 | 2 | undefined;
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsExecution(stored, task, allowCompleted))
+      throw new ChatReplyLeaseLostError();
+    const payload = taskPayload(stored!);
+    if (payload.mode === "group") {
+      if (!actorId)
+        throw new ProviderError(
+          "format",
+          "群聊模型调用缺少角色预算标识",
+          "",
+          createApiErrorInfo("format", { providerCode: "missing_group_call_scope" }),
+        );
+      const budget = groupBudgetOf(payload, actorId);
+      if (budget.providerCallCount >= budget.providerCallLimit)
+        throw providerBudgetError(actorId);
+      ordinal = (budget.providerCallCount + 1) as 1 | 2;
+      const nextBudget: ChatGroupProviderCallBudget = {
+        ...budget,
+        providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
+        providerCallCount: ordinal,
+        providerCallTrace: [
+          ...budget.providerCallTrace,
+          { ordinal, purpose, state: "started" as const },
+        ].slice(-CHAT_PROVIDER_CALL_LIMIT),
+        leaseGeneration: stored!.leaseGeneration,
+        state: "running",
+      };
+      const nextPayload: ChatReplyTaskPayload = {
+        ...payload,
+        groupProviderCallBudgets: {
+          ...(payload.groupProviderCallBudgets ?? {}),
+          [actorId]: nextBudget,
+        },
+      };
+      await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
+      task.payload = nextPayload;
+      return;
+    }
+    const count = payload.providerCallCount ?? 0;
+    if (count >= (payload.providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT))
+      throw providerBudgetError();
+    ordinal = (count + 1) as 1 | 2;
+    const trace: ChatProviderCallTrace[] = [
+      ...(payload.providerCallTrace ?? []),
+      { ordinal, purpose, state: "started" as const },
+    ].slice(-CHAT_PROVIDER_CALL_LIMIT);
+    const nextPayload: ChatReplyTaskPayload = {
+      ...payload,
+      providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
+      providerCallCount: ordinal,
+      providerCallTrace: trace,
+    };
+    await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
+    task.payload = nextPayload;
+  });
+  if (!ordinal) throw providerBudgetError(actorId);
+  return ordinal;
+}
+async function finishProviderCall(
+  task: BackgroundTask,
+  ordinal: 1 | 2,
+  result: ProviderChatResult | undefined,
+  error?: unknown,
+  allowCompleted = false,
+  actorId?: string,
+) {
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsExecution(stored, task, allowCompleted))
+      throw new ChatReplyLeaseLostError();
+    const payload = taskPayload(stored!);
+    const finishTrace = (trace: ChatProviderCallTrace[]) =>
+      trace.map((entry) =>
+        entry.ordinal !== ordinal
+          ? entry
+          : {
+              ...entry,
+              state: error
+                ? error instanceof ProviderError && error.kind === "aborted"
+                  ? "aborted"
+                  : "failed"
+                : "completed",
+              responseShape: result?.responseShape,
+              rawLength: result?.rawLength,
+              finishReason: result?.finishReason,
+              errorKind: error instanceof ProviderError ? error.kind : error ? "unknown" : undefined,
+              providerCode: error instanceof ProviderError ? error.apiError?.providerCode : undefined,
+            },
+      ) satisfies ChatProviderCallTrace[];
+    let nextPayload: ChatReplyTaskPayload;
+    if (payload.mode === "group") {
+      if (!actorId) throw new ChatReplyLeaseLostError();
+      const budget = groupBudgetOf(payload, actorId);
+      nextPayload = {
+        ...payload,
+        groupProviderCallBudgets: {
+          ...(payload.groupProviderCallBudgets ?? {}),
+          [actorId]: {
+            ...budget,
+            providerCallTrace: finishTrace(budget.providerCallTrace),
+            leaseGeneration: stored!.leaseGeneration,
+          },
+        },
+      };
+    } else {
+      nextPayload = {
+        ...payload,
+        providerCallTrace: finishTrace(payload.providerCallTrace ?? []),
+      };
+    }
+    await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
+    task.payload = nextPayload;
+  });
+}
+function providerInvokerForTask(
+  task: BackgroundTask,
+  allowCompleted = false,
+  actorId?: string,
+): ProviderChatInvoker {
+  return async (settings, messages, options, purpose) => {
+    const ordinal = await reserveProviderCall(task, purpose, allowCompleted, actorId);
+    try {
+      const result = await new OpenAIProvider(settings).chatWithMeta(messages, {
+        ...options,
+        timeoutMs: null,
+      });
+      await finishProviderCall(task, ordinal, result, undefined, allowCompleted, actorId);
+      if (!allowCompleted) await updatePhase(task, "parsing");
+      return result;
+    } catch (error) {
+      await finishProviderCall(task, ordinal, undefined, error, allowCompleted, actorId).catch(() => {});
+      throw error;
+    }
+  };
 }
 function isStickerMessage(message: Message | undefined) {
   return Boolean(
@@ -172,7 +381,7 @@ function replyStickerMessage(input: {
       speakerTurnId: input.speakerTurnId,
       segmentIndex: input.segmentIndex,
       taskEventId: task.eventId,
-      phase: "post-processing",
+      phase: "completed",
       attempt: task.attempts,
       lastProgressAt: input.createdAt,
     },
@@ -370,7 +579,10 @@ export async function ensureRunnableChatReplyTask(
     phase: "queued",
     autoResumeCount: 0,
     generationCycle: 1,
+    providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
     providerCallCount: 0,
+    providerCallTrace: [],
+    groupProviderCallBudgets: input.mode === "group" ? {} : undefined,
     originalMessage: target && !originalMessages ? { ...target } : undefined,
     originalMessages: originalMessages?.map((message) => ({ ...message })),
   };
@@ -424,14 +636,30 @@ export async function ensureRunnableChatReplyTask(
           const shouldRequeue = existing.state === "failed" ||
             (existing.state === "running" && !activeLease) ||
             existing.nextAttemptAt > t;
+          const startsNewCycle =
+            existing.state === "failed" ||
+            (existing.state === "running" && !activeLease);
           const nextPayload: ChatReplyTaskPayload = {
             ...existingPayload,
             phase: activeLease ? existingPayload.phase : "queued",
             cancelled: false,
-            lastApiError: activeLease ? existingPayload.lastApiError : undefined,
-            generationCycle: activeLease ? (existingPayload.generationCycle ?? 1) : (existingPayload.generationCycle ?? 1) + 1,
-            providerCallCount: activeLease ? (existingPayload.providerCallCount ?? 0) : 0,
-            failureStage: activeLease ? existingPayload.failureStage : undefined,
+            lastApiError: startsNewCycle ? undefined : existingPayload.lastApiError,
+            generationCycle: startsNewCycle
+              ? (existingPayload.generationCycle ?? 1) + 1
+              : (existingPayload.generationCycle ?? 1),
+            providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
+            providerCallCount: startsNewCycle
+              ? 0
+              : (existingPayload.providerCallCount ?? 0),
+            providerCallTrace: startsNewCycle
+              ? []
+              : (existingPayload.providerCallTrace ?? []),
+            groupProviderCallBudgets: startsNewCycle
+              ? existingPayload.mode === "group"
+                ? {}
+                : undefined
+              : existingPayload.groupProviderCallBudgets,
+            failureStage: startsNewCycle ? undefined : existingPayload.failureStage,
           };
           const nextTask: BackgroundTask = {
             ...existing,
@@ -439,6 +667,8 @@ export async function ensureRunnableChatReplyTask(
             state: activeLease ? "running" : "pending",
             nextAttemptAt: activeLease ? existing.nextAttemptAt : t,
             leaseExpiresAt: activeLease ? existing.leaseExpiresAt : undefined,
+            leaseOwnerId: activeLease ? existing.leaseOwnerId : undefined,
+            leaseGeneration: existing.leaseGeneration,
             lastError: activeLease ? existing.lastError : undefined,
             attempts: activeLease ? existing.attempts : 0,
             updatedAt: t,
@@ -495,44 +725,40 @@ export async function ensureRunnableChatReplyTask(
 export async function enqueueChatReply(input: EnqueueChatReplyInput) {
   return (await ensureRunnableChatReplyTask(input)).task;
 }
-async function recordProviderAttempt(task: BackgroundTask, attempt: number) {
-  const payload = {
-    ...taskPayload(task),
-    providerCallCount: Math.max(taskPayload(task).providerCallCount ?? 0, attempt),
-  };
-  task.payload = payload;
-  task.updatedAt = now();
-  await db.backgroundTasks.update(task.id, { payload, updatedAt: task.updatedAt });
-}
 async function updatePhase(
   task: BackgroundTask,
   phase: ChatReplyTaskPayload["phase"],
   messageId?: string,
 ) {
-  const t = now(),
-    payload = { ...taskPayload(task), phase };
-  task.payload = payload;
-  task.updatedAt = t;
-  task.leaseExpiresAt = t + CHAT_REPLY_LEASE_MS;
-  await db.backgroundTasks.update(task.id, {
-    payload,
-    updatedAt: t,
-    leaseExpiresAt: task.leaseExpiresAt,
+  const t = now();
+  await db.transaction("rw", [db.backgroundTasks, db.messages], async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
+    const payload = { ...taskPayload(stored!), phase };
+    const leaseExpiresAt = t + CHAT_REPLY_LEASE_MS;
+    await db.backgroundTasks.update(task.id, {
+      payload,
+      updatedAt: t,
+      leaseExpiresAt,
+    });
+    task.payload = payload;
+    task.updatedAt = t;
+    task.leaseExpiresAt = leaseExpiresAt;
+    const id = messageId ?? payload.outputMessageId;
+    if (id) {
+      const message = await db.messages.get(id);
+      if (message)
+        await db.messages.update(id, {
+          generation: {
+            ...message.generation!,
+            phase,
+            lastProgressAt: t,
+            attempt: task.attempts,
+          },
+          updatedAt: t,
+        });
+    }
   });
-  const id = messageId ?? payload.outputMessageId;
-  if (id) {
-    const message = await db.messages.get(id);
-    if (message)
-      await db.messages.update(id, {
-        generation: {
-          ...message.generation!,
-          phase,
-          lastProgressAt: t,
-          attempt: task.attempts,
-        },
-        updatedAt: t,
-      });
-  }
   emit();
 }
 async function memoryRecall(
@@ -637,6 +863,7 @@ async function loadTaskData(task: BackgroundTask) {
   };
 }
 async function postProcessPrivate(input: {
+  task: BackgroundTask;
   character: Character;
   conversation: Conversation;
   provider: ProviderSettings;
@@ -653,6 +880,7 @@ async function postProcessPrivate(input: {
   presence: ChatPresenceContext;
 }) {
   const {
+    task,
     character,
     conversation,
     provider,
@@ -668,11 +896,10 @@ async function postProcessPrivate(input: {
     mediaAssets,
     presence,
   } = input;
+  const invokeProvider = providerInvokerForTask(task, true);
   let latest = character;
   let shouldConfess = false;
-  const auxiliary = await resolveSecondaryProvider(provider).catch(
-    () => provider,
-  );
+  const auxiliary = await resolveSecondaryProvider(provider).catch(() => provider);
   if (source && chatSettingsOf(latest).strategyMode.enabled)
     try {
       const evaluated = await evaluateStrategyInteraction({
@@ -682,6 +909,7 @@ async function postProcessPrivate(input: {
         messages,
         characters,
         provider: auxiliary,
+        invokeProvider,
       });
       latest = evaluated.character;
       shouldConfess = evaluated.shouldConfess;
@@ -692,12 +920,13 @@ async function postProcessPrivate(input: {
       "chat:" + source.id + ":" + latest.id,
     ).catch(() => {});
   await Promise.allSettled([
-    maybeAttachCharacterVoice({ character: latest, messageIds, provider }),
+    maybeAttachCharacterVoice({ character: latest, messageIds, provider, invokeProvider }),
     decidePendingTransfer({
       messages,
       character: latest,
       provider: auxiliary,
       replyText: reply,
+      invokeProvider,
     }),
     source
       ? maybeCreateCharacterCommerce({
@@ -707,6 +936,7 @@ async function postProcessPrivate(input: {
           userText: source.content,
           replyText: reply,
           provider: auxiliary,
+          invokeProvider,
         })
       : Promise.resolve(null),
     source
@@ -717,12 +947,6 @@ async function postProcessPrivate(input: {
           replyText: reply,
         })
       : Promise.resolve(null),
-    prepareRoleplayResources({
-      character: latest,
-      conversation,
-      loreBooks,
-      provider,
-    }),
   ]);
   if (shouldConfess)
     try {
@@ -738,8 +962,7 @@ async function postProcessPrivate(input: {
           messages: currentMessages,
           loreBooks,
           memories,
-          userText:
-            "\u5728\u6b63\u5e38\u56de\u590d\u4e4b\u540e\uff0c\u4ee5\u89d2\u8272\u8eab\u4efd\u5b8c\u6210\u9996\u6b21\u771f\u8bda\u8868\u767d\u3002",
+          userText: "Complete the first sincere confession naturally after the normal reply.",
           settings,
           provider,
           mediaAssets,
@@ -751,6 +974,7 @@ async function postProcessPrivate(input: {
           character: latest,
           context: ctx,
           provider,
+          invokeProvider,
         }),
         review = await reviewCharacterReply({
           character: latest,
@@ -764,6 +988,7 @@ async function postProcessPrivate(input: {
           settings,
           provider,
           presence,
+          invokeProvider,
         });
       const confessionValidation = validateLocalCharacterReply({
         messages: review.revisedMessages,
@@ -771,12 +996,7 @@ async function postProcessPrivate(input: {
         presence,
       });
       if (confessionValidation.issues.length)
-        throw new ProviderError(
-          "format",
-          confessionValidation.issues.includes("remote-presence")
-            ? "表白回复仍违反线上聊天距离约束"
-            : "表白回复仍不符合本地格式要求",
-        );
+        throw new ProviderError("format", "Confession reply failed local validation");
       await saveConfessionMessages({
         characterId: latest.id,
         conversationId: conversation.id,
@@ -836,7 +1056,7 @@ async function savePrivateParts(
           speakerTurnId: turnId,
           segmentIndex: index,
           taskEventId: task.eventId,
-          phase: "post-processing",
+          phase: "completed",
           attempt: task.attempts,
           startedAt: first?.generation?.startedAt,
           lastProgressAt: base + index,
@@ -868,19 +1088,56 @@ async function savePrivateParts(
         segmentIndex: rows.length,
       }),
     );
-  await db.transaction("rw", [db.messages, db.conversations], async () => {
-    await db.messages.put(rows[0]);
-    if (rows.length > 1) await db.messages.bulkAdd(rows.slice(1));
-    await db.conversations.update(task.conversationId!, {
-      lastActivityAt: base + rows.length - 1,
-      updatedAt: base + rows.length - 1,
-    });
-  });
-  const savedFirst = await db.messages.get(firstId);
-  if (!savedFirst || savedFirst.status !== "complete" || !savedFirst.content.trim())
-    throw new Error("角色回复写入本地数据库后校验失败");
-  if (innerVoice && !savedFirst.innerVoice)
-    throw new Error("角色心声写入本地数据库后校验失败");  return rows;
+  if (!parts.length || parts.some((part) => !part.content.trim()))
+    throw new ProviderError("format", "角色回复正文不完整");
+  if (!innerVoice)
+    throw new ProviderError(
+      "format",
+      "角色心声缺失，整轮回复不会保存",
+      "",
+      createApiErrorInfo("format", {
+        providerCode: "missing_inner_voice",
+        failureStage: "inner-voice",
+      }),
+    );
+  let completedPayload: ChatReplyTaskPayload | undefined;
+  await db.transaction(
+    "rw",
+    [db.messages, db.conversations, db.backgroundTasks],
+    async () => {
+      const storedTask = await db.backgroundTasks.get(task.id);
+      if (!taskOwnsLease(storedTask, task)) throw new ChatReplyLeaseLostError();
+      await db.messages.bulkPut(rows);
+      await db.conversations.update(task.conversationId!, {
+        lastActivityAt: base + rows.length - 1,
+        updatedAt: base + rows.length - 1,
+      });
+      const savedRows = await db.messages.bulkGet(rows.map((row) => row.id));
+      const savedFirst = savedRows[0];
+      if (savedRows.some((row) => !row || row.status !== "complete" || !row.content.trim()))
+        throw new Error("角色回复写入本地数据库后校验失败");
+      if (!savedFirst?.innerVoice)
+        throw new Error("角心声写入本地数据库后校验失败");
+      completedPayload = {
+        ...taskPayload(storedTask!),
+        phase: "completed",
+        lastApiError: undefined,
+        failureStage: undefined,
+      };
+      await db.backgroundTasks.put({
+        ...storedTask!,
+        payload: completedPayload,
+        state: "completed",
+        leaseExpiresAt: undefined,
+        updatedAt: base + rows.length - 1,
+      });
+    },
+  );
+  task.payload = completedPayload ?? task.payload;
+  task.state = "completed";
+  task.leaseExpiresAt = undefined;
+  emit();
+  return rows;
 }
 async function processPrivate(
   task: BackgroundTask,
@@ -1005,7 +1262,8 @@ async function processPrivate(
       name,
       description,
     })),
-    (attempt) => recordProviderAttempt(task, attempt),
+    undefined,
+    providerInvokerForTask(task),
     );
     let parts = generatedTurn.parts,
     innerVoice: GeneratedInnerVoice | undefined = generatedTurn.innerVoice;
@@ -1038,6 +1296,7 @@ async function processPrivate(
         presence,
         crossModeContinuity,
         signal: controller.signal,
+        invokeProvider: providerInvokerForTask(task),
       }),
       revised = review.revisedMessages.map((content, index) => ({
         content,
@@ -1081,6 +1340,7 @@ async function processPrivate(
           : "审查后的角色回复仍不符合本地格式要求",
       );
   }
+  await updatePhase(task, "saving");
   const selectedSticker = generatedTurn.stickerId
       ? replyStickers.find((sticker) => sticker.id === generatedTurn.stickerId)
       : undefined,
@@ -1094,15 +1354,21 @@ async function processPrivate(
     ),
     textRows = rows.filter((row) => !isStickerMessage(row)),
     reply = textRows.map((row) => row.content).join("\n\n");
-  if (generatedTurn.musicAction)
-    await executeCharacterMusicAction({ conversationId: conversation.id, characterId: character.id, action: generatedTurn.musicAction });
-  if (generatedTurn.islandAction)
-    await executeCharacterIslandAction({ conversationId: conversation.id, characterId: character.id, action: generatedTurn.islandAction });
-  else if (islandContext?.pendingInvitation)
-    await respondCoupleIslandInvitation(islandContext.pendingInvitation.id, "accept");
-  if (source?.senderType === "user") await rewardIslandChat(conversation.id, character.id, source.id);
-  await completeTask(task);
+  void Promise.allSettled([
+    generatedTurn.musicAction
+      ? executeCharacterMusicAction({ conversationId: conversation.id, characterId: character.id, action: generatedTurn.musicAction })
+      : Promise.resolve(),
+    generatedTurn.islandAction
+      ? executeCharacterIslandAction({ conversationId: conversation.id, characterId: character.id, action: generatedTurn.islandAction })
+      : islandContext?.pendingInvitation
+        ? respondCoupleIslandInvitation(islandContext.pendingInvitation.id, "accept")
+        : Promise.resolve(),
+    source?.senderType === "user"
+      ? rewardIslandChat(conversation.id, character.id, source.id)
+      : Promise.resolve(),
+  ]);
   void postProcessPrivate({
+    task,
     character,
     conversation,
     provider,
@@ -1126,6 +1392,8 @@ async function saveGroupParts(
   provider: ProviderSettings,
   innerVoice?: GeneratedInnerVoice,
   sticker?: StickerItem,
+  complete = false,
+  nextSpeakerIndex?: number,
 ) {
   const payload = taskPayload(task),
     base = now(),
@@ -1165,7 +1433,7 @@ async function saveGroupParts(
         speakerTurnId: turnId,
         segmentIndex: index,
         taskEventId: task.eventId,
-        phase: "post-processing",
+        phase: "completed",
         attempt: task.attempts,
         startedAt: first?.generation?.startedAt,
         lastProgressAt: base + index,
@@ -1186,14 +1454,65 @@ async function saveGroupParts(
         segmentIndex: rows.length,
       }),
     );
-  await db.transaction("rw", [db.messages, db.conversations], async () => {
-    await db.messages.put(rows[0]);
-    if (rows.length > 1) await db.messages.bulkAdd(rows.slice(1));
-    await db.conversations.update(task.conversationId!, {
-      lastActivityAt: base + rows.length - 1,
-      updatedAt: base + rows.length - 1,
-    });
-  });
+  if (!parts.length || parts.some((part) => !part.content.trim()))
+    throw new ProviderError("format", "???????????");
+  if ((payload.innerVoiceRequired ?? true) && !innerVoice)
+    throw new ProviderError(
+      "format",
+      "???????????????????",
+      "",
+      createApiErrorInfo("format", {
+        providerCode: "missing_inner_voice",
+        failureStage: "inner-voice",
+      }),
+    );
+  let nextPayload: ChatReplyTaskPayload | undefined;
+  await db.transaction(
+    "rw",
+    [db.messages, db.conversations, db.backgroundTasks],
+    async () => {
+      const storedTask = await db.backgroundTasks.get(task.id);
+      if (!taskOwnsLease(storedTask, task)) throw new ChatReplyLeaseLostError();
+      await db.messages.bulkPut(rows);
+      await db.conversations.update(task.conversationId!, {
+        lastActivityAt: base + rows.length - 1,
+        updatedAt: base + rows.length - 1,
+      });
+      const savedRows = await db.messages.bulkGet(rows.map((row) => row.id));
+      if (savedRows.some((row) => !row || row.status !== "complete" || !row.content.trim()))
+        throw new Error("??????????????????");
+      const storedPayload = taskPayload(storedTask!);
+      const speakerBudget = groupBudgetOf(storedPayload, speaker.id);
+      nextPayload = {
+        ...storedPayload,
+        nextSpeakerIndex,
+        phase: complete ? "completed" : "post-processing",
+        lastApiError: undefined,
+        failureStage: undefined,
+        groupProviderCallBudgets: {
+          ...(storedPayload.groupProviderCallBudgets ?? {}),
+          [speaker.id]: {
+            ...speakerBudget,
+            leaseGeneration: storedTask!.leaseGeneration,
+            state: "completed",
+          },
+        },
+      };
+      await db.backgroundTasks.put({
+        ...storedTask!,
+        payload: nextPayload,
+        state: complete ? "completed" : "running",
+        leaseExpiresAt: complete ? undefined : storedTask!.leaseExpiresAt,
+        updatedAt: base + rows.length - 1,
+      });
+    },
+  );
+  task.payload = nextPayload ?? task.payload;
+  if (complete) {
+    task.state = "completed";
+    task.leaseExpiresAt = undefined;
+  }
+  emit();
   return rows;
 }
 async function nextGroupPlaceholder(
@@ -1212,6 +1531,8 @@ async function nextGroupPlaceholder(
     };
   task.payload = payload;
   await db.transaction("rw", [db.messages, db.backgroundTasks], async () => {
+    const storedTask = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(storedTask, task)) throw new ChatReplyLeaseLostError();
     await db.messages.add({
       id,
       schemaVersion: SCHEMA_VERSION,
@@ -1277,10 +1598,14 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
   ) {
     const speaker = actors.find((actor) => actor.id === order[index]);
     if (!speaker) continue;
-    if (index > (payload.nextSpeakerIndex ?? 0) || !payload.outputMessageId)
+    const currentPayload = taskPayload(task);
+    if (
+      index > (currentPayload.nextSpeakerIndex ?? 0) ||
+      !currentPayload.outputMessageId
+    )
       await nextGroupPlaceholder(task, speaker, provider, index);
     else {
-      const current = await db.messages.get(payload.outputMessageId);
+      const current = await db.messages.get(currentPayload.outputMessageId);
       if (current)
         await db.messages.update(current.id, {
           senderType: speaker.type,
@@ -1384,7 +1709,8 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         name,
         description,
       })),
-    (attempt) => recordProviderAttempt(task, attempt),
+    undefined,
+    providerInvokerForTask(task, false, speaker.id),
     );
     let parts: Array<{ content: string; translation?: string }> =
         generatedTurn.parts,
@@ -1419,6 +1745,7 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         presence,
         crossModeContinuity,
         signal: controller.signal,
+        invokeProvider: providerInvokerForTask(task, false, speaker.id),
       });
       const revised = review.revisedMessages.slice(0, 6);
       if (bilingual) {
@@ -1454,9 +1781,12 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
             : "审查后的群聊回复仍不符合本地格式要求",
         );
     }
+    await updatePhase(task, "saving");
     const selectedSticker = generatedTurn.stickerId
         ? replyStickers.find((sticker) => sticker.id === generatedTurn.stickerId)
         : undefined,
+      nextSpeakerIndex = index + 1,
+      finalSpeaker = nextSpeakerIndex >= order.length,
       rows = await saveGroupParts(
         task,
         speaker,
@@ -1464,57 +1794,21 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         provider,
         innerVoice,
         selectedSticker,
+        finalSpeaker,
+        nextSpeakerIndex,
       );
-    payload.nextSpeakerIndex = index + 1;
-    task.payload = { ...payload };
-    await db.backgroundTasks.update(task.id, {
-      payload: task.payload,
-      updatedAt: now(),
-    });
+    task.payload = { ...taskPayload(task), nextSpeakerIndex };
     history = [...history, ...rows];
     if (speaker.type === "character")
-      void Promise.allSettled([
-        recordMemoryAccess(
-          recalled.map((memory) => memory.id),
-          "group:" + payload.roundId + ":" + speaker.id,
-        ),
-        maybeAttachCharacterVoice({
-          character: speaker.character,
-          messageIds: rows
-            .filter((row) => !isStickerMessage(row))
-            .map((row) => row.id),
-          provider,
-        }),
-        prepareRoleplayResources({
-          character: speaker.character,
-          conversation,
-          loreBooks,
-          provider,
-        }),
-      ]);
+      void recordMemoryAccess(
+        recalled.map((memory) => memory.id),
+        "group:" + payload.roundId + ":" + speaker.id,
+      ).catch(() => {});
     if (index + 1 < order.length) {
       const next = actors.find((actor) => actor.id === order[index + 1]);
       if (next) await nextGroupPlaceholder(task, next, provider, index + 1);
     }
   }
-  await completeTask(task);
-}
-async function completeTask(task: BackgroundTask) {
-  const t = now(),
-    payload = {
-      ...taskPayload(task),
-      phase: "post-processing" as const,
-      lastApiError: undefined,
-    };
-  await db.backgroundTasks.put({
-    ...task,
-    payload,
-    state: "completed",
-    leaseExpiresAt: undefined,
-    updatedAt: t,
-  });
-  activeControllers.delete(task.id);
-  emit();
 }
 async function pauseOrFail(task: BackgroundTask, error: unknown) {
   const payload = taskPayload(task),
@@ -1524,31 +1818,53 @@ async function pauseOrFail(task: BackgroundTask, error: unknown) {
     failureStage = apiError?.failureStage ?? (apiError?.providerCode === "missing_inner_voice" ? "inner-voice" : apiError?.kind === "format" ? "role-protocol" : undefined);
   activeControllers.delete(task.id);
   if (payload.cancelled) return;
-  if (retryable(error) && payload.autoResumeCount < 1) {
-    const next = {
-      ...payload,
-      phase: "paused" as const,
-      autoResumeCount: payload.autoResumeCount + 1,
+  const shouldRetry = retryable(error) && payload.autoResumeCount < 1;
+  await db.transaction("rw", [db.backgroundTasks, db.messages], async () => {
+    const storedTask = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(storedTask, task)) throw new ChatReplyLeaseLostError();
+    const storedPayload = taskPayload(storedTask!);
+    const failedActorId = storedPayload.mode === "group" ? storedTask!.characterId : undefined;
+    const failedBudget = failedActorId
+      ? groupBudgetOf(storedPayload, failedActorId)
+      : undefined;
+    const next: ChatReplyTaskPayload = {
+      ...storedPayload,
+      phase: "failed",
+      autoResumeCount: shouldRetry
+        ? payload.autoResumeCount + 1
+        : payload.autoResumeCount,
       lastApiError: apiError,
       failureStage,
+      groupProviderCallBudgets:
+        failedActorId && failedBudget
+          ? {
+              ...(storedPayload.groupProviderCallBudgets ?? {}),
+              [failedActorId]: {
+                ...failedBudget,
+                leaseGeneration: storedTask!.leaseGeneration,
+                state: "failed",
+              },
+            }
+          : storedPayload.groupProviderCallBudgets,
     };
     await db.backgroundTasks.put({
-      ...task,
+      ...storedTask!,
       payload: next,
       state: "failed",
       leaseExpiresAt: undefined,
+      leaseOwnerId: undefined,
       lastError: errorText(error),
-      nextAttemptAt: t + AUTO_RESUME_DELAY_MS,
+      nextAttemptAt: shouldRetry ? t + AUTO_RESUME_DELAY_MS : Number.MAX_SAFE_INTEGER,
       updatedAt: t,
     });
     if (messageId) {
       const message = await db.messages.get(messageId);
       if (message)
         await db.messages.update(messageId, {
-          status: "generating",
+          status: shouldRetry ? "generating" : "error",
           generation: {
             ...message.generation!,
-            phase: "paused",
+            phase: "failed",
             error: errorText(error),
             apiError,
             lastProgressAt: t,
@@ -1556,38 +1872,7 @@ async function pauseOrFail(task: BackgroundTask, error: unknown) {
           updatedAt: t,
         });
     }
-  } else {
-    const next = {
-      ...payload,
-      phase: "paused" as const,
-      lastApiError: apiError,
-      failureStage,
-    };
-    await db.backgroundTasks.put({
-      ...task,
-      payload: next,
-      state: "failed",
-      leaseExpiresAt: undefined,
-      lastError: errorText(error),
-      nextAttemptAt: Number.MAX_SAFE_INTEGER,
-      updatedAt: t,
-    });
-    if (messageId) {
-      const message = await db.messages.get(messageId);
-      if (message)
-        await db.messages.update(messageId, {
-          status: "error",
-          generation: {
-            ...message.generation!,
-            phase: "paused",
-            error: errorText(error),
-            apiError,
-            lastProgressAt: t,
-          },
-          updatedAt: t,
-        });
-    }
-  }
+  });
   emit();
 }
 export async function claimNextChatReplyTask() {
@@ -1605,6 +1890,7 @@ export async function claimNextChatReplyTask() {
         state: "pending",
         nextAttemptAt: t,
         leaseExpiresAt: undefined,
+        leaseOwnerId: undefined,
         updatedAt: t,
       });
     const rows = await db.backgroundTasks
@@ -1630,6 +1916,8 @@ export async function claimNextChatReplyTask() {
       state: "running" as const,
       attempts: task.attempts + 1,
       leaseExpiresAt: t + CHAT_REPLY_LEASE_MS,
+      leaseOwnerId: CHAT_REPLY_OWNER_ID,
+      leaseGeneration: (task.leaseGeneration ?? 0) + 1,
       updatedAt: t,
     };
     await db.backgroundTasks.put(claimed);
@@ -1641,20 +1929,38 @@ export async function processChatReplyTask(
 ): Promise<ChatReplyProcessOutcome> {
   const controller = new AbortController();
   activeControllers.set(task.id, controller);
-  const heartbeat = setInterval(
-    () =>
-      void db.backgroundTasks.update(task.id, {
-        leaseExpiresAt: now() + CHAT_REPLY_LEASE_MS,
-        updatedAt: now(),
-      }),
-    10_000,
-  );
+  let heartbeatRunning = false;
+  let leaseLost = false;
+  const renewLease = async () => {
+    if (heartbeatRunning || leaseLost) return;
+    heartbeatRunning = true;
+    try {
+      await db.transaction("rw", db.backgroundTasks, async () => {
+        const stored = await db.backgroundTasks.get(task.id);
+        if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
+        const t = now();
+        await db.backgroundTasks.update(task.id, {
+          leaseExpiresAt: t + CHAT_REPLY_LEASE_MS,
+          updatedAt: t,
+        });
+        task.leaseExpiresAt = t + CHAT_REPLY_LEASE_MS;
+      });
+    } catch {
+      leaseLost = true;
+      controller.abort("lease-lost");
+    } finally {
+      heartbeatRunning = false;
+    }
+  };
+  const heartbeat = setInterval(() => void renewLease(), 10_000);
   try {
+    await assertTaskLease(task);
     if (taskPayload(task).mode === "group")
       await processGroup(task, controller);
     else await processPrivate(task, controller);
   } catch (error) {
-    await pauseOrFail(task, error);
+    if (!leaseLost && !(error instanceof ChatReplyLeaseLostError))
+      await pauseOrFail(task, error);
   } finally {
     clearInterval(heartbeat);
     activeControllers.delete(task.id);
@@ -1713,6 +2019,7 @@ export async function stopChatReply(conversationId: string) {
       payload,
       state: "completed",
       leaseExpiresAt: undefined,
+      leaseOwnerId: undefined,
       updatedAt: now(),
     });
   });
@@ -1730,7 +2037,10 @@ export async function retryChatReply(eventId: string) {
     cancelled: false,
     lastApiError: undefined,
     generationCycle: (taskPayload(task).generationCycle ?? 1) + 1,
+    providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
     providerCallCount: 0,
+    providerCallTrace: [],
+    groupProviderCallBudgets: taskPayload(task).mode === "group" ? {} : undefined,
     failureStage: undefined,
   };
   if (payload.outputMessageId) {
@@ -1756,6 +2066,7 @@ export async function retryChatReply(eventId: string) {
     state: "pending",
     nextAttemptAt: now(),
     leaseExpiresAt: undefined,
+    leaseOwnerId: undefined,
     lastError: undefined,
     attempts: 0,
     updatedAt: now(),
@@ -1770,6 +2081,28 @@ export async function chatReplyDiagnostic(eventId: string) {
   const placeholder = payload?.outputMessageId
     ? await db.messages.get(payload.outputMessageId)
     : undefined;
+  const groupProviderCallBudgets =
+    payload?.mode === "group"
+      ? Object.entries(payload.groupProviderCallBudgets ?? {}).map(
+          ([actorId, budget]) => ({
+            actorId,
+            providerCallLimit: budget.providerCallLimit,
+            providerCallCount: budget.providerCallCount,
+            providerCallTrace: budget.providerCallTrace,
+            leaseGeneration: budget.leaseGeneration,
+            state: budget.state,
+          }),
+        )
+      : undefined;
+  const groupProviderCallCount = groupProviderCallBudgets?.reduce(
+    (total, budget) => total + budget.providerCallCount,
+    0,
+  );
+  const groupProviderCallLimit =
+    payload?.mode === "group"
+      ? (payload.speakerOrder?.length ?? groupProviderCallBudgets?.length ?? 0) *
+        CHAT_PROVIDER_CALL_LIMIT
+      : undefined;
   return JSON.stringify(
     {
       feature: "chat-reply",
@@ -1777,14 +2110,28 @@ export async function chatReplyDiagnostic(eventId: string) {
       conversationId: task.conversationId,
       state: task.state,
       attempts: task.attempts,
+      model: placeholder?.generation?.model,
       generationCycle: payload?.generationCycle ?? 1,
-      providerCallCount: payload?.providerCallCount,
+      providerCallLimit: payload?.providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT,
+      providerCallCount: payload?.providerCallCount ?? 0,
+      providerCallTrace: payload?.providerCallTrace ?? [],
+      groupProviderCallLimit,
+      groupProviderCallCount,
+      groupProviderCallBudgets,
       failureStage: payload?.failureStage ?? payload?.lastApiError?.failureStage,
       nextAttemptReady: task.nextAttemptAt <= now(),
       leaseExpired: task.state === "running" ? (task.leaseExpiresAt ?? 0) <= now() : undefined,
+      leaseOwnedByCurrentRuntime:
+        task.state === "running" ? task.leaseOwnerId === CHAT_REPLY_OWNER_ID : undefined,
+      leaseGeneration: task.leaseGeneration,
       payloadValid: Boolean(payload),
       placeholderPresent: Boolean(placeholder),
       placeholderStatus: placeholder?.status,
+      persistenceVerified:
+        task.state === "completed"
+          ? Boolean(placeholder?.status === "complete" && placeholder.content.trim())
+          : undefined,
+      innerVoicePresent: placeholder?.innerVoice ? true : undefined,
       phase: payload?.phase ?? placeholder?.generation?.phase,
       apiErrorKind: payload?.lastApiError?.kind ?? placeholder?.generation?.apiError?.kind,
       httpStatus: payload?.lastApiError?.httpStatus ?? placeholder?.generation?.apiError?.httpStatus,
@@ -1802,10 +2149,15 @@ export async function chatReplyDiagnostic(eventId: string) {
 }
 
 export function chatReplyPhaseText(phase?: ChatReplyTaskPayload["phase"]) {
-  if (phase === "paused") return "\u7b49\u5f85\u6062\u590d";
-  if (phase === "reviewing") return "\u6b63\u5728\u68c0\u67e5\u56de\u590d";
-  if (phase === "queued") return "\u7b49\u5f85\u751f\u6210";
-  return "\u6b63\u5728\u751f\u6210";
+  if (phase === "queued") return "????";
+  if (phase === "preparing") return "????";
+  if (phase === "generating" || phase === "requesting") return "????";
+  if (phase === "parsing") return "????";
+  if (phase === "validating" || phase === "reviewing") return "??????";
+  if (phase === "saving") return "????";
+  if (phase === "completed") return "????";
+  if (phase === "failed" || phase === "paused") return "????";
+  return "????";
 }
 
 

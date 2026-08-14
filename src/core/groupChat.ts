@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { createApiErrorInfo, OpenAIProvider, ProviderError, isContextOverflowError } from "./provider";
+import { createApiErrorInfo, OpenAIProvider, ProviderError, isContextOverflowError, type ProviderChatInvoker } from "./provider";
 import { coreSettingOf, personaOf } from "./character";
 import type { Character, Message, ProviderSettings } from "./types";
 import type { ChatItem } from "./context";
@@ -97,6 +97,7 @@ export async function generateCharacterReplyTurn(
   islandActionEnabled = false,
   stickerCatalog: ReplyStickerCatalogItem[] = [],
   onProviderAttempt?: (attempt: number) => void | Promise<void>,
+  invokeProvider?: ProviderChatInvoker,
 ): Promise<GeneratedReplyTurn> {
   const plan = replyBubblePlanOf(character, context, scene),
     range = plan.range;
@@ -122,12 +123,35 @@ export async function generateCharacterReplyTurn(
     };
     try {
       const sourceContext = attempt ? compactChatItemsForRetry(context) : context;
-      const fitted = fitChatItemsToInternalBudget([...sourceContext, request]);
+      const requestItems = [...sourceContext, request];
+      let latestUserIndex = -1;
+      for (let index = sourceContext.length - 1; index >= 0; index -= 1) {
+        if (sourceContext[index]?.role === "user") {
+          latestUserIndex = index;
+          break;
+        }
+      }
+      const requiredIndexes = [requestItems.length - 1];
+      if (latestUserIndex >= 0) requiredIndexes.push(latestUserIndex);
+      const fitted = fitChatItemsToInternalBudget(requestItems, { requiredIndexes });
       await onProviderAttempt?.(attempt + 1);
-      const response = await new OpenAIProvider({ ...settings, stream: false }).chatWithMeta(
-        fitted.items,
-        { stream: false, signal, temperature: attempt ? 0.1 : settings.temperature },
-      );
+      const options = {
+        stream: false,
+        signal,
+        temperature: attempt ? 0.1 : settings.temperature,
+        timeoutMs: null,
+      } as const;
+      const response = invokeProvider
+        ? await invokeProvider(
+            { ...settings, stream: false },
+            fitted.items,
+            options,
+            attempt ? "regeneration" : "generation",
+          )
+        : await new OpenAIProvider({ ...settings, stream: false }).chatWithMeta(
+            fitted.items,
+            options,
+          );
       // A provider may report a length finish reason after emitting a complete role protocol.
       // Validate the returned JSON first; only genuinely incomplete protocol data should fail.
       const normalized = parseStrictReplyTurn(

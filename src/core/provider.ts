@@ -1,5 +1,5 @@
 ﻿import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ProviderSettings } from "./types";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ProviderSettings } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
@@ -55,7 +55,15 @@ export interface ProviderChatOptions {
   onToken?: (value: string) => void;
   stream?: boolean;
   temperature?: number;
+  /** null disables the provider-owned timeout while preserving caller cancellation. */
+  timeoutMs?: number | null;
 }
+export type ProviderChatInvoker = (
+  settings: ProviderSettings,
+  messages: ChatItem[],
+  options: ProviderChatOptions,
+  purpose: ChatProviderCallPurpose,
+) => Promise<ProviderChatResult>;
 export class ProviderError extends Error {
   constructor(
     public kind: ProviderErrorKind,
@@ -726,7 +734,8 @@ export class OpenAIProvider {
   }
   async chatWithMeta(messages: ChatItem[], opts: ProviderChatOptions = {}): Promise<ProviderChatResult> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort("timeout"), this.settings.timeoutMs);
+    const timeoutMs = opts.timeoutMs === undefined ? this.settings.timeoutMs : opts.timeoutMs;
+    const timer = timeoutMs === null ? undefined : setTimeout(() => controller.abort("timeout"), timeoutMs);
     const abort = () => controller.abort("user");
     opts.signal?.addEventListener("abort", abort, { once: true });
     const stream = opts.stream ?? this.settings.stream;
@@ -805,7 +814,7 @@ export class OpenAIProvider {
       if (error instanceof TypeError) throw this.failure("cors", "网络或跨域请求失败，请确认 API 支持浏览器 CORS", out, { providerCode: "cors_or_fetch_failed", detail: error.message });
       throw this.failure("network", error instanceof Error ? error.message : "网络请求失败", out, { providerCode: "network_error", detail: error instanceof Error ? error.message : undefined });
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", abort);
     }
   }

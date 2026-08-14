@@ -89,31 +89,49 @@ export function compactChatItemsForRetry(items: ChatItem[], ratio = 0.55) {
   return [...system, ...history.slice(-keep), ...(latestUser ? [latestUser] : [])];
 }
 
-export function fitChatItemsToInternalBudget(items: ChatItem[]) {
+export interface FitChatItemsOptions {
+  /** Indexes that must survive fitting, in addition to every system message. */
+  requiredIndexes?: number[];
+}
+
+export class RequiredChatContextTooLargeError extends Error {
+  readonly code = "required_context_too_large";
+  constructor(public readonly estimatedTokens: number) {
+    super("必要的角色设定、最新用户消息和回复协议超过内部输入预算");
+    this.name = "RequiredChatContextTooLargeError";
+  }
+}
+
+export function fitChatItemsToInternalBudget(
+  items: ChatItem[],
+  options: FitChatItemsOptions = {},
+) {
   if (estimateChatTokens(items) <= INTERNAL_INPUT_BUDGET_TOKENS)
     return { items, removed: 0 };
-  const latest = items.length ? items[items.length - 1] : undefined;
-  const required = items.filter(
-    (item, index) => item.role === "system" || index === items.length - 1,
-  );
-  const optional = items.filter(
-    (item, index) => item.role !== "system" && index !== items.length - 1,
-  );
-  const kept: ChatItem[] = [];
-  let used = estimateChatTokens(required);
+  const requiredIndexes = new Set(options.requiredIndexes ?? []);
+  items.forEach((item, index) => {
+    if (item.role === "system") requiredIndexes.add(index);
+  });
+  const required = items.filter((_, index) => requiredIndexes.has(index));
+  const requiredTokens = estimateChatTokens(required);
+  if (requiredTokens > INTERNAL_INPUT_BUDGET_TOKENS)
+    throw new RequiredChatContextTooLargeError(requiredTokens);
+  const optional = items
+    .map((item, index) => ({ item, index }))
+    .filter(({ index }) => !requiredIndexes.has(index));
+  const keptIndexes = new Set(requiredIndexes);
+  let used = requiredTokens;
   for (let index = optional.length - 1; index >= 0; index -= 1) {
-    const item = optional[index]!;
-    const size = estimateChatItemTokens(item);
+    const row = optional[index]!;
+    const size = estimateChatItemTokens(row.item);
     if (used + size > INTERNAL_INPUT_BUDGET_TOKENS) continue;
-    kept.unshift(item);
+    keptIndexes.add(row.index);
     used += size;
   }
-  const output = [
-    ...required.filter((item) => item.role === "system"),
-    ...kept,
-    ...(latest && latest.role !== "system" ? [latest] : []),
-  ].filter((item, index, rows) => rows.indexOf(item) === index);
-  return { items: output, removed: optional.length - kept.length };
+  return {
+    items: items.filter((_, index) => keptIndexes.has(index)),
+    removed: optional.length - (keptIndexes.size - requiredIndexes.size),
+  };
 }
 
 export function fitPrioritizedPromptSections(

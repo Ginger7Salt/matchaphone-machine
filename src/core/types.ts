@@ -624,10 +624,38 @@ export type ChatReplyPhase =
   | "queued"
   | "preparing"
   | "generating"
+  | "requesting"
+  | "parsing"
   | "validating"
   | "reviewing"
+  | "saving"
   | "post-processing"
+  | "completed"
+  | "failed"
   | "paused";
+
+export type ChatProviderCallPurpose =
+  | "generation"
+  | "regeneration"
+  | "review"
+  | "auxiliary";
+export interface ChatProviderCallTrace {
+  ordinal: 1 | 2;
+  purpose: ChatProviderCallPurpose;
+  state: "started" | "completed" | "failed" | "aborted";
+  responseShape?: string;
+  rawLength?: number;
+  finishReason?: string;
+  errorKind?: string;
+  providerCode?: string;
+}
+export interface ChatGroupProviderCallBudget {
+  providerCallLimit: 2;
+  providerCallCount: number;
+  providerCallTrace: ChatProviderCallTrace[];
+  leaseGeneration?: number;
+  state?: "pending" | "running" | "completed" | "failed";
+}
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
   outputMessageId?: string;
@@ -649,6 +677,12 @@ export interface ChatReplyTaskPayload {
   generationCycle?: number;
   /** Provider calls made in the current generation cycle. */
   providerCallCount?: number;
+  /** Shared private-chat limit; retained as a legacy field for group tasks. */
+  providerCallLimit?: 2;
+  /** Sanitized provider call lifecycle; never stores prompts or response text. */
+  providerCallTrace?: ChatProviderCallTrace[];
+  /** Per-speaker provider budgets for group chat; optional for legacy rows. */
+  groupProviderCallBudgets?: Record<string, ChatGroupProviderCallBudget>;
   /** Last deterministic failure stage, used only for status/diagnostics. */
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
   cancelled?: boolean;
@@ -663,6 +697,10 @@ export interface BackgroundTask extends BaseEntity {
   nextAttemptAt: number;
   attempts: number;
   leaseExpiresAt?: number;
+  /** Runtime owner of the current lease; optional for legacy rows. */
+  leaseOwnerId?: string;
+  /** Monotonic fencing generation used to reject stale tabs. */
+  leaseGeneration?: number;
   eventId: string;
   payload: unknown;
   lastError?: string;

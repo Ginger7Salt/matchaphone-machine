@@ -2,7 +2,7 @@
 import { coreSettingOf, personaOf } from "./character";
 import { db } from "./db";
 import { configuredProvider, getModelServiceSettings } from "./modelServices";
-import { OpenAIProvider, ProviderError } from "./provider";
+import { OpenAIProvider, ProviderError, type ProviderChatInvoker } from "./provider";
 import { generatedInnerVoiceOf, type GeneratedInnerVoice } from "./innerVoice";
 import { evaluateLore, isLoreBookMounted } from "./lore";
 import { userPersonaContext } from "./userPersona";
@@ -198,14 +198,25 @@ async function callStrictJson(
   system: string,
   user: string,
   signal?: AbortSignal,
+  invokeProvider?: ProviderChatInvoker,
 ) {
-  return new OpenAIProvider({ ...provider, stream: false }).chat(
-    [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    { stream: false, signal },
-  );
+  const messages = [
+    { role: "system" as const, content: system },
+    { role: "user" as const, content: user },
+  ];
+  if (invokeProvider)
+    return (
+      await invokeProvider(
+        { ...provider, stream: false },
+        messages,
+        { stream: false, signal, timeoutMs: null },
+        "review",
+      )
+    ).text;
+  return new OpenAIProvider({ ...provider, stream: false }).chat(messages, {
+    stream: false,
+    signal,
+  });
 }
 const performancePending = new Map<
   string,
@@ -600,6 +611,7 @@ export async function reviewCharacterReply(input: {
   presence?: ChatPresenceContext;
   crossModeContinuity?: string;
   signal?: AbortSignal;
+  invokeProvider?: ProviderChatInvoker;
 }) {
   const drafts = input.draftMessages
     .map((value) => value.trim())
@@ -673,7 +685,8 @@ export async function reviewCharacterReply(input: {
       .filter(Boolean)
       .join("\n\n");
   let last: unknown;
-  for (let attempt = 0; attempt < Math.max(2, providers.length); attempt++) {
+  const reviewAttempts = input.invokeProvider ? 1 : Math.max(2, providers.length);
+  for (let attempt = 0; attempt < reviewAttempts; attempt++) {
     const provider = providers[Math.min(attempt, providers.length - 1)];
     try {
       const raw = await callStrictJson(
@@ -681,6 +694,7 @@ export async function reviewCharacterReply(input: {
           "你是茶茶机严格角色一致性审查器。角色原始设定和世界书原文高于草稿。只输出严格 JSON，不解释过程。",
           prompt,
           input.signal,
+          input.invokeProvider,
         ),
         parsed = reviewSchema.parse(parseJson(raw));
       if (!parsed.revisedMessages.length)
