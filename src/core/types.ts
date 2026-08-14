@@ -639,6 +639,8 @@ export type ChatProviderCallPurpose =
   | "regeneration"
   | "review"
   | "auxiliary";
+export type ChatProviderTransportMode = "non-stream" | "sse" | "ndjson" | "json-fallback";
+export type ChatProviderTailKind = "quote" | "object-close" | "array-close" | "comma" | "colon" | "escape" | "other";
 export interface ChatProviderCallTrace {
   ordinal: 1 | 2;
   purpose: ChatProviderCallPurpose;
@@ -648,6 +650,22 @@ export interface ChatProviderCallTrace {
   finishReason?: string;
   errorKind?: string;
   providerCode?: string;
+  transportMode?: ChatProviderTransportMode;
+  receivedChars?: number;
+  receivedBytes?: number;
+  declaredContentLength?: number;
+  contentLengthMatched?: boolean;
+  parseStatus?: "strict-json" | "repaired-json" | "unrecoverable-json" | "truncated-json";
+  strictParseSucceeded?: boolean;
+  repairAttempted?: boolean;
+  repairedParseSucceeded?: boolean;
+  outerContainerClosed?: boolean;
+  unterminatedString?: boolean;
+  hasMessages?: boolean;
+  hasInnerVoice?: boolean;
+  completeVisibleFieldRecovered?: boolean;
+  tailKind?: ChatProviderTailKind;
+  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
 }
 export interface ChatGroupProviderCallBudget {
   providerCallLimit: 2;
@@ -1029,6 +1047,14 @@ export interface ApiErrorInfo {
   hasInnerVoice?: boolean;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
+  transportMode?: ChatProviderTransportMode;
+  receivedChars?: number;
+  receivedBytes?: number;
+  declaredContentLength?: number;
+  contentLengthMatched?: boolean;
+  completeVisibleFieldRecovered?: boolean;
+  tailKind?: ChatProviderTailKind;
+  finishReason?: string;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
   troubleshooting: string[];
 }

@@ -75,6 +75,12 @@ import {
 import { resolveSecondaryProvider } from "./modelServices";
 import { buildMeetCrossModeContinuity, closeMeetOnlineWindow, resumeMeetSessionForOfflineActivity } from "./crossModeContinuity";
 
+function shouldUseCompactStreamingRetry(error: unknown) {
+  if (!(error instanceof ProviderError)) return false;
+  const code = error.apiError?.providerCode;
+  return code === "truncated_json" || code === "transport_truncated" || code === "malformed_envelope";
+}
+
 export async function createMeetSession(input: {
   participantIds: string[];
   conversationId?: string;
@@ -508,13 +514,19 @@ async function generateMeetTurnInternal(
               ? INTERNAL_INPUT_BUDGET_TOKENS
               : Math.floor(INTERNAL_INPUT_BUDGET_TOKENS * 0.72),
           );
+          const compactStreamingRetry = attempt === 1 && shouldUseCompactStreamingRetry(lastTurnError);
           const baseMessages = [
             {
               role: "system" as const,
               content:
                 "\u4f60\u6b63\u5728\u751f\u6210\u7ebf\u4e0b\u89c1\u9762\u89d2\u8272\u56de\u590d\u3002\u5fc5\u987b\u9075\u5b88\u7528\u6237\u63d0\u4f9b\u7684\u7ed3\u6784\uff0c\u53ea\u8f93\u51fa\u6709\u6548 JSON\u3002",
             },
-            { role: "user" as const, content: fittedPrompt.text },
+            {
+              role: "user" as const,
+              content: compactStreamingRetry
+                ? `${fittedPrompt.text}\n\n这是一次完整紧凑重生成：只输出单行、无 Markdown、无解释的完整 JSON；不得续写或拼接上一次响应；保留所有必需字段、角色 ID 和必要译文。`
+                : fittedPrompt.text,
+            },
           ];
           const fitted = fitChatItemsToInternalBudget(baseMessages);
           generationMeta.stage = "requesting";
@@ -523,9 +535,14 @@ async function generateMeetTurnInternal(
             estimateChatTokens(fitted.items),
           );
           await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-          const response = await new OpenAIProvider({ ...provider, stream: false }).chatWithMeta(
+          const response = await new OpenAIProvider({ ...provider, stream: compactStreamingRetry }).chatWithMeta(
             fitted.items,
-            { stream: false, signal, temperature: attempt === 0 ? provider.temperature : 0.1 },
+            {
+              stream: compactStreamingRetry,
+              signal,
+              timeoutMs: null,
+              temperature: attempt === 0 ? provider.temperature : 0.1,
+            },
           );
           Object.assign(generationMeta, {
             stage: "parsing" as const,
@@ -919,7 +936,7 @@ export async function maybeCreateMeetInvitation(input: {
             content: meetInvitationPrompt({ ...input, appSettings }),
           },
         ],
-        { stream: false, signal: input.signal },
+        { stream: false, signal: input.signal, timeoutMs: null },
       ),
       start = raw.indexOf("{"),
       end = raw.lastIndexOf("}"),
@@ -1147,7 +1164,7 @@ export async function regenerateMeetCharacterEntry(
           },
           { role: "user", content: prompt },
         ],
-        { stream: false, signal },
+        { stream: false, signal, timeoutMs: null },
       ),
       reviewProvider = await resolveSecondaryProvider(provider);
     let raw = draft;
@@ -1164,7 +1181,7 @@ export async function regenerateMeetCharacterEntry(
             content: `严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n\n${userPersonaContext(appSettings)}\n\n用户输入：${source.content}\n\n待审查 JSON：\n${draft}`,
           },
         ],
-        { stream: false, signal },
+        { stream: false, signal, timeoutMs: null },
       );
     } catch {}
     reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled)
@@ -1347,7 +1364,7 @@ export async function generateMeetOpeningDraft(
           },
           { role: "user", content: prompt },
         ],
-        { stream: false, signal },
+        { stream: false, signal, timeoutMs: null },
       )
     ).trim(),
     reviewProvider = await resolveSecondaryProvider(provider);
@@ -1366,7 +1383,7 @@ export async function generateMeetOpeningDraft(
               content: `角色资料：\n${profiles}\n\n最近聊天：\n${history}\n\n待审查开场：\n${draft}`,
             },
           ],
-          { stream: false, signal },
+          { stream: false, signal, timeoutMs: null },
         )
       ).trim() || draft
     );

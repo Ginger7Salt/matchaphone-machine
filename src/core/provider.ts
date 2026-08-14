@@ -1,5 +1,5 @@
 ﻿import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ProviderSettings } from "./types";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ProviderSettings } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
@@ -30,6 +30,14 @@ export interface ProviderErrorMetadata {
   hasInnerVoice?: boolean;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
+  transportMode?: ChatProviderTransportMode;
+  receivedChars?: number;
+  receivedBytes?: number;
+  declaredContentLength?: number;
+  contentLengthMatched?: boolean;
+  completeVisibleFieldRecovered?: boolean;
+  tailKind?: ChatProviderTailKind;
+  finishReason?: string;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
 }
 export interface ProviderChatResult {
@@ -49,6 +57,13 @@ export interface ProviderChatResult {
   hasInnerVoice?: boolean;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
+  transportMode?: ChatProviderTransportMode;
+  receivedChars?: number;
+  receivedBytes?: number;
+  declaredContentLength?: number;
+  contentLengthMatched?: boolean;
+  completeVisibleFieldRecovered?: boolean;
+  tailKind?: ChatProviderTailKind;
 }
 export interface ProviderChatOptions {
   signal?: AbortSignal;
@@ -466,20 +481,220 @@ function kindOfSuccessfulError(value: JsonRecord): ApiErrorKind {
   if (/server|gateway|unavailable|overload/i.test(text)) return "server";
   return "format";
 }
-function parseSseOrNdjson(raw: string, mode: "sse" | "ndjson", contentType?: string): ProviderChatResult | undefined {
+interface ResponseTransportMetadata {
+  transportMode: ChatProviderTransportMode;
+  receivedChars: number;
+  receivedBytes: number;
+  declaredContentLength?: number;
+  contentLengthMatched?: boolean;
+  transportMarkedIncomplete?: boolean;
+  tailKind: ChatProviderTailKind;
+}
+interface JsonStringToken {
+  value: string;
+  end: number;
+}
+interface CompleteVisibleFieldRecovery {
+  text: string;
+  path: string;
+  diagnostics: StructuredJsonDiagnostics;
+}
+function responseTailKind(input: string): ChatProviderTailKind {
+  const tail = input.trimEnd().at(-1);
+  if (tail === '"' || tail === "'") return "quote";
+  if (tail === "}") return "object-close";
+  if (tail === "]") return "array-close";
+  if (tail === ",") return "comma";
+  if (tail === ":") return "colon";
+  if (tail === "\\") return "escape";
+  return "other";
+}
+function byteLengthOf(value: string) {
+  return new TextEncoder().encode(value).byteLength;
+}
+function declaredContentLengthOf(response: Response) {
+  const raw = response.headers.get("Content-Length");
+  if (!raw || !/^\d+$/.test(raw.trim())) return undefined;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+function transportMetadataOf(
+  response: Response,
+  raw: string,
+  transportMode: ChatProviderTransportMode,
+  receivedBytes = byteLengthOf(raw),
+): ResponseTransportMetadata {
+  const declaredContentLength = declaredContentLengthOf(response);
+  const encoded = response.headers.get("Content-Encoding");
+  const contentLengthMatched =
+    declaredContentLength === undefined || (encoded && encoded.toLowerCase() !== "identity")
+      ? undefined
+      : declaredContentLength === receivedBytes;
+  return {
+    transportMode,
+    receivedChars: raw.length,
+    receivedBytes,
+    declaredContentLength,
+    contentLengthMatched,
+    transportMarkedIncomplete: contentLengthMatched === false,
+    tailKind: responseTailKind(raw),
+  };
+}
+function readJsonStringToken(input: string, start: number): JsonStringToken | undefined {
+  if (input[start] !== '"') return undefined;
+  let escaped = false;
+  for (let index = start + 1; index < input.length; index += 1) {
+    const char = input[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char !== '"') continue;
+    const encoded = input.slice(start, index + 1);
+    try {
+      const value = JSON.parse(encoded) as unknown;
+      return typeof value === "string" ? { value, end: index + 1 } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+function nextNonWhitespace(input: string, start: number) {
+  let index = start;
+  while (index < input.length && /\s/.test(input[index]!)) index += 1;
+  return index;
+}
+function completeRolePayloadOf(input: string): { text: string; diagnostics: StructuredJsonDiagnostics } | undefined {
+  let value: unknown = input;
+  let diagnostics: StructuredJsonDiagnostics | undefined;
+  for (let depth = 0; depth < 5 && typeof value === "string"; depth += 1) {
+    try {
+      const parsed = parseStructuredJsonWithMeta(value);
+      value = parsed.value;
+      diagnostics = parsed.diagnostics;
+    } catch {
+      return undefined;
+    }
+  }
+  if (!isRecord(value) || !Array.isArray(value.messages) || !isRecord(value.innerVoice) || !diagnostics) return undefined;
+  const text = safeJson(value);
+  return text ? { text, diagnostics } : undefined;
+}
+function knownBrokenEnvelopePath(raw: string, keyStart: number, key: string) {
+  const prefix = raw.slice(0, keyStart);
+  const lower = prefix.toLowerCase();
+  const hasDirectMessages = /"messages"\s*:/.test(prefix);
+  if (key === "content") {
+    const lastMessage = Math.max(lower.lastIndexOf('"message"'), lower.lastIndexOf('"delta"'));
+    const lastHidden = Math.max(lower.lastIndexOf('"reasoning"'), lower.lastIndexOf('"analysis"'), lower.lastIndexOf('"thinking"'));
+    if (lastMessage >= 0 && lastMessage > lastHidden && (!hasDirectMessages || lower.includes('"choices"'))) {
+      return lower.includes('"choices"') ? "choices[].message.content" : "message.content";
+    }
+    return undefined;
+  }
+  if (key === "output_text") return "output[].content[].output_text";
+  if (key === "text") {
+    if (lower.includes('"candidates"') && lower.includes('"parts"')) return "candidates[].content.parts[].text";
+    if (lower.includes('"type"') && lower.includes("output_text")) return "output[].content[].text";
+    if (lower.includes('"content"') && lower.includes('"type"') && lower.includes('"text"')) return "content[].text";
+    return undefined;
+  }
+  if (["reply", "completion", "generated_text", "answer", "response_text"].includes(key)) return key;
+  return undefined;
+}
+function recoverCompleteVisibleField(raw: string): CompleteVisibleFieldRecovery | undefined {
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== '"') continue;
+    const keyToken = readJsonStringToken(raw, index);
+    if (!keyToken) continue;
+    const colon = nextNonWhitespace(raw, keyToken.end);
+    if (raw[colon] !== ":") {
+      index = keyToken.end - 1;
+      continue;
+    }
+    const path = knownBrokenEnvelopePath(raw, index, keyToken.value);
+    const valueStart = nextNonWhitespace(raw, colon + 1);
+    if (!path || raw[valueStart] !== '"') {
+      index = keyToken.end - 1;
+      continue;
+    }
+    const valueToken = readJsonStringToken(raw, valueStart);
+    if (!valueToken) return undefined;
+    const complete = completeRolePayloadOf(valueToken.value);
+    if (complete) return { ...complete, path };
+    index = valueToken.end - 1;
+  }
+  return undefined;
+}
+function hasUnterminatedKnownVisibleField(raw: string) {
+  for (let index = 0; index < raw.length; index += 1) {
+    if (raw[index] !== '"') continue;
+    const keyToken = readJsonStringToken(raw, index);
+    if (!keyToken) continue;
+    const colon = nextNonWhitespace(raw, keyToken.end);
+    if (raw[colon] !== ":") {
+      index = keyToken.end - 1;
+      continue;
+    }
+    const path = knownBrokenEnvelopePath(raw, index, keyToken.value);
+    const valueStart = nextNonWhitespace(raw, colon + 1);
+    if (!path || raw[valueStart] !== '"') {
+      index = keyToken.end - 1;
+      continue;
+    }
+    const valueToken = readJsonStringToken(raw, valueStart);
+    if (!valueToken) return true;
+    index = valueToken.end - 1;
+  }
+  return false;
+}
+function transportMetaFields(meta?: Partial<ResponseTransportMetadata>) {
+  if (!meta) return {};
+  return {
+    transportMode: meta.transportMode,
+    receivedChars: meta.receivedChars,
+    receivedBytes: meta.receivedBytes,
+    declaredContentLength: meta.declaredContentLength,
+    contentLengthMatched: meta.contentLengthMatched,
+    transportMarkedIncomplete: meta.transportMarkedIncomplete,
+    tailKind: meta.tailKind,
+  };
+}
+function looksLikeKnownEnvelope(input: string) {
+  return /"(?:choices|candidates|output|message|response|result|data|payload)"\s*:/.test(input);
+}
+const MAX_STREAM_CARRY_CHARS = 8_000_000;
+function parseSseOrNdjson(
+  raw: string,
+  mode: "sse" | "ndjson",
+  contentType?: string,
+  secrets: string[] = [],
+  transportMeta?: ResponseTransportMetadata,
+  onVisibleChunk?: (value: string) => void,
+): ProviderChatResult | undefined {
   const chunks: string[] = [];
   let finishReason: string | undefined;
   let outputTokens: number | undefined;
+  let doneMarker = false;
+  let parsedCount = 0;
+  let malformedCount = 0;
+  let carry = "";
   const visibleCandidatePaths: string[] = [];
   const signals: ExtractionSignals = { reasoning: false, tool: false };
-  const rows = raw.replace(/\r\n/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean);
-  let parsedCount = 0;
-  for (const row of rows) {
-    if (mode === "sse" && !row.startsWith("data:")) continue;
-    const text = mode === "sse" ? row.slice(5).trim() : row;
-    if (!text || text === "[DONE]") continue;
+  const parsePayload = (text: string): "parsed" | "done" | "invalid" => {
+    const payload = text.trim();
+    if (!payload) return "parsed";
+    if (payload === "[DONE]") {
+      doneMarker = true;
+      return "done";
+    }
     try {
-      const value = JSON.parse(text) as unknown;
+      const value = JSON.parse(payload) as unknown;
       parsedCount += 1;
       const error = errorRecordOf(value);
       if (error) {
@@ -492,87 +707,239 @@ function parseSseOrNdjson(raw: string, mode: "sse" | "ndjson", contentType?: str
           rawLength: raw.length,
           contentType,
           visibleCandidatePaths,
+          ...transportMetaFields(transportMeta),
         });
       }
       const visible = visibleTextOf(value, `${mode}[${parsedCount - 1}]`, 0, visibleCandidatePaths, signals);
       if (visible) chunks.push(visible);
       finishReason = finishReasonOf(value) ?? finishReason;
       outputTokens = outputTokensOf(value) ?? outputTokens;
+      return "parsed";
     } catch (error) {
       if (error instanceof ProviderResponseParseError) throw error;
+      return "invalid";
     }
+  };
+  const appendCarry = (fragment: string) => {
+    if (carry.length + fragment.length > MAX_STREAM_CARRY_CHARS) {
+      malformedCount += 1;
+      carry = fragment.length <= MAX_STREAM_CARRY_CHARS ? fragment : "";
+      return;
+    }
+    carry += fragment;
+  };
+  const consumeFragment = (fragment: string) => {
+    if (!fragment) return;
+    if (carry) {
+      const joined = carry + fragment;
+      const joinedResult = parsePayload(joined);
+      if (joinedResult !== "invalid") {
+        carry = "";
+        return;
+      }
+      const joinedWithLineBreak = carry + "\n" + fragment;
+      if (joinedWithLineBreak !== joined) {
+        const lineResult = parsePayload(joinedWithLineBreak);
+        if (lineResult !== "invalid") {
+          carry = "";
+          return;
+        }
+      }
+      const standalone = parsePayload(fragment);
+      if (standalone !== "invalid") {
+        malformedCount += 1;
+        carry = "";
+        return;
+      }
+      appendCarry(fragment);
+      return;
+    }
+    if (parsePayload(fragment) === "invalid") appendCarry(fragment);
+  };
+  const lines = raw.replace(/\r\n?/g, "\n").split("\n");
+  if (mode === "sse") {
+    for (const original of lines) {
+      if (!original) continue;
+      if (/^(?:event:|id:|retry:|:)/.test(original)) continue;
+      if (original.startsWith("data:")) {
+        consumeFragment(original.slice(5).replace(/^ /, ""));
+        continue;
+      }
+      if (carry) consumeFragment(original);
+    }
+  } else {
+    for (const line of lines) if (line.trim()) consumeFragment(line);
+  }
+  if (carry) {
+    if (parsePayload(carry) === "invalid") malformedCount += 1;
+    carry = "";
   }
   if (!parsedCount || !chunks.length) return undefined;
-  return {
-    text: chunks.join(""),
-    finishReason,
-    truncated: truncatedOf(finishReason),
-    responseShape: mode,
-    rawLength: raw.length,
-    outputTokens,
-  };
+  const combined = chunks.join("");
+  try {
+    const normalized = parseChatResponse(
+      combined,
+      "application/json",
+      secrets,
+      transportMeta ? { ...transportMeta, transportMode: mode } : undefined,
+    );
+    chunks.forEach((chunk) => onVisibleChunk?.(chunk));
+    return {
+      ...normalized,
+      finishReason: finishReason ?? normalized.finishReason,
+      truncated: truncatedOf(finishReason ?? normalized.finishReason),
+      responseShape: mode,
+      rawLength: raw.length,
+      outputTokens: outputTokens ?? normalized.outputTokens,
+      transportMode: mode,
+      receivedChars: transportMeta?.receivedChars ?? raw.length,
+      receivedBytes: transportMeta?.receivedBytes ?? byteLengthOf(raw),
+      declaredContentLength: transportMeta?.declaredContentLength,
+      contentLengthMatched: transportMeta?.contentLengthMatched,
+      tailKind: transportMeta?.tailKind ?? responseTailKind(raw),
+    };
+  } catch (error) {
+    if (error instanceof ProviderResponseParseError) {
+      throw new ProviderResponseParseError(error.kind, error.message, {
+        ...error.meta,
+        providerCode:
+          error.meta.providerCode === "truncated_json" && transportMeta?.contentLengthMatched === false
+            ? "transport_truncated"
+            : error.meta.providerCode,
+        responseShape: `${mode}:${error.meta.responseShape ?? "invalid"}`,
+        rawLength: raw.length,
+        contentType,
+        finishReason,
+        detail: malformedCount
+          ? `${error.meta.detail ?? error.message}；另有 ${malformedCount} 个无法解析的流事件`
+          : error.meta.detail,
+        ...transportMetaFields(transportMeta ? { ...transportMeta, transportMode: mode } : undefined),
+      });
+    }
+    throw error;
+  }
 }
-function parseChatResponse(raw: string, contentType?: string, secrets: string[] = []): ProviderChatResult {
+function parseChatResponse(
+  raw: string,
+  contentType?: string,
+  secrets: string[] = [],
+  transportMeta: ResponseTransportMetadata = {
+    transportMode: "non-stream",
+    receivedChars: raw.length,
+    receivedBytes: byteLengthOf(raw),
+    tailKind: responseTailKind(raw),
+  },
+): ProviderChatResult {
   const trimmed = raw.replace(/^\uFEFF/, "").trim();
+  const baseMeta = { rawLength: raw.length, contentType, ...transportMetaFields(transportMeta) };
   if (!trimmed)
     throw new ProviderResponseParseError("format", "服务返回了空响应", {
       providerCode: "empty_response",
       detail: "HTTP 请求成功，但响应正文为空",
       responseShape: "empty",
-      rawLength: raw.length,
-      contentType,
       visibleCandidatePaths: [],
+      failureStage: "provider-parse",
+      ...baseMeta,
     });
   if (/text\/html/i.test(contentType ?? "") || /^\s*(?:<!doctype\s+html|<html\b|<body\b)/i.test(trimmed))
     throw new ProviderResponseParseError("format", "服务返回了网页而不是 API 数据", {
       providerCode: "html_response",
       detail: "接口返回了 HTML、登录页或网关页面",
       responseShape: "html",
-      rawLength: raw.length,
-      contentType,
       visibleCandidatePaths: [],
+      failureStage: "provider-parse",
+      ...baseMeta,
     });
   if (/^\s*(?:data|event):/m.test(trimmed)) {
-    const streamed = parseSseOrNdjson(trimmed, "sse", contentType);
+    const streamed = parseSseOrNdjson(trimmed, "sse", contentType, secrets, { ...transportMeta, transportMode: "sse" });
     if (streamed) return streamed;
   }
   const ndjsonLines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (ndjsonLines.length > 1 && ndjsonLines.every((line) => {
     try { JSON.parse(line); return true; } catch { return false; }
   })) {
-    const ndjson = parseSseOrNdjson(trimmed, "ndjson", contentType);
+    const ndjson = parseSseOrNdjson(trimmed, "ndjson", contentType, secrets, { ...transportMeta, transportMode: "ndjson" });
     if (ndjson) return ndjson;
   }
 
   let data: unknown;
   let structuredDiagnostics: StructuredJsonDiagnostics | undefined;
   try {
-    const parsed = parseStructuredJsonWithMeta(trimmed);
+    const parsed = parseStructuredJsonWithMeta(trimmed, {
+      transportMarkedIncomplete: transportMeta.transportMarkedIncomplete,
+    });
     data = parsed.value;
     structuredDiagnostics = parsed.diagnostics;
   } catch (error) {
     const looksStructured = /^[\[{]/.test(trimmed) || /^```/i.test(trimmed);
     if (!looksStructured) {
-      return { text: trimmed, truncated: false, responseShape: "plain-text", rawLength: raw.length };
+      return {
+        text: trimmed,
+        truncated: false,
+        responseShape: "plain-text",
+        rawLength: raw.length,
+        ...transportMetaFields(transportMeta),
+      };
     }
     const structuredError = error instanceof StructuredJsonError ? error : undefined;
-    const truncated = structuredError?.reason === "incomplete";
-    throw new ProviderResponseParseError(
-      "format",
-      truncated ? "服务返回内容被截断或结构不完整" : "服务返回的数据格式无法识别",
-      {
-        providerCode: truncated ? "truncated_json" : "invalid_json",
-        detail: truncated
-          ? "响应在字符串、字段或容器结束前中断，无法恢复完整角色数据"
-          : "响应看起来是结构化数据，但无法通过确定性 JSON 修复",
-        responseShape: truncated ? "truncated-json" : "malformed-json",
+    const recovered = looksLikeKnownEnvelope(trimmed) ? recoverCompleteVisibleField(trimmed) : undefined;
+    if (recovered) {
+      return {
+        text: recovered.text,
+        truncated: false,
+        responseShape: `recovered-envelope:${recovered.path}`,
         rawLength: raw.length,
-        contentType,
-        visibleCandidatePaths: [],
-        failureStage: "provider-parse",
-        ...structuredDiagnosticMeta(structuredError?.diagnostics),
-      },
-    );
+        completeVisibleFieldRecovered: true,
+        ...structuredDiagnosticMeta(recovered.diagnostics),
+        ...transportMetaFields(transportMeta),
+      };
+    }
+    const diagnostics = structuredError?.diagnostics;
+    const transportTruncated = transportMeta.transportMarkedIncomplete === true;
+    const incomplete = structuredError?.reason === "incomplete";
+    const malformedEnvelope = looksLikeKnownEnvelope(trimmed) && !transportTruncated && !incomplete;
+    const providerCode = transportTruncated
+      ? "transport_truncated"
+      : incomplete
+        ? "truncated_json"
+        : malformedEnvelope
+          ? "malformed_envelope"
+          : "invalid_json";
+    const message = transportTruncated || incomplete
+      ? "服务返回内容被截断或结构不完整"
+      : malformedEnvelope
+        ? "服务返回的 API 外壳损坏，无法恢复完整正文"
+        : "服务返回的数据格式无法识别";
+    throw new ProviderResponseParseError("format", message, {
+      providerCode,
+      detail: transportTruncated
+        ? "实际接收长度与服务声明长度不一致，且未恢复到完整角色数据"
+        : incomplete
+          ? "响应在字符串、字段或明确的 EOF 不完整标记处中断，无法恢复完整角色数据"
+          : malformedEnvelope
+            ? "响应包含已知 API 外壳字段，但外壳无法解析且没有完整可解码的角色正文字段"
+            : "响应看起来是结构化数据，但无法通过确定性 JSON 修复",
+      responseShape: transportTruncated ? "transport-truncated" : incomplete ? "truncated-json" : malformedEnvelope ? "malformed-envelope" : "malformed-json",
+      visibleCandidatePaths: [],
+      failureStage: "provider-parse",
+      ...structuredDiagnosticMeta(diagnostics),
+      ...baseMeta,
+    });
+  }
+  if (
+    structuredDiagnostics?.parseStatus === "repaired-json" &&
+    looksLikeKnownEnvelope(trimmed) &&
+    hasUnterminatedKnownVisibleField(trimmed)
+  ) {
+    throw new ProviderResponseParseError("format", "服务返回内容被截断或结构不完整", {
+      providerCode: transportMeta.transportMarkedIncomplete ? "transport_truncated" : "truncated_json",
+      detail: "已知 API 正文字段的 JSON 字符串在结束引号前中断",
+      responseShape: "truncated-visible-field",
+      visibleCandidatePaths: [],
+      failureStage: "provider-parse",
+      ...structuredDiagnosticMeta({ ...structuredDiagnostics, parseStatus: "truncated-json", unterminatedString: true }),
+      ...baseMeta,
+    });
   }
   for (let depth = 0; depth < 5 && typeof data === "string"; depth++) {
     const nested = parseNestedStringWithMeta(data);
@@ -585,17 +952,16 @@ function parseChatResponse(raw: string, contentType?: string, secrets: string[] 
   const wrappedError = wrappedErrorOf(data);
   if (wrappedError) {
     const parsed = parsedErrorBody(safeJson({ error: wrappedError.error }) ?? "", secrets);
-    const detail = parsed.message || "\u670d\u52a1\u8fd4\u56de\u4e86\u9519\u8bef\u7ed3\u679c";
+    const detail = parsed.message || "服务返回了错误结果";
     throw new ProviderResponseParseError(kindOfSuccessfulError(wrappedError.error), detail, {
       providerCode: parsed.providerCode ?? "provider_error",
       providerType: parsed.providerType,
       param: parsed.param,
       detail,
       responseShape: `${responseShape}:error@${wrappedError.path}`,
-      rawLength: raw.length,
-      contentType,
       visibleCandidatePaths,
       ...structuredDiagnosticMeta(structuredDiagnostics),
+      ...baseMeta,
     });
   }
   const signals: ExtractionSignals = { reasoning: false, tool: false };
@@ -613,22 +979,33 @@ function parseChatResponse(raw: string, contentType?: string, secrets: string[] 
       providerCode,
       detail,
       responseShape,
-      rawLength: raw.length,
-      contentType,
       visibleCandidatePaths,
       failureStage: "provider-parse",
       ...structuredDiagnosticMeta(structuredDiagnostics),
+      ...baseMeta,
     });
   }
   const finishReason = finishReasonOf(data);
+  const completeVisibleRole = completeRolePayloadOf(text);
+  const visibleFieldRecovered = Boolean(
+    completeVisibleRole &&
+      structuredDiagnostics?.parseStatus === "repaired-json" &&
+      structuredDiagnostics.outerContainerClosed === false,
+  );
   return {
-    text,
+    text: completeVisibleRole?.text ?? text,
     finishReason,
     truncated: truncatedOf(finishReason),
-    responseShape,
+    responseShape: visibleFieldRecovered
+      ? `recovered-envelope:${visibleCandidatePaths[0] ?? responseShape}`
+      : responseShape,
     rawLength: raw.length,
     outputTokens: outputTokensOf(data),
-    ...structuredDiagnosticMeta(signals.structuredDiagnostics ?? structuredDiagnostics),
+    completeVisibleFieldRecovered: visibleFieldRecovered || undefined,
+    ...structuredDiagnosticMeta(signals.structuredDiagnostics ?? structuredDiagnostics ?? completeVisibleRole?.diagnostics),
+    hasMessages: completeVisibleRole ? true : (signals.structuredDiagnostics ?? structuredDiagnostics)?.hasMessages,
+    hasInnerVoice: completeVisibleRole ? true : (signals.structuredDiagnostics ?? structuredDiagnostics)?.hasInnerVoice,
+    ...transportMetaFields(transportMeta),
   };
 }
 
@@ -646,6 +1023,8 @@ function parsedErrorBody(text: string, secrets: string[]) {
   return { message: sanitizeApiErrorText(message ?? fallback, secrets), providerCode, providerType, param };
 }
 function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
+  if (providerCode === "transport_truncated") return "服务返回内容在传输过程中被截断";
+  if (providerCode === "malformed_envelope") return "服务返回的 API 外壳损坏";
   if (providerCode === "truncated_json") return "服务返回内容被截断或结构不完整";
   if (providerCode === "missing_messages") return "角色回复缺少完整正文消息";
   if (providerCode === "missing_inner_voice") return "角色回复缺少完整心声";
@@ -662,6 +1041,10 @@ function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
   return "API 返回的数据无法按兼容格式识别";
 }
 function troubleshootingOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
+  if (providerCode === "transport_truncated")
+    return ["重新生成完整回复。", "检查中转服务的流式传输或响应长度限制。", "若问题持续，请复制脱敏诊断信息。"];
+  if (providerCode === "malformed_envelope")
+    return ["重新生成完整回复。", "检查中转是否破坏了 OpenAI 兼容响应外壳。", "若问题持续，请复制脱敏诊断信息。"];
   if (providerCode === "truncated_json")
     return ["重新生成完整回复。", "检查服务商是否提前结束输出或截断响应。", "若问题持续，请复制脱敏诊断信息。"];
   if (providerCode === "missing_messages")
@@ -705,6 +1088,14 @@ export function createApiErrorInfo(kind: ApiErrorKind, meta: ProviderErrorMetada
     hasInnerVoice: meta.hasInnerVoice,
     transportMarkedIncomplete: meta.transportMarkedIncomplete,
     protocolValidationReached: meta.protocolValidationReached,
+    transportMode: meta.transportMode,
+    receivedChars: meta.receivedChars,
+    receivedBytes: meta.receivedBytes,
+    declaredContentLength: meta.declaredContentLength,
+    contentLengthMatched: meta.contentLengthMatched,
+    completeVisibleFieldRecovered: meta.completeVisibleFieldRecovered,
+    tailKind: meta.tailKind,
+    finishReason: meta.finishReason,
     failureStage: meta.failureStage,
     troubleshooting: troubleshootingOf(kind, meta.httpStatus, meta.providerCode),
   };
@@ -743,76 +1134,142 @@ export class OpenAIProvider {
     try {
       const payloadMessages = messages.map(({ imageUrl, imageUrls, ...message }) => {
         const urls = [...(imageUrls ?? []), ...(imageUrl ? [imageUrl] : [])];
-        return urls.length ? { ...message, content: [{ type: "text", text: message.content }, ...urls.map((url) => ({ type: "image_url", image_url: { url } }))] } : message;
+        return urls.length
+          ? { ...message, content: [{ type: "text", text: message.content }, ...urls.map((url) => ({ type: "image_url", image_url: { url } }))] }
+          : message;
       });
       const response = await fetch(this.base() + "/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: "Bearer " + this.settings.apiKey },
-        body: JSON.stringify({ model: this.settings.model, messages: payloadMessages, temperature: opts.temperature ?? this.settings.temperature, stream }),
+        body: JSON.stringify({
+          model: this.settings.model,
+          messages: payloadMessages,
+          temperature: opts.temperature ?? this.settings.temperature,
+          stream,
+        }),
         signal: controller.signal,
       });
       if (!response.ok) throw this.mapStatus(response.status, await response.text());
-      if (!stream) {
-        const raw = await response.text();
-        const contentType = response.headers.get("Content-Type") ?? undefined;
-        let result: ProviderChatResult;
+      const contentType = response.headers.get("Content-Type") ?? undefined;
+      const parseOrThrow = (raw: string, meta: ResponseTransportMetadata) => {
         try {
-          result = parseChatResponse(raw, contentType, [this.settings.apiKey]);
+          return parseChatResponse(raw, contentType, [this.settings.apiKey], meta);
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
             throw this.failure(error.kind, error.message, "", error.meta);
-          throw this.failure("format", "\u670d\u52a1\u8fd4\u56de\u7684\u6570\u636e\u683c\u5f0f\u65e0\u6cd5\u8bc6\u522b\uff0c\u7f3a\u5c11\u53ef\u7528\u6b63\u6587", "", {
+          throw this.failure("format", "服务返回的数据格式无法识别，缺少可用正文", "", {
             providerCode: "invalid_response",
-            detail: `\u54cd\u5e94\u7ed3\u6784\u65e0\u6cd5\u63d0\u53d6\u6b63\u6587\uff1b\u957f\u5ea6 ${raw.length}`,
+            detail: `响应结构无法提取正文；长度 ${raw.length}`,
             responseShape: "unknown",
             rawLength: raw.length,
             contentType,
             visibleCandidatePaths: [],
+            failureStage: "provider-parse",
+            ...transportMetaFields(meta),
           });
         }
+      };
+      if (!stream) {
+        const raw = await response.text();
+        const result = parseOrThrow(raw, transportMetadataOf(response, raw, "non-stream"));
+        out = result.text;
         opts.onToken?.(result.text);
         return result;
       }
-      if (!response.body) throw this.failure("format", "服务没有返回数据流", "", { providerCode: "missing_stream_body" });
-      const reader = response.body.getReader(), decoder = new TextDecoder();
-      let buffer = "", doneMarker = false, finishReason: string | undefined, outputTokens: number | undefined;
+      if (!response.body)
+        throw this.failure("format", "服务没有返回数据流", "", {
+          providerCode: "missing_stream_body",
+          transportMode: "sse",
+        });
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let raw = "";
+      let receivedBytes = 0;
       while (true) {
         let chunk: ReadableStreamReadResult<Uint8Array>;
-        try { chunk = await reader.read(); }
-        catch { throw this.failure("interrupted", "数据流意外中断", out, { providerCode: "stream_interrupted" }); }
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, { stream: true }).replace(/\r\n/g, "\n");
-        let split: number;
-        while ((split = buffer.indexOf("\n\n")) >= 0) {
-          const event = buffer.slice(0, split); buffer = buffer.slice(split + 2);
-          for (const line of event.split("\n")) {
-            if (!line.startsWith("data:")) continue;
-            const raw = line.slice(5).trim();
-            if (!raw) continue;
-            if (raw === "[DONE]") { doneMarker = true; continue; }
-            try {
-              const value = JSON.parse(raw) as unknown;
-              const paths: string[] = [];
-              const signals: ExtractionSignals = { reasoning: false, tool: false };
-              const token = visibleTextOf(value, "stream", 0, paths, signals) ?? "";
-              finishReason = finishReasonOf(value) ?? finishReason;
-              outputTokens = outputTokensOf(value) ?? outputTokens;
-              if (token) { out += token; opts.onToken?.(token); }
-            } catch {}
-          }
+        try {
+          chunk = await reader.read();
+        } catch {
+          const meta = transportMetadataOf(response, raw, "sse", receivedBytes);
+          throw this.failure("interrupted", "数据流意外中断", "", {
+            providerCode: "transport_truncated",
+            detail: "流式传输在完整角色协议形成前中断",
+            responseShape: "interrupted-stream",
+            rawLength: raw.length,
+            contentType,
+            failureStage: "provider-parse",
+            ...transportMetaFields({ ...meta, transportMarkedIncomplete: true }),
+          });
         }
+        if (chunk.done) break;
+        receivedBytes += chunk.value.byteLength;
+        raw += decoder.decode(chunk.value, { stream: true });
       }
-      if (!out) throw this.failure("format", "数据流已结束，但没有生成正文", "", { providerCode: "empty_stream" });
-      if (!doneMarker && !finishReason) throw this.failure("interrupted", "数据流在完成前中断", out, { providerCode: "missing_done_marker" });
-      return { text: out, finishReason, truncated: truncatedOf(finishReason), responseShape: "stream", rawLength: out.length, outputTokens };
+      raw += decoder.decode();
+      const trimmedStream = raw.replace(/^\uFEFF/, "").trim();
+      const contentTypeValue = (contentType ?? "").toLowerCase();
+      const hasSseLines = /^\s*(?:data|event):/m.test(trimmedStream);
+      const looksJsonDocument = /^[\[{"']/.test(trimmedStream);
+      const looksSse = hasSseLines || (/text\/event-stream/.test(contentTypeValue) && !looksJsonDocument);
+      const looksNdjson = /(?:application\/(?:x-)?ndjson|json-seq)/.test(contentTypeValue);
+      let result: ProviderChatResult | undefined;
+      if (looksSse) {
+        const meta = transportMetadataOf(response, raw, "sse", receivedBytes);
+        try {
+          result = parseSseOrNdjson(raw, "sse", contentType, [this.settings.apiKey], meta, opts.onToken);
+        } catch (error) {
+          if (error instanceof ProviderResponseParseError)
+            throw this.failure(error.kind, error.message, "", error.meta);
+          throw error;
+        }
+      } else if (looksNdjson) {
+        const meta = transportMetadataOf(response, raw, "ndjson", receivedBytes);
+        try {
+          result = parseSseOrNdjson(raw, "ndjson", contentType, [this.settings.apiKey], meta, opts.onToken);
+        } catch (error) {
+          if (error instanceof ProviderResponseParseError)
+            throw this.failure(error.kind, error.message, "", error.meta);
+          throw error;
+        }
+      } else {
+        result = parseOrThrow(raw, transportMetadataOf(response, raw, "json-fallback", receivedBytes));
+      }
+      if (!result)
+        throw this.failure("format", "数据流已结束，但没有生成完整正文", "", {
+          providerCode: "empty_stream",
+          detail: "流式响应中没有可解析的可见正文事件",
+          responseShape: looksSse ? "sse-empty" : looksNdjson ? "ndjson-empty" : "stream-empty",
+          rawLength: raw.length,
+          contentType,
+          failureStage: "provider-parse",
+          ...transportMetaFields(
+            transportMetadataOf(
+              response,
+              raw,
+              looksSse ? "sse" : looksNdjson ? "ndjson" : "json-fallback",
+              receivedBytes,
+            ),
+          ),
+        });
+      out = result.text;
+      if (!looksSse && !looksNdjson) opts.onToken?.(result.text);
+      return result;
     } catch (error) {
       if (error instanceof ProviderError) throw error;
       if (controller.signal.aborted) {
-        if (controller.signal.reason === "timeout") throw this.failure("timeout", "请求超时", out, { providerCode: "request_timeout" });
-        throw new ProviderError("aborted", "生成已停止", out);
+        if (controller.signal.reason === "timeout")
+          throw this.failure("timeout", "请求超时", "", { providerCode: "request_timeout" });
+        throw new ProviderError("aborted", "生成已停止", "");
       }
-      if (error instanceof TypeError) throw this.failure("cors", "网络或跨域请求失败，请确认 API 支持浏览器 CORS", out, { providerCode: "cors_or_fetch_failed", detail: error.message });
-      throw this.failure("network", error instanceof Error ? error.message : "网络请求失败", out, { providerCode: "network_error", detail: error instanceof Error ? error.message : undefined });
+      if (error instanceof TypeError)
+        throw this.failure("cors", "网络或跨域请求失败，请确认 API 支持浏览器 CORS", "", {
+          providerCode: "cors_or_fetch_failed",
+          detail: error.message,
+        });
+      throw this.failure("network", error instanceof Error ? error.message : "网络请求失败", "", {
+        providerCode: "network_error",
+        detail: error instanceof Error ? error.message : undefined,
+      });
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       opts.signal?.removeEventListener("abort", abort);

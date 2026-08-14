@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateCharacterReplyTurn } from "./groupChat";
-import { OpenAIProvider, ProviderError } from "./provider";
+import { createApiErrorInfo, OpenAIProvider, ProviderError, type ProviderChatInvoker } from "./provider";
 import { defaultProvider, type Character } from "./types";
 
 const character = {
@@ -113,4 +113,74 @@ describe("generateCharacterReplyTurn strict retry", () => {
     expect(turn.parts[0].content).toBe("完整回复");
     expect(turn.innerVoice?.continuity.emotion).toBe("专注");
   });;
+  it("switches only the truncation retry to compact buffered streaming", async () => {
+    const calls: Array<{ stream?: boolean; purpose: string; prompt: string; settingStream: boolean }> = [];
+    const invoke: ProviderChatInvoker = async (providerSettings, messages, options, purpose) => {
+      calls.push({
+        stream: options.stream,
+        purpose,
+        prompt: messages.at(-1)?.content ?? "",
+        settingStream: providerSettings.stream,
+      });
+      if (calls.length === 1)
+        throw new ProviderError(
+          "format",
+          "truncated",
+          "",
+          createApiErrorInfo("format", {
+            providerCode: "truncated_json",
+            responseShape: "truncated-json",
+            failureStage: "provider-parse",
+          }),
+        );
+      return result(JSON.stringify({ messages: [{ content: "完整回复" }], innerVoice: voice }));
+    };
+    const turn = await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false },
+      [{ role: "system", content: "core persona" }, { role: "user", content: "最新用户消息" }],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+    );
+    expect(turn.parts[0]?.content).toBe("完整回复");
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toMatchObject({ stream: false, settingStream: false, purpose: "generation" });
+    expect(calls[1]).toMatchObject({ stream: true, settingStream: true, purpose: "regeneration" });
+    expect(calls[1]?.prompt).toContain("single-line minified JSON");
+    expect(calls[1]?.prompt).toContain("physicalState");
+    expect(calls[1]?.prompt).toContain("devilThought");
+    expect(calls[1]?.prompt).toContain("Do not continue");
+  });
+
+  it("keeps a non-truncation format retry non-streaming", async () => {
+    const streams: Array<boolean | undefined> = [];
+    const invoke: ProviderChatInvoker = async (_providerSettings, _messages, options) => {
+      streams.push(options.stream);
+      if (streams.length === 1)
+        throw new ProviderError("format", "invalid", "", createApiErrorInfo("format", { providerCode: "invalid_role_protocol" }));
+      return result(JSON.stringify({ messages: [{ content: "完整回复" }], innerVoice: voice }));
+    };
+    await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false },
+      [{ role: "user", content: "你好" }],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+    );
+    expect(streams).toEqual([false, false]);
+  });
 });

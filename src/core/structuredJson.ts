@@ -199,7 +199,9 @@ function incompleteAfterRepairFailure(scan: ContainerScan, input: string, option
   if (options.transportMarkedIncomplete) return true;
   if (scan.trailingIncompleteToken) return true;
   if (scan.unterminatedString && !/[}\]]\s*$/.test(input)) return true;
-  return scan.openContainers > 0 && !scan.mismatchedContainer;
+  // Open containers alone are ambiguous when malformed quotes confused the scanner.
+  // Treat them as truncation only when transport or an EOF token/string proves content ended early.
+  return false;
 }
 
 export function parseStructuredJsonWithMeta<T = unknown>(

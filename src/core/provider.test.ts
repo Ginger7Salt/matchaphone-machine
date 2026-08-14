@@ -4,6 +4,10 @@ import {defaultProvider} from "./types";
 import {parseReplyTurn,parseStrictReplyTurn} from "./replyBubbles";
 const settings={...defaultProvider,apiKey:"test",baseUrl:"https://api.test/v1",stream:false,timeoutMs:1000};
 const encoder=new TextEncoder();
+const completeRolePayload=()=>JSON.stringify({
+ messages:[{content:"完整回复"}],
+ innerVoice:{sections:{physicalState:"呼吸平稳",emotionAndMind:"认真回应",unspokenWords:"还有一点想说",selfDeception:"假装并不在意",triggeredMemory:"此刻没有被触发的具体回忆",angelThought:"先尊重对方",devilThought:"想更直接一点"},continuity:{emotion:"专注"}},
+});
 function streamResponse(chunks:string[],fail=false){let i=0;return new Response(new ReadableStream<Uint8Array>({pull(controller){if(i<chunks.length){controller.enqueue(encoder.encode(chunks[i++]));return}if(fail){controller.error(new Error("broken"));return}controller.close()}}),{status:200,headers:{"Content-Type":"text/event-stream"}})}
 describe("OpenAI provider",()=>{ it("does not send output token limits",async()=>{let payload:any;vi.stubGlobal("fetch",vi.fn().mockImplementation(async(_url,options:any)=>{payload=JSON.parse(options.body);return new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})}));await new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false});expect(payload).not.toHaveProperty("max_tokens");expect(payload).not.toHaveProperty("max_completion_tokens")});
  it("extracts nested relay wrappers and metadata",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({data:{result:{choices:[{message:{content:"正文"},finish_reason:"length"}],usage:{completion_tokens:321}}}}),{status:200,headers:{"Content-Type":"application/json"}})));await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"正文",finishReason:"length",truncated:true,responseShape:"wrapper:data",outputTokens:321})});
@@ -16,7 +20,7 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
  it.each([[401,"auth"],[404,"model"],[429,"rate"],[500,"server"]] as const)("maps %s to %s",async(status,kind)=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response("error",{status})));await expect(new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false})).rejects.toMatchObject({kind})});
  it("rejects invalid response",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[]}),{status:200,headers:{"Content-Type":"application/json"}})));await expect(new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false})).rejects.toBeInstanceOf(ProviderError)});
  it("parses SSE split across chunks",async()=>{const tokens:string[]=[];vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse(['data: {"choices":[{"delta":{"content":"你','好"}}]}\n\ndata: {"choices":[{"delta":{"content":"！"}}]}\n\n','data: [DONE]\n\n'])));await expect(new OpenAIProvider({...settings,stream:true}).chat([{role:"user",content:"hi"}],{stream:true,onToken:t=>tokens.push(t)})).resolves.toBe("你好！");expect(tokens).toEqual(["你好","！"])});
- it("reports interrupted stream with partial text",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse(['data: {"choices":[{"delta":{"content":"部分"}}]}\n\n'],true)));await expect(new OpenAIProvider({...settings,stream:true}).chat([{role:"user",content:"hi"}],{stream:true})).rejects.toMatchObject({kind:"interrupted",partial:"部分"})});
+ it("reports interrupted stream with partial text",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse(['data: {"choices":[{"delta":{"content":"部分"}}]}\n\n'],true)));await expect(new OpenAIProvider({...settings,stream:true}).chat([{role:"user",content:"hi"}],{stream:true})).rejects.toMatchObject({kind:"interrupted",partial:"",apiError:{providerCode:"transport_truncated",transportMode:"sse"}})});
  it("distinguishes request timeout",async()=>{vi.stubGlobal("fetch",vi.fn((_u,options:any)=>new Promise((_r,reject)=>{options.signal.addEventListener("abort",()=>reject(new DOMException("Aborted","AbortError"))) })));await expect(new OpenAIProvider({...settings,timeoutMs:5}).chat([{role:"user",content:"hi"}],{stream:false})).rejects.toMatchObject({kind:"timeout"})});
  it("distinguishes user abort",async()=>{const controller=new AbortController();vi.stubGlobal("fetch",vi.fn((_u,_o)=>new Promise((_r,reject)=>{controller.signal.addEventListener("abort",()=>reject(new DOMException("Aborted","AbortError"))) })));const p=new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false,signal:controller.signal});controller.abort();await expect(p).rejects.toMatchObject({kind:"aborted"})});
  it.each([[400,"format"],[408,"timeout"],[422,"format"],[503,"server"]] as const)("keeps HTTP status and guidance for %s",async(status,kind)=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({error:{message:"provider detail",code:"provider_code",type:"provider_type",param:"messages"}}),{status,headers:{"Content-Type":"application/json"}})));const error=await new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false}).catch(value=>value) as ProviderError;expect(error).toMatchObject({kind,apiError:{source:"api",kind,httpStatus:status,providerCode:"provider_code",providerType:"provider_type",param:"messages"}});expect(error.apiError?.troubleshooting.length).toBeGreaterThan(1)});
@@ -139,6 +143,76 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
   expect(JSON.stringify(error.apiError)).not.toContain(sentinel);
  });
 
+ it("recovers a complete role field when only the API envelope tail is cut",async()=>{
+  const role=completeRolePayload();
+  const raw=`{"id":"relay","choices":[{"message":{"role":"assistant","content":${JSON.stringify(role)}}}],"usage":`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(raw,{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false});
+  expect(result).toMatchObject({responseShape:"recovered-envelope:choices[0].message.content",completeVisibleFieldRecovered:true,hasMessages:true,hasInnerVoice:true,transportMode:"non-stream"});
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("完整回复");
+ });
+ it("does not recover an API envelope cut inside the visible content string",async()=>{
+  const sentinel="PRIVATE_ENVELOPE_SENTINEL";
+  const encoded=JSON.stringify(completeRolePayload().replace("完整回复",sentinel));
+  const raw=`{"choices":[{"message":{"content":${encoded.slice(0,-12)}`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(raw,{status:200,headers:{"Content-Type":"application/json"}})));
+  const error=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false}).catch(value=>value) as ProviderError;
+  expect(error.apiError).toMatchObject({providerCode:"truncated_json",failureStage:"provider-parse"});
+  expect(error.apiError?.completeVisibleFieldRecovered).not.toBe(true);
+  expect(JSON.stringify(error.apiError)).not.toContain(sentinel);
+ });
+ it("buffers single-line CRLF SSE including the final residual event before exposing chunks",async()=>{
+  const role=completeRolePayload(),split=Math.floor(role.length/2),seen:string[]=[];
+  const body=[
+   `data: ${JSON.stringify({choices:[{delta:{content:role.slice(0,split)}}]})}\r\n`,
+   `data: ${JSON.stringify({choices:[{delta:{content:role.slice(split)},finish_reason:"stop"}]})}`,
+  ];
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse(body)));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true,onToken:value=>seen.push(value)});
+  expect(result).toMatchObject({transportMode:"sse",responseShape:"sse",hasMessages:true,hasInnerVoice:true});
+  expect(seen.join("")).toBe(role);
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("完整回复");
+ });
+ it("reassembles relay-split SSE JSON records across event boundaries",async()=>{
+  const role=completeRolePayload();
+  const event=JSON.stringify({choices:[{delta:{content:role},finish_reason:"stop"}]});
+  const split=Math.floor(event.length/2);
+  const body=`data: ${event.slice(0,split)}\n\ndata: ${event.slice(split)}\n\ndata: [DONE]`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse([body])));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result).toMatchObject({transportMode:"sse",text:role,hasMessages:true,hasInnerVoice:true});
+ });
+ it("reassembles relay-split NDJSON records without exposing partial content",async()=>{
+  const role=completeRolePayload();
+  const event=JSON.stringify({response:role,done:true});
+  const split=Math.floor(event.length/2);
+  const body=`${event.slice(0,split)}\n${event.slice(split)}`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(body,{status:200,headers:{"Content-Type":"application/x-ndjson"}})));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result).toMatchObject({transportMode:"ndjson",text:role,hasMessages:true,hasInnerVoice:true});
+ }); it("supports streamed NDJSON and ordinary JSON fallback when stream true",async()=>{
+  const role=completeRolePayload(),split=Math.floor(role.length/2);
+  const ndjson=`${JSON.stringify({response:role.slice(0,split),done:false})}\n${JSON.stringify({response:role.slice(split),done:true})}`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValueOnce(new Response(ndjson,{status:200,headers:{"Content-Type":"application/x-ndjson"}})).mockResolvedValueOnce(new Response(JSON.stringify({choices:[{message:{content:role}}]}),{status:200,headers:{"Content-Type":"application/json"}})));
+  await expect(new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true})).resolves.toMatchObject({transportMode:"ndjson",hasMessages:true,hasInnerVoice:true});
+  await expect(new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true})).resolves.toMatchObject({transportMode:"json-fallback",text:role});
+ });
+ it("falls back to ordinary JSON when a relay incorrectly labels it as event-stream",async()=>{
+  const role=completeRolePayload();
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:role}}]}),{status:200,headers:{"Content-Type":"text/event-stream"}})));
+  await expect(new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true})).resolves.toMatchObject({transportMode:"json-fallback",text:role,hasMessages:true,hasInnerVoice:true});
+ });
+ it("ignores streamed reasoning and tool arguments while collecting visible role JSON",async()=>{
+  const role=completeRolePayload();
+  const body=`data: ${JSON.stringify({choices:[{delta:{reasoning_content:"hidden",tool_calls:[{function:{arguments:"secret"}}]}}]})}\n`+
+   `data: ${JSON.stringify({choices:[{delta:{content:role},finish_reason:"stop"}]})}\n`+
+   "data: [DONE]";
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse([body])));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result.text).toBe(role);
+  expect(result.text).not.toContain("hidden");
+  expect(result.text).not.toContain("secret");
+ });
 });
 
 

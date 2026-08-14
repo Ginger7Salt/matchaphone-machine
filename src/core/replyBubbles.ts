@@ -472,6 +472,16 @@ function strictTurnError(
       unterminatedString: diagnostics?.unterminatedString ?? response?.unterminatedString,
       hasMessages: diagnostics?.hasMessages ?? response?.hasMessages,
       hasInnerVoice: diagnostics?.hasInnerVoice ?? response?.hasInnerVoice,
+      transportMarkedIncomplete: response?.transportMarkedIncomplete,
+      protocolValidationReached: true,
+      transportMode: response?.transportMode,
+      receivedChars: response?.receivedChars,
+      receivedBytes: response?.receivedBytes,
+      declaredContentLength: response?.declaredContentLength,
+      contentLengthMatched: response?.contentLengthMatched,
+      completeVisibleFieldRecovered: response?.completeVisibleFieldRecovered,
+      tailKind: response?.tailKind,
+      finishReason: response?.finishReason,
       failureStage,
     }),
   );
@@ -531,6 +541,9 @@ export function parseStrictReplyTurn(
     );
   }
 }
+export interface ReplyProtocolOptions {
+  compactComplete?: boolean;
+}
 export function replyBubbleInstruction(
   character: Character,
   bilingual: boolean,
@@ -540,6 +553,7 @@ export function replyBubbleInstruction(
   islandActionEnabled = false,
   plan?: ReplyBubblePlan,
   stickerCatalog: ReplyStickerCatalogItem[] = [],
+  options: ReplyProtocolOptions = {},
 ) {
   const resolvedPlan = plan ?? replyBubblePlanOf(character, [], scene),
     range = resolvedPlan.range,
@@ -570,6 +584,9 @@ export function replyBubbleInstruction(
     musicActionEnabled ? "When listening context is present, use at most one musicAction and only when naturally relevant. Track actions may only use candidate IDs explicitly supplied by the listening context. Balanced mode requires propose-control for pause, next, or clear-queue." : "",
     islandActionEnabled ? "When the island context explicitly requires an invitation decision, islandAction must not be null. Otherwise use at most one islandAction and only when naturally relevant." : "",
     stickerCatalog.length ? `Available stickers (use only an exact id from this list): ${JSON.stringify(stickerCatalog)}. Set stickerId only when one sticker naturally adds an in-character emotion or attitude to this exact turn. Use at most one, use stickers sparingly, never send one merely because it is available, and do not explain or repeat the sticker meaning in visible text. Otherwise return stickerId as null.` : "",
+    options.compactComplete
+      ? "This is the one complete compact rewrite. Return exactly one single-line minified JSON object with no Markdown, code fence, explanation, or surrounding text. Keep every visible bubble short but semantically complete. Keep all seven innerVoice section values concise, specific, non-empty Simplified Chinese. In continuity, emotion is mandatory; omit concern, pendingIntent, and physicalState unless essential. Never omit messages, required translations, or any of the seven innerVoice sections."
+      : "",
     "Return strict JSON only: " + shape,
   ].filter(Boolean).join(" ");
 }

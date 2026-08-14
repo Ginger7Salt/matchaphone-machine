@@ -72,9 +72,21 @@ export function loreDecisionTokenCount(items: LoreDecision[]) {
     .reduce((sum, item) => sum + estimateTextTokens(item.content), 0);
 }
 
-export function compactChatItemsForRetry(items: ChatItem[], ratio = 0.55) {
-  if (items.length <= 3) return items;
-  const system = items.filter((item) => item.role === "system");
+function compactRetrySystemContent(content: string) {
+  const limit = 14_000;
+  if (content.length <= limit) return content;
+  // buildContext places role rules and the core persona near the front, while optional
+  // memories/lore and one-shot notes are later. Keep both ends without rewriting facts.
+  const head = content.slice(0, 9_000).trimEnd();
+  const tail = content.slice(-3_500).trimStart();
+  return `${head}\n\n[低优先级上下文已为完整重生成压缩]\n\n${tail}`;
+}
+
+export function compactChatItemsForRetry(items: ChatItem[], ratio = 0.4) {
+  if (items.length <= 3 && items.every((item) => item.role !== "system" || item.content.length <= 14_000)) return items;
+  const system = items
+    .filter((item) => item.role === "system")
+    .map((item) => ({ ...item, content: compactRetrySystemContent(item.content) }));
   const nonSystem = items.filter((item) => item.role !== "system");
   let latestUserIndex = -1;
   for (let index = nonSystem.length - 1; index >= 0; index -= 1) {

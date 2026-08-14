@@ -77,7 +77,7 @@ export async function selectGroupReplyOrder(
         },
         { role: "user", content: prompt },
       ],
-      { stream: false, signal },
+      { stream: false, signal, timeoutMs: null },
     );
     return validateReplyOrder(parse(raw), fallback);
   } catch (error) {
@@ -85,6 +85,12 @@ export async function selectGroupReplyOrder(
     return fallback;
   }
 }
+function shouldUseCompactStreamingRetry(error: unknown) {
+  if (!(error instanceof ProviderError)) return false;
+  const code = error.apiError?.providerCode;
+  return code === "truncated_json" || code === "transport_truncated" || code === "malformed_envelope";
+}
+
 export async function generateCharacterReplyTurn(
   settings: ProviderSettings,
   context: ChatItem[],
@@ -104,6 +110,7 @@ export async function generateCharacterReplyTurn(
   let lastFormatError: unknown,
     adaptiveRetryReason = "";
   for (let attempt = 0; attempt < 2; attempt++) {
+    const compactStreamingRetry = attempt === 1 && shouldUseCompactStreamingRetry(lastFormatError);
     const request: ChatItem = {
       role: "user",
       content:
@@ -116,9 +123,12 @@ export async function generateCharacterReplyTurn(
           islandActionEnabled,
           plan,
           stickerCatalog,
+          { compactComplete: compactStreamingRetry },
         ) +
         (attempt
-          ? " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field." + (adaptiveRetryReason ? " " + adaptiveRetryReason : "")
+          ? compactStreamingRetry
+            ? " The previous provider response was cut or its API envelope was damaged. Generate the entire turn again from the beginning as compact complete JSON. Do not continue, quote, or merge any previous partial output."
+            : " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field." + (adaptiveRetryReason ? " " + adaptiveRetryReason : "")
           : ""),
     };
     try {
@@ -136,19 +146,19 @@ export async function generateCharacterReplyTurn(
       const fitted = fitChatItemsToInternalBudget(requestItems, { requiredIndexes });
       await onProviderAttempt?.(attempt + 1);
       const options = {
-        stream: false,
+        stream: compactStreamingRetry,
         signal,
         temperature: attempt ? 0.1 : settings.temperature,
         timeoutMs: null,
       } as const;
       const response = invokeProvider
         ? await invokeProvider(
-            { ...settings, stream: false },
+            { ...settings, stream: compactStreamingRetry },
             fitted.items,
             options,
             attempt ? "regeneration" : "generation",
           )
-        : await new OpenAIProvider({ ...settings, stream: false }).chatWithMeta(
+        : await new OpenAIProvider({ ...settings, stream: compactStreamingRetry }).chatWithMeta(
             fitted.items,
             options,
           );
@@ -165,16 +175,12 @@ export async function generateCharacterReplyTurn(
         const retryReason = adaptiveReplyRetryReason(plan, normalized.parts);
         if (!retryReason || attempt === 1) return normalized;
         adaptiveRetryReason = retryReason;
-        lastFormatError = new ProviderError("format", "\u89d2\u8272\u56de\u590d\u5728\u81ea\u9002\u5e94\u6a21\u5f0f\u4e0b\u8fc7\u5ea6\u5c55\u5f00\u6216\u8fde\u7eed\u91cd\u590d\u76f8\u540c\u6761\u6570");
+        lastFormatError = new ProviderError("format", "角色回复在自适应模式下过度展开或连续重复相同条数");
         continue;
       }
-      lastFormatError = new ProviderError(
-        "format",
-        "\u89d2\u8272\u56de\u590d\u6761\u6570\u4e0d\u5728\u8bbe\u7f6e\u8303\u56f4\u5185",
-      );
+      lastFormatError = new ProviderError("format", "角色回复条数不在设置范围内");
     } catch (error) {
-      if (error instanceof ProviderError && error.kind === "aborted")
-        throw error;
+      if (error instanceof ProviderError && error.kind === "aborted") throw error;
       if (!(error instanceof ProviderError) || (error.kind !== "format" && !isContextOverflowError(error)))
         throw error;
       lastFormatError = error;
@@ -182,10 +188,9 @@ export async function generateCharacterReplyTurn(
   }
   throw (
     lastFormatError ??
-    new ProviderError("format", "\u89d2\u8272\u6ca1\u6709\u8fd4\u56de\u5b8c\u6574\u5fc3\u58f0\u548c\u6d88\u606f")
+    new ProviderError("format", "角色没有返回完整心声和消息")
   );
 }
-
 export async function generateCharacterReplyBubbles(
   settings: ProviderSettings,
   context: ChatItem[],
