@@ -8,6 +8,10 @@ const completeRolePayload=()=>JSON.stringify({
  messages:[{content:"完整回复"}],
  innerVoice:{sections:{physicalState:"呼吸平稳",emotionAndMind:"认真回应",unspokenWords:"还有一点想说",selfDeception:"假装并不在意",triggeredMemory:"此刻没有被触发的具体回忆",angelThought:"先尊重对方",devilThought:"想更直接一点"},continuity:{emotion:"专注"}},
 });
+const completeCompactRolePayload=()=>JSON.stringify({
+ m:[{c:"\u5b8c\u6574\u56de\u590d"}],
+ v:{s:{p:"\u547c\u5438\u5e73\u7a33",e:"\u8ba4\u771f\u56de\u5e94",u:"\u8fd8\u6709\u4e00\u70b9\u60f3\u8bf4",d:"\u5047\u88c5\u5e76\u4e0d\u5728\u610f",r:"\u6b64\u523b\u6ca1\u6709\u88ab\u89e6\u53d1\u7684\u5177\u4f53\u56de\u5fc6",a:"\u5148\u5c0a\u91cd\u5bf9\u65b9",x:"\u60f3\u66f4\u76f4\u63a5\u4e00\u70b9"},q:{e:"\u4e13\u6ce8"}},
+});
 function streamResponse(chunks:string[],fail=false){let i=0;return new Response(new ReadableStream<Uint8Array>({pull(controller){if(i<chunks.length){controller.enqueue(encoder.encode(chunks[i++]));return}if(fail){controller.error(new Error("broken"));return}controller.close()}}),{status:200,headers:{"Content-Type":"text/event-stream"}})}
 describe("OpenAI provider",()=>{ it("does not send output token limits",async()=>{let payload:any;vi.stubGlobal("fetch",vi.fn().mockImplementation(async(_url,options:any)=>{payload=JSON.parse(options.body);return new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})}));await new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false});expect(payload).not.toHaveProperty("max_tokens");expect(payload).not.toHaveProperty("max_completion_tokens")});
  it("extracts nested relay wrappers and metadata",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({data:{result:{choices:[{message:{content:"正文"},finish_reason:"length"}],usage:{completion_tokens:321}}}}),{status:200,headers:{"Content-Type":"application/json"}})));await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"正文",finishReason:"length",truncated:true,responseShape:"wrapper:data",outputTokens:321})});
@@ -160,6 +164,70 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
   expect(error.apiError).toMatchObject({providerCode:"truncated_json",failureStage:"provider-parse"});
   expect(error.apiError?.completeVisibleFieldRecovered).not.toBe(true);
   expect(JSON.stringify(error.apiError)).not.toContain(sentinel);
+ });
+ it("accepts a top-level compact role protocol and reports compact diagnostics",async()=>{
+  const role=completeCompactRolePayload();
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(role,{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false});
+  expect(result).toMatchObject({text:role,responseShape:"direct-role-compact",wireFormat:"compact",hasMessages:true,hasInnerVoice:true,strictParseSucceeded:true,protocolValidationReached:true});
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
+ });
+ it("preserves compact role JSON extracted from an OpenAI response envelope",async()=>{
+  const role=completeCompactRolePayload();
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:role},finish_reason:"stop"}]}),{status:200,headers:{"Content-Type":"application/json"}})));
+  await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:role,responseShape:"choices",wireFormat:"compact",hasMessages:true,hasInnerVoice:true,finishReason:"stop"});
+ });
+ it("recovers a complete compact role field when only the response envelope tail is cut",async()=>{
+  const role=completeCompactRolePayload();
+  const raw=`{"choices":[{"message":{"content":${JSON.stringify(role)}}}],"usage":`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(raw,{status:200,headers:{"Content-Type":"application/json"}})));
+  await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:role,responseShape:"recovered-envelope:choices[0].message.content",wireFormat:"compact",completeVisibleFieldRecovered:true,hasMessages:true,hasInnerVoice:true});
+ });
+ it("accepts compact JSON assembled from OpenAI SSE delta content",async()=>{
+  const role=completeCompactRolePayload(),split=Math.floor(role.length/2);
+  const body=`data: ${JSON.stringify({choices:[{delta:{content:role.slice(0,split)}}]})}\n\n`+
+   `data: ${JSON.stringify({choices:[{delta:{content:role.slice(split)},finish_reason:"stop"}]})}\n\n`+
+   "data: [DONE]\n\n";
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse([body])));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result).toMatchObject({transportMode:"sse",text:role,finishReason:"stop",wireFormat:"compact",hasMessages:true,hasInnerVoice:true,protocolValidationReached:true});
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
+ });
+ it("accepts a compact role object delivered directly as an SSE event",async()=>{
+  const role=JSON.parse(completeCompactRolePayload());
+  const body=`data: ${JSON.stringify({...role,finish_reason:"stop"})}\n\ndata: [DONE]\n\n`;
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse([body])));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result).toMatchObject({transportMode:"sse",wireFormat:"compact",hasMessages:true,hasInnerVoice:true,finishReason:"stop"});
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
+ });
+ it("accepts a compact role object delivered directly as NDJSON",async()=>{
+  const role=completeCompactRolePayload();
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(role+"\n",{status:200,headers:{"Content-Type":"application/x-ndjson"}})));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result).toMatchObject({transportMode:"ndjson",wireFormat:"compact",hasMessages:true,hasInnerVoice:true});
+  expect(parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
+ });
+ it("falls back to a compact JSON document when event-stream content type is wrong",async()=>{
+  const role=completeCompactRolePayload();
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(role,{status:200,headers:{"Content-Type":"text/event-stream"}})));
+  await expect(new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true})).resolves.toMatchObject({transportMode:"json-fallback",text:role,responseShape:"direct-role-compact",wireFormat:"compact",hasMessages:true,hasInnerVoice:true});
+ });
+ it("passes an incomplete compact protocol to strict validation instead of reporting invalid_response",async()=>{
+  const role=JSON.stringify({m:[{c:"\u5b8c\u6574\u56de\u590d"}]});
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(role,{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false});
+  expect(result).toMatchObject({responseShape:"direct-role-compact",wireFormat:"compact",hasMessages:true,hasInnerVoice:false});
+  const error=(()=>{try{return parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result)}catch(value){return value}})() as ProviderError;
+  expect(error.apiError).toMatchObject({providerCode:"missing_inner_voice",failureStage:"inner-voice",protocolValidationReached:true,wireFormat:"compact"});
+ });
+ it("passes compact inner voice without m to strict missing-message validation",async()=>{
+  const role=JSON.stringify({v:{s:{p:"p",e:"e",u:"u",d:"d",r:"r",a:"a",x:"x"},q:{e:"e"}}});
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(role,{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false});
+  expect(result).toMatchObject({responseShape:"direct-role-compact",wireFormat:"compact",hasMessages:false,hasInnerVoice:true});
+  const error=(()=>{try{return parseStrictReplyTurn(result.text,false,{min:1,max:8,adaptive:true},true,result)}catch(value){return value}})() as ProviderError;
+  expect(error.apiError).toMatchObject({providerCode:"missing_messages",failureStage:"role-protocol",protocolValidationReached:true,wireFormat:"compact"});
  });
  it("buffers single-line CRLF SSE including the final residual event before exposing chunks",async()=>{
   const role=completeRolePayload(),split=Math.floor(role.length/2),seen:string[]=[];

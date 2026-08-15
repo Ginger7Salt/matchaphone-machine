@@ -640,6 +640,7 @@ export type ChatProviderCallPurpose =
   | "review"
   | "auxiliary";
 export type ChatProviderTransportMode = "non-stream" | "sse" | "ndjson" | "json-fallback";
+export type ChatReplyWireFormat = "legacy" | "compact";
 export type ChatProviderTailKind = "quote" | "object-close" | "array-close" | "comma" | "colon" | "escape" | "other";
 export interface ChatProviderCallTrace {
   ordinal: 1 | 2;
@@ -663,6 +664,8 @@ export interface ChatProviderCallTrace {
   unterminatedString?: boolean;
   hasMessages?: boolean;
   hasInnerVoice?: boolean;
+  wireFormat?: ChatReplyWireFormat;
+  protocolValidationReached?: boolean;
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
@@ -1049,6 +1052,7 @@ export interface ApiErrorInfo {
   unterminatedString?: boolean;
   hasMessages?: boolean;
   hasInnerVoice?: boolean;
+  wireFormat?: ChatReplyWireFormat;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
   transportMode?: ChatProviderTransportMode;

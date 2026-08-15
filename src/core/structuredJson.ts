@@ -1,10 +1,17 @@
-﻿import { jsonrepair } from "jsonrepair";
+﻿import type { ChatReplyWireFormat } from "./types";
+import { jsonrepair } from "jsonrepair";
 
 export type StructuredJsonParseStatus =
   | "strict-json"
   | "repaired-json"
   | "unrecoverable-json"
   | "truncated-json";
+
+export interface ReplyProtocolPresence {
+  wireFormat?: ChatReplyWireFormat;
+  hasMessages: boolean;
+  hasInnerVoice: boolean;
+}
 
 export interface StructuredJsonDiagnostics {
   parseStatus: StructuredJsonParseStatus;
@@ -17,6 +24,7 @@ export interface StructuredJsonDiagnostics {
   unterminatedString: boolean;
   hasMessages: boolean;
   hasInnerVoice: boolean;
+  wireFormat?: ChatReplyWireFormat;
 }
 
 export interface StructuredJsonResult<T = unknown> {
@@ -103,14 +111,40 @@ function scanContainers(input: string): ContainerScan {
   };
 }
 
-function flagsOf(value: unknown) {
+export function replyProtocolPresenceOf(value: unknown): ReplyProtocolPresence {
   const row = value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+  if (!row) return { hasMessages: false, hasInnerVoice: false };
+  const legacyMessages = Array.isArray(row.messages);
+  const compactMessages = Array.isArray(row.m);
+  const legacyInnerVoice = Boolean(row.innerVoice && typeof row.innerVoice === "object" && !Array.isArray(row.innerVoice));
+  const compactInnerVoice = Boolean(row.v && typeof row.v === "object" && !Array.isArray(row.v));
+  const legacyMentioned = "messages" in row || "innerVoice" in row;
+  const compactMentioned = "m" in row || "v" in row;
+  const wireFormat: ChatReplyWireFormat | undefined =
+    compactMessages && compactInnerVoice
+      ? "compact"
+      : legacyMessages && legacyInnerVoice
+        ? "legacy"
+        : compactMentioned && !legacyMentioned
+          ? "compact"
+          : legacyMentioned
+            ? "legacy"
+            : compactMentioned
+              ? "compact"
+              : undefined;
   return {
-    hasMessages: Boolean(row && Array.isArray(row.messages)),
-    hasInnerVoice: Boolean(row && row.innerVoice && typeof row.innerVoice === "object"),
+    wireFormat,
+    hasMessages: legacyMessages || compactMessages,
+    hasInnerVoice: legacyInnerVoice || compactInnerVoice,
   };
+}
+
+function looksLikeReplyProtocolText(value: string) {
+  const legacy = /(?:^|[,{\s])(?:["']?messages["']?|["']?innerVoice["']?)\s*:/i.test(value);
+  const compact = /(?:^|[,{\s])(?:["']?m["']?|["']?v["']?)\s*:/i.test(value);
+  return legacy || compact;
 }
 
 function diagnosticsOf(
@@ -130,7 +164,7 @@ function diagnosticsOf(
     protocolValidationReached: false,
     outerContainerClosed: scan.outerContainerClosed,
     unterminatedString: scan.unterminatedString,
-    ...flagsOf(value),
+    ...replyProtocolPresenceOf(value),
   };
 }
 
@@ -236,8 +270,8 @@ export function parseStructuredJsonWithMeta<T = unknown>(
       const repaired = jsonrepair(candidate);
       const parsed = nativeParse(repaired);
       if (!parsed.ok) continue;
-      const parsedFlags = flagsOf(parsed.value);
-      const roleProtocolCandidate = /(?:^|[,{\s])(?:["']?messages["']?|["']?innerVoice["']?)\s*:/i.test(candidate);
+      const parsedFlags = replyProtocolPresenceOf(parsed.value);
+      const roleProtocolCandidate = looksLikeReplyProtocolText(candidate);
       const repairedProtocolComplete = parsedFlags.hasMessages && parsedFlags.hasInnerVoice;
       if (roleProtocolCandidate && !repairedProtocolComplete && incompleteAfterRepairFailure(scanContainers(candidate), candidate, options))
         continue;

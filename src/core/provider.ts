@@ -1,8 +1,9 @@
 ﻿import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ProviderSettings } from "./types";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderSettings } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
+  replyProtocolPresenceOf,
   StructuredJsonError,
   type StructuredJsonDiagnostics,
   type StructuredJsonParseStatus,
@@ -28,6 +29,7 @@ export interface ProviderErrorMetadata {
   unterminatedString?: boolean;
   hasMessages?: boolean;
   hasInnerVoice?: boolean;
+  wireFormat?: ChatReplyWireFormat;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
   transportMode?: ChatProviderTransportMode;
@@ -55,6 +57,7 @@ export interface ProviderChatResult {
   unterminatedString?: boolean;
   hasMessages?: boolean;
   hasInnerVoice?: boolean;
+  wireFormat?: ChatReplyWireFormat;
   transportMarkedIncomplete?: boolean;
   protocolValidationReached?: boolean;
   transportMode?: ChatProviderTransportMode;
@@ -177,6 +180,7 @@ function structuredDiagnosticMeta(
   | "unterminatedString"
   | "hasMessages"
   | "hasInnerVoice"
+  | "wireFormat"
   | "transportMarkedIncomplete"
   | "protocolValidationReached"
 > {
@@ -190,6 +194,7 @@ function structuredDiagnosticMeta(
     unterminatedString: diagnostics.unterminatedString,
     hasMessages: diagnostics.hasMessages,
     hasInnerVoice: diagnostics.hasInnerVoice,
+    wireFormat: diagnostics.wireFormat,
     transportMarkedIncomplete: diagnostics.transportMarkedIncomplete,
     protocolValidationReached: diagnostics.protocolValidationReached,
   };
@@ -205,8 +210,9 @@ function directRoleProtocolText(value: unknown) {
     return safeJson(value);
   }
   if (!isRecord(value)) return undefined;
-  if (Array.isArray(value.messages)) return safeJson(value);
-  if (value.innerVoice !== undefined && ["content", "message", "reply"].some((key) => value[key] !== undefined))
+  const presence = replyProtocolPresenceOf(value);
+  if (presence.wireFormat) return safeJson(value);
+  if (presence.hasInnerVoice && ["content", "message", "reply"].some((key) => value[key] !== undefined))
     return safeJson(value);
   return undefined;
 }
@@ -438,7 +444,9 @@ function responseShapeOf(value: unknown): string {
   if (Array.isArray(value)) return directRoleProtocolText(value) ? "direct-role-array" : "array";
   if (!value || typeof value !== "object") return typeof value;
   const row = value as JsonRecord;
-  if (Array.isArray(row.messages)) return "direct-role-json";
+  const protocol = replyProtocolPresenceOf(row);
+  if (protocol.wireFormat === "compact") return "direct-role-compact";
+  if (protocol.hasMessages) return "direct-role-json";
   if (Array.isArray(row.choices)) return "choices";
   if (Array.isArray(row.output)) return "responses-output";
   for (const key of WRAPPER_KEYS) if (row[key] !== undefined) return `wrapper:${key}`;
@@ -451,7 +459,7 @@ function truncatedOf(reason?: string) {
   return Boolean(reason && /length|max[_ -]?tokens?|context|incomplete|truncat/i.test(reason));
 }
 function errorRecordOf(value: unknown): JsonRecord | undefined {
-  if (!isRecord(value) || Array.isArray(value.messages)) return undefined;
+  if (!isRecord(value) || replyProtocolPresenceOf(value).hasMessages) return undefined;
   if (isRecord(value.error)) return value.error;
   if (typeof value.error === "string") return { message: value.error };
   const status = cleanScalar(value.status, 60)?.toLowerCase();
@@ -581,7 +589,8 @@ function completeRolePayloadOf(input: string): { text: string; diagnostics: Stru
       return undefined;
     }
   }
-  if (!isRecord(value) || !Array.isArray(value.messages) || !isRecord(value.innerVoice) || !diagnostics) return undefined;
+  const presence = replyProtocolPresenceOf(value);
+  if (!isRecord(value) || !presence.hasMessages || !presence.hasInnerVoice || !diagnostics) return undefined;
   const text = safeJson(value);
   return text ? { text, diagnostics } : undefined;
 }
@@ -1005,6 +1014,10 @@ function parseChatResponse(
     ...structuredDiagnosticMeta(signals.structuredDiagnostics ?? structuredDiagnostics ?? completeVisibleRole?.diagnostics),
     hasMessages: completeVisibleRole ? true : (signals.structuredDiagnostics ?? structuredDiagnostics)?.hasMessages,
     hasInnerVoice: completeVisibleRole ? true : (signals.structuredDiagnostics ?? structuredDiagnostics)?.hasInnerVoice,
+    wireFormat: (completeVisibleRole?.diagnostics ?? signals.structuredDiagnostics ?? structuredDiagnostics)?.wireFormat,
+    protocolValidationReached: Boolean(
+      completeVisibleRole || (signals.structuredDiagnostics ?? structuredDiagnostics)?.wireFormat,
+    ),
     ...transportMetaFields(transportMeta),
   };
 }
@@ -1086,6 +1099,7 @@ export function createApiErrorInfo(kind: ApiErrorKind, meta: ProviderErrorMetada
     unterminatedString: meta.unterminatedString,
     hasMessages: meta.hasMessages,
     hasInnerVoice: meta.hasInnerVoice,
+    wireFormat: meta.wireFormat,
     transportMarkedIncomplete: meta.transportMarkedIncomplete,
     protocolValidationReached: meta.protocolValidationReached,
     transportMode: meta.transportMode,

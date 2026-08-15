@@ -371,4 +371,14 @@ describe("compact reply wire protocol", () => {
       true,
     )).toThrow();
   });
+
+  it("accepts a complete compact reply whose serialized wire text exceeds the old global cap", () => {
+    const raw = JSON.stringify({
+      m: [{ c: "\u5b8c\u6574\u56de\u590d" }],
+      v: { s: { p: "\u547c\u5438\u5e73\u7a33", e: "\u8ba4\u771f\u56de\u5e94", u: "\u8fd8\u6709\u4e00\u70b9\u60f3\u8bf4", d: "\u5047\u88c5\u5e76\u4e0d\u5728\u610f", r: "\u6b64\u523b\u6ca1\u6709\u88ab\u89e6\u53d1\u7684\u5177\u4f53\u56de\u5fc6", a: "\u5148\u5c0a\u91cd\u5bf9\u65b9", x: "\u60f3\u66f4\u76f4\u63a5\u4e00\u70b9" }, q: { e: "\u4e13\u6ce8" } },
+    }) + " ".repeat(2600);
+    expect(raw.length).toBeGreaterThan(2400);
+    expect(parseStrictReplyTurn(raw, false, { min: 1, max: 8, adaptive: true }, true).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
+  });
+
 });

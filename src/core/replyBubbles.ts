@@ -579,6 +579,7 @@ function strictTurnError(
       unterminatedString: diagnostics?.unterminatedString ?? response?.unterminatedString,
       hasMessages: diagnostics?.hasMessages ?? response?.hasMessages,
       hasInnerVoice: diagnostics?.hasInnerVoice ?? response?.hasInnerVoice,
+      wireFormat: diagnostics?.wireFormat ?? response?.wireFormat,
       transportMarkedIncomplete: response?.transportMarkedIncomplete,
       protocolValidationReached: true,
       transportMode: response?.transportMode,
@@ -626,8 +627,6 @@ export function parseStrictReplyTurn(
       structuredError?.diagnostics,
     );
   }
-  if (isCompactReplyRoot(root) && raw.length > 2400)
-    throw strictTurnError("invalid_role_protocol", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u8d85\u8fc7\u5b89\u5168\u4f20\u8f93\u957f\u5ea6", response, "role-protocol", diagnostics);
   if (!root || typeof root !== "object" || Array.isArray(root))
     throw strictTurnError("invalid_role_protocol", "服务返回的 JSON 不是完整角色回复对象", response, "role-protocol", diagnostics);
   const row = root as Record<string, unknown>;

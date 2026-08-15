@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
+  replyProtocolPresenceOf,
   StructuredJsonError,
 } from "./structuredJson";
 
@@ -129,6 +130,23 @@ describe("parseStructuredJson", () => {
       transportMarkedIncomplete: true,
       repairAttempted: true,
       repairedParseSucceeded: false,
+    });
+  });
+
+
+  it("reports compact role protocol presence with the shared wire detector", () => {
+    const value = { m: [{ c: "ok" }], v: { s: {}, q: {} } };
+    expect(replyProtocolPresenceOf(value)).toEqual({ wireFormat: "compact", hasMessages: true, hasInnerVoice: true });
+    expect(parseStructuredJsonWithMeta(JSON.stringify(value)).diagnostics).toMatchObject({
+      parseStatus: "strict-json",
+      wireFormat: "compact",
+      hasMessages: true,
+      hasInnerVoice: true,
+    });
+    expect(parseStructuredJsonWithMeta(JSON.stringify({ m: [{ c: "ok" }] })).diagnostics).toMatchObject({
+      wireFormat: "compact",
+      hasMessages: true,
+      hasInnerVoice: false,
     });
   });
 

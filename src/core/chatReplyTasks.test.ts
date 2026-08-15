@@ -621,6 +621,29 @@ describe("chat reply provider budget and lease fencing",()=>{
   expect((stored?.payload as any).providerCallTrace).toHaveLength(2);
   expect(await claimNextChatReplyTask()).toBeUndefined();
  });
+ it("saves a complete compact SSE retry after the first relay response is truncated",async()=>{
+  const compact=JSON.stringify({
+   m:[{c:"\u597d\u7684"},{c:"\u6211\u77e5\u9053\u4e86"}],
+   v:{s:{p:"\u547c\u5438\u5e73\u7a33",e:"\u8ba4\u771f\u56de\u5e94",u:"\u8fd8\u6709\u4e00\u70b9\u60f3\u8bf4",d:"\u5047\u88c5\u5e76\u4e0d\u5728\u610f",r:"\u6b64\u523b\u6ca1\u6709\u88ab\u89e6\u53d1\u7684\u5177\u4f53\u56de\u5fc6",a:"\u5148\u5c0a\u91cd\u5bf9\u65b9",x:"\u60f3\u66f4\u76f4\u63a5\u4e00\u70b9"},q:{e:"\u4e13\u6ce8"}},
+  });
+  const streamBody=`data: ${JSON.stringify({choices:[{delta:{content:compact},finish_reason:"stop"}]})}\n\ndata: [DONE]\n\n`;
+  const fetchMock=vi.fn()
+   .mockResolvedValueOnce(new Response('{"choices":[{"message":{"content":"unfinished',{status:200,headers:{"Content-Type":"application/json"}}))
+   .mockResolvedValueOnce(new Response(streamBody,{status:200,headers:{"Content-Type":"text/event-stream"}}));
+  vi.stubGlobal("fetch",fetchMock);
+  const queued=await enqueueChatReply({conversationId:privateConversation.id,mode:"private"});
+  await processChatReplyTask((await claimNextChatReplyTask())!);
+  const stored=await db.backgroundTasks.get(queued.id);
+  const saved=await db.messages.get((stored?.payload as any).outputMessageId);
+  expect(fetchMock).toHaveBeenCalledTimes(2);
+  expect(stored?.state).toBe("completed");
+  expect((stored?.payload as any).providerCallCount).toBe(2);
+  expect((stored?.payload as any).providerCallTrace).toMatchObject([
+   {ordinal:1,purpose:"generation",state:"failed",providerCode:"truncated_json"},
+   {ordinal:2,purpose:"regeneration",state:"completed",wireFormat:"compact",finishReason:"stop",protocolValidationReached:true},
+  ]);
+  expect(saved).toMatchObject({status:"complete",content:"\u597d\u7684",innerVoice:{continuity:{emotion:"\u4e13\u6ce8"}}});
+ });
  it("shares the two-call limit across automatic task resume",async()=>{
   const fetchMock=vi.fn().mockRejectedValue(new TypeError("offline"));
   vi.stubGlobal("fetch",fetchMock);
