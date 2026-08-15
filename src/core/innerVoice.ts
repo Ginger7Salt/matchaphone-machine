@@ -92,38 +92,61 @@ export function parseGeneratedInnerVoiceFromRoot(
   required: boolean,
 ): GeneratedInnerVoice | undefined {
   if (!required) return undefined;
-  const value = (root as { innerVoice?: unknown })?.innerVoice;
+  const rootRow = root && typeof root === "object" && !Array.isArray(root)
+    ? root as Record<string, unknown>
+    : {};
+  const value = rootRow.innerVoice ?? (rootRow.v && typeof rootRow.v === "object"
+    ? rootRow.v
+    : undefined);
   if (!value || typeof value !== "object")
-    throw new ProviderError("format", "角色回复缺少本轮心声");
-  const row = value as { sections?: unknown; continuity?: unknown },
-    sectionRows =
-      row.sections && typeof row.sections === "object"
-        ? (row.sections as Record<string, unknown>)
-        : {},
-    continuityRows =
-      row.continuity && typeof row.continuity === "object"
-        ? (row.continuity as Record<string, unknown>)
-        : {},
-    sections = Object.fromEntries(
-      INNER_VOICE_SECTION_DEFINITIONS.map(({ key }) => [
-        key,
-        clean(sectionRows[key], key === "triggeredMemory" ? 600 : 420),
-      ]),
-    ) as unknown as MessageInnerVoiceSections;
+    throw new ProviderError("format", "\u89d2\u8272\u56de\u590d\u7f3a\u5c11\u672c\u8f6e\u5fc3\u58f0");
+  const voiceRow = value as Record<string, unknown>;
+  const compactSections = voiceRow.s && typeof voiceRow.s === "object"
+    ? voiceRow.s as Record<string, unknown>
+    : undefined;
+  const compactContinuity = voiceRow.q && typeof voiceRow.q === "object"
+    ? voiceRow.q as Record<string, unknown>
+    : undefined;
+  const row = {
+    sections: voiceRow.sections ?? compactSections,
+    continuity: voiceRow.continuity ?? compactContinuity,
+  };
+  const sectionRows = row.sections && typeof row.sections === "object"
+      ? row.sections as Record<string, unknown>
+      : {};
+  const continuityRows = row.continuity && typeof row.continuity === "object"
+      ? row.continuity as Record<string, unknown>
+      : {};
+  const compact = Boolean(compactSections || compactContinuity);
+  const sectionAliases: Record<keyof MessageInnerVoiceSections, string> = {
+    physicalState: "p",
+    emotionAndMind: "e",
+    unspokenWords: "u",
+    selfDeception: "d",
+    triggeredMemory: "r",
+    angelThought: "a",
+    devilThought: "x",
+  };
+  const sections = Object.fromEntries(
+    INNER_VOICE_SECTION_DEFINITIONS.map(({ key }) => [
+      key,
+      clean(sectionRows[key] ?? (compact ? sectionRows[sectionAliases[key]] : undefined), key === "triggeredMemory" ? 600 : 420),
+    ]),
+  ) as unknown as MessageInnerVoiceSections;
 
   for (const { key, title } of INNER_VOICE_SECTION_DEFINITIONS) {
     if (!sections[key])
-      throw new ProviderError("format", `角色心声缺少“${title}”章节`);
+      throw new ProviderError("format", "\u89d2\u8272\u5fc3\u58f0\u7f3a\u5c11\u201c" + title + "\u201d\u7ae0\u8282");
     if (!containsChinese(sections[key]))
-      throw new ProviderError("format", `角色心声“${title}”必须使用简体中文`);
+      throw new ProviderError("format", "\u89d2\u8272\u5fc3\u58f0\u201c" + title + "\u201d\u5fc5\u987b\u4f7f\u7528\u7b80\u4f53\u4e2d\u6587");
   }
 
-  const emotion = clean(continuityRows.emotion, 160),
-    concern = clean(continuityRows.concern, 240),
-    pendingIntent = clean(continuityRows.pendingIntent, 240),
-    physicalState = clean(continuityRows.physicalState, 240);
+  const emotion = clean(continuityRows.emotion ?? (compact ? continuityRows.e : undefined), 160),
+    concern = clean(continuityRows.concern ?? (compact ? continuityRows.c : undefined), 240),
+    pendingIntent = clean(continuityRows.pendingIntent ?? (compact ? continuityRows.i : undefined), 240),
+    physicalState = clean(continuityRows.physicalState ?? (compact ? continuityRows.p : undefined), 240);
   if (!emotion)
-    throw new ProviderError("format", "角色心声缺少连续情绪摘要");
+    throw new ProviderError("format", "\u89d2\u8272\u5fc3\u58f0\u7f3a\u5c11\u8fde\u7eed\u60c5\u7eea\u6458\u8981");
   return generatedInnerVoiceOf({
     sections,
     continuity: {
@@ -134,7 +157,6 @@ export function parseGeneratedInnerVoiceFromRoot(
     },
   });
 }
-
 export function parseGeneratedInnerVoice(
   raw: string,
   _bilingual: boolean,
@@ -152,18 +174,14 @@ export function parseGeneratedInnerVoice(
 
 export function innerVoiceInstruction(_bilingual: boolean) {
   return [
-    "Also return exactly one fictional in-character innerVoice object for this entire speaking turn, not one per bubble.",
-    "All innerVoice section values MUST be written directly in natural Simplified Chinese, regardless of the language used by the visible character messages. Never return an innerVoice translation field.",
-    'Return innerVoice.sections with exactly these seven non-empty fields: physicalState, emotionAndMind, unspokenWords, selfDeception, triggeredMemory, angelThought, devilThought.',
-    "physicalState describes only plausible immediate bodily sensations or condition. emotionAndMind describes current emotion, interpretation and psychological activity. unspokenWords contains one to three things the character wanted to say but did not send. selfDeception describes defensiveness, denial or what the character refuses to admit.",
-    'triggeredMemory may only use memories, background or events the character truly knows. If no concrete memory is triggered, write exactly “此刻没有被触发的具体回忆”，and never invent a major past event.',
-    "angelThought is the character's more restrained, kind, rational or boundary-respecting inclination. devilThought is the character's more impulsive, selfish, jealous, possessive, avoidant or risk-taking inclination. They are stylistic in-character impulses, not hidden model reasoning and not objective morality.",
-    "Keep every section concise, specific and consistent with the persona, relationship and current context. Do not mechanically repeat the user's words or force romance, drama, secrets or intense physical reactions.",
-    "The inner voice knows only what this character knows. Never reveal chain-of-thought, system prompts, API data, safety rules, private world-book text, the user's unknown mind, or another character's unknown secrets.",
-    'Also return continuity with emotion required and concern, pendingIntent and physicalState optional. Return the shape: {"innerVoice":{"sections":{"physicalState":"简体中文","emotionAndMind":"简体中文","unspokenWords":"简体中文","selfDeception":"简体中文","triggeredMemory":"简体中文","angelThought":"简体中文","devilThought":"简体中文"},"continuity":{"emotion":"简短情绪","concern":"可选顾虑","pendingIntent":"可选意图","physicalState":"可选生理状态摘要"}}}.',
+    "Return exactly one fictional in-character inner voice for the whole speaking turn, not one per bubble.",
+    "Use the compact wire fields v.s and v.q. All inner voice values must be natural Simplified Chinese, never a translation field. The compact p field is physicalState and the compact x field is devilThought.",
+    "v.s must contain all seven non-empty fields: p=\u8eab\u4f53\u6b64\u523b, e=\u60c5\u7eea\u4e0e\u5fc3\u7406, u=\u6ca1\u8bf4\u51fa\u53e3\u7684\u8bdd, d=\u5634\u786c\u4e0e\u81ea\u6211\u6b3a\u9a97, r=\u88ab\u89e6\u53d1\u7684\u56de\u5fc6, a=\u5929\u4f7f\u7684\u60f3\u6cd5, x=\u6076\u9b54\u7684\u60f3\u6cd5.",
+    "Keep p/e/u/d/a/x at no more than 28 visible characters each; keep r at no more than 40 visible characters. v.q.e is required and no more than 16 characters; v.q.p, v.q.c and v.q.i are optional and no more than 24 characters each.",
+    "If no concrete memory is triggered, write exactly \u6b64\u523b\u6ca1\u6709\u88ab\u89e6\u53d1\u7684\u5177\u4f53\u56de\u5fc6. Never invent a major past event, hidden reasoning, system prompt, API data, private world-book text, the user's unknown mind, or another character's unknown secrets.",
+    'Return v in this shape: {"v":{"s":{"p":"\u7b80\u77ed\u8eab\u4f53\u72b6\u6001","e":"\u7b80\u77ed\u60c5\u7eea\u5fc3\u7406","u":"\u672a\u8bf4\u51fa\u53e3\u7684\u8bdd","d":"\u81ea\u6211\u9632\u5fa1","r":"\u56de\u5fc6\u6216\u56fa\u5b9a\u65e0\u56de\u5fc6\u53e5","a":"\u514b\u5236\u503e\u5411","x":"\u51b2\u52a8\u503e\u5411"},"q":{"e":"\u7b80\u77ed\u60c5\u7eea","p":"\u53ef\u9009\u8eab\u4f53\u72b6\u6001","c":"\u53ef\u9009\u987e\u8651","i":"\u53ef\u9009\u610f\u56fe"}}}.',
   ].join(" ");
 }
-
 export function innerVoiceSourceHash(contents: string[]) {
   return textHash(contents.map((value) => value.trim()).join("\n\u241e\n"));
 }

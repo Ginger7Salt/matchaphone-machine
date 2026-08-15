@@ -124,10 +124,22 @@ describe("persistent chat reply tasks", () => {
   it("recovers an expired running task without creating a duplicate", async () => {
     await db.conversations.add(privateConversation);
     const first = await enqueueChatReply({ conversationId: privateConversation.id, mode: "private" });
-    await db.backgroundTasks.update(first.id, { state: "running", leaseExpiresAt: 1 });
+    const originalPayload = first.payload as any;
+    await db.backgroundTasks.update(first.id, {
+      state: "running",
+      leaseExpiresAt: 1,
+      payload: {
+        ...originalPayload,
+        providerCallCount: 1,
+        providerCallTrace: [{ ordinal: 1, purpose: "generation", state: "failed", providerCode: "transport_truncated" }],
+      },
+    });
     const result = await ensureRunnableChatReplyTask({ conversationId: privateConversation.id, mode: "private" });
     expect(result.action).toBe("requeued");
     expect(result.task).toMatchObject({ id: first.id, state: "pending" });
+    expect((result.task.payload as any).generationCycle).toBe(originalPayload.generationCycle);
+    expect((result.task.payload as any).providerCallCount).toBe(1);
+    expect((result.task.payload as any).providerCallTrace).toHaveLength(1);
     expect(await db.backgroundTasks.where("conversationId").equals(privateConversation.id).count()).toBe(1);
   });
   it("keeps a running task with a valid lease", async () => {
@@ -491,7 +503,7 @@ describe("mounted reply stickers", () => {
 
   const modelTurn = (stickerId: string) =>
     JSON.stringify({
-      messages: [{ content: "好吧" }],
+      messages: [{ content: "好吧" }, { content: "我知道了" }],
       stickerId,
       innerVoice: {
         sections: {
@@ -549,8 +561,8 @@ describe("mounted reply stickers", () => {
 
   it("saves a validated mounted sticker after the text bubbles", async () => {
     const rows = await runStickerReply("sticker-real");
-    expect(rows.map((row) => row.content)).toEqual(["好吧", "[表情包]"]);
-    expect(rows[1]).toMatchObject({
+    expect(rows.map((row) => row.content)).toEqual(["好吧", "我知道了", "[表情包]"]);
+    expect(rows[2]).toMatchObject({
       kind: "sticker",
       attachments: [
         {
@@ -564,7 +576,7 @@ describe("mounted reply stickers", () => {
 
   it("ignores an unmounted sticker id instead of falling back to the first sticker", async () => {
     const rows = await runStickerReply("not-mounted");
-    expect(rows.map((row) => row.content)).toEqual(["好吧"]);
+    expect(rows.map((row) => row.content)).toEqual(["好吧", "我知道了"]);
     expect(rows.some((row) => row.kind === "sticker")).toBe(false);
   });
 });
@@ -609,7 +621,7 @@ describe("chat reply provider budget and lease fencing",()=>{
  it("does not allow post-processing to make a third model call",async()=>{
   await db.characters.update(character.id,{chatSettings:{...(character.chatSettings as any),strategyMode:{enabled:true}} as any,updatedAt:t+1});
   await db.messages.add({id:"source",schemaVersion:SCHEMA_VERSION,createdAt:t+2,updatedAt:t+2,conversationId:privateConversation.id,senderType:"user",content:"hello",status:"complete"} as Message);
-  const turn=JSON.stringify({messages:[{content:"\u4f60\u597d"},{content:"\u518d\u8bf4\u4e00\u53e5"}],innerVoice:{sections:{physicalState:"\u547c\u5438\u5e73\u7a33",emotionAndMind:"\u6b63\u5728\u601d\u8003",unspokenWords:"\u8fd8\u6709\u8bdd\u60f3\u8bf4",selfDeception:"\u5047\u88c5\u4e0d\u5728\u610f",triggeredMemory:"\u60f3\u8d77\u4e00\u4ef6\u5c0f\u4e8b",angelThought:"\u6e29\u548c\u4e00\u70b9",devilThought:"\u76f4\u63a5\u4e00\u70b9"},continuity:{emotion:"\u5e73\u9759"}}});
+  const turn=JSON.stringify({messages:[{content:"\u4f60\u597d"}],innerVoice:{sections:{physicalState:"\u547c\u5438\u5e73\u7a33",emotionAndMind:"\u6b63\u5728\u601d\u8003",unspokenWords:"\u8fd8\u6709\u8bdd\u60f3\u8bf4",selfDeception:"\u5047\u88c5\u4e0d\u5728\u610f",triggeredMemory:"\u60f3\u8d77\u4e00\u4ef6\u5c0f\u4e8b",angelThought:"\u6e29\u548c\u4e00\u70b9",devilThought:"\u76f4\u63a5\u4e00\u70b9"},continuity:{emotion:"\u5e73\u9759"}}});
   const fetchMock=vi.fn()
    .mockResolvedValueOnce(new Response(JSON.stringify({id:"unknown"}),{status:200,headers:{"Content-Type":"application/json"}}))
    .mockResolvedValueOnce(new Response(JSON.stringify({choices:[{message:{content:turn}}]}),{status:200,headers:{"Content-Type":"application/json"}}))
@@ -626,7 +638,7 @@ describe("chat reply provider budget and lease fencing",()=>{
   it("lazily preserves legacy group call usage without a Dexie migration", async () => {
     await db.conversations.add(groupConversation);
     const completeTurn = JSON.stringify({
-      messages: [{ content: "你好" }],
+      messages: [{ content: "你好" }, { content: "再说一句" }],
       innerVoice: {
         sections: {
           physicalState: "呼吸平稳",

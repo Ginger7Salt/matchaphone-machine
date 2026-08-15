@@ -306,18 +306,21 @@ function providerInvokerForTask(
 ): ProviderChatInvoker {
   return async (settings, messages, options, purpose) => {
     const ordinal = await reserveProviderCall(task, purpose, allowCompleted, actorId);
+    let result: ProviderChatResult;
     try {
-      const result = await new OpenAIProvider(settings).chatWithMeta(messages, {
+      result = await new OpenAIProvider(settings).chatWithMeta(messages, {
         ...options,
         timeoutMs: null,
       });
-      await finishProviderCall(task, ordinal, result, undefined, allowCompleted, actorId);
-      if (!allowCompleted) await updatePhase(task, "parsing");
-      return result;
     } catch (error) {
       await finishProviderCall(task, ordinal, undefined, error, allowCompleted, actorId).catch(() => {});
       throw error;
     }
+    // Once the provider call is recorded as completed, a phase/store refresh failure
+    // must not rewrite that completed call as failed or trigger another API request.
+    await finishProviderCall(task, ordinal, result, undefined, allowCompleted, actorId);
+    if (!allowCompleted) await updatePhase(task, "parsing");
+    return result;
   };
 }
 function isStickerMessage(message: Message | undefined) {
@@ -652,9 +655,7 @@ export async function ensureRunnableChatReplyTask(
           const shouldRequeue = existing.state === "failed" ||
             (existing.state === "running" && !activeLease) ||
             existing.nextAttemptAt > t;
-          const startsNewCycle =
-            existing.state === "failed" ||
-            (existing.state === "running" && !activeLease);
+          const startsNewCycle = existing.state === "failed";
           const nextPayload: ChatReplyTaskPayload = {
             ...existingPayload,
             phase: activeLease ? existingPayload.phase : "queued",
@@ -1290,7 +1291,9 @@ async function processPrivate(
     characterName: character.name,
     presence,
   }), timeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), new Date()) : null;
-  if (payload.regenerationTargetId || localValidation.issues.length || timeConflict) {
+  const providerBudgetAvailable = (taskPayload(task).providerCallCount ?? 0) < (taskPayload(task).providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT);
+  const needsLocalReview = Boolean(payload.regenerationTargetId || localValidation.issues.length || timeConflict);
+  if (needsLocalReview && providerBudgetAvailable) {
     await updatePhase(task, "reviewing");
     const review = await reviewCharacterReply({
         character,
@@ -1311,6 +1314,7 @@ async function processPrivate(
         innerVoiceRequired: payload.innerVoiceRequired ?? true,
         presence,
         crossModeContinuity,
+        targetCount: generatedTurn.targetCount,
         signal: controller.signal,
         invokeProvider: providerInvokerForTask(task),
       }),
@@ -1323,6 +1327,7 @@ async function processPrivate(
       normalized = normalizeReplyBubbles(
         revised,
         replyBubbleRangeOf(character),
+        generatedTurn.targetCount,
       );
     if (
       !normalized.compliant ||
@@ -1355,6 +1360,13 @@ async function processPrivate(
           ? "角色回复仍违反线上聊天距离约束"
           : "审查后的角色回复仍不符合本地格式要求",
       );
+  } else if (needsLocalReview) {
+    throw new ProviderError(
+      "format",
+      "\u672c\u8f6e\u6a21\u578b\u8c03\u7528\u989d\u5ea6\u5df2\u7528\u5b8c\uff0c\u89d2\u8272\u56de\u590d\u672a\u901a\u8fc7\u672c\u5730\u6821\u9a8c",
+      "",
+      createApiErrorInfo("format", { providerCode: "local_validation_after_budget", failureStage: "role-protocol" }),
+    );
   }
   await updatePhase(task, "saving");
   const selectedSticker = generatedTurn.stickerId
@@ -1471,11 +1483,11 @@ async function saveGroupParts(
       }),
     );
   if (!parts.length || parts.some((part) => !part.content.trim()))
-    throw new ProviderError("format", "???????????");
+    throw new ProviderError("format", "\u7fa4\u804a\u89d2\u8272\u8fd4\u56de\u7f3a\u5c11\u975e\u7a7a\u6b63\u6587");
   if ((payload.innerVoiceRequired ?? true) && !innerVoice)
     throw new ProviderError(
       "format",
-      "???????????????????",
+      "群聊角色心声缺失，整轮回复需要重新生成",
       "",
       createApiErrorInfo("format", {
         providerCode: "missing_inner_voice",
@@ -1496,7 +1508,7 @@ async function saveGroupParts(
       });
       const savedRows = await db.messages.bulkGet(rows.map((row) => row.id));
       if (savedRows.some((row) => !row || row.status !== "complete" || !row.content.trim()))
-        throw new Error("??????????????????");
+        throw new Error("\u7fa4\u804a\u56de\u590d\u4e8b\u52a1\u6821\u9a8c\u5931\u8d25");
       const storedPayload = taskPayload(storedTask!);
       const speakerBudget = groupBudgetOf(storedPayload, speaker.id);
       nextPayload = {
@@ -1739,7 +1751,10 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         characterName: speaker.name,
         presence,
       });
-    if (payload.regenerationTargetId || localValidation.issues.length) {
+    const groupProviderBudget = groupBudgetOf(taskPayload(task), speaker.id);
+    const groupReviewAvailable = groupProviderBudget.providerCallCount < groupProviderBudget.providerCallLimit;
+    const needsGroupReview = Boolean(payload.regenerationTargetId || localValidation.issues.length);
+    if (needsGroupReview && groupReviewAvailable) {
       await updatePhase(task, "reviewing");
       const review = await reviewCharacterReply({
         character: speaker.character,
@@ -1760,6 +1775,7 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         innerVoiceRequired: payload.innerVoiceRequired ?? true,
         presence,
         crossModeContinuity,
+        targetCount: generatedTurn.targetCount,
         signal: controller.signal,
         invokeProvider: providerInvokerForTask(task, false, speaker.id),
       });
@@ -1780,6 +1796,8 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         }));
       } else parts = revised.map((content) => ({ content }));
       innerVoice = review.revisedInnerVoice;
+      if (generatedTurn.targetCount !== undefined && parts.length !== generatedTurn.targetCount)
+        throw new ProviderError("format", "审查后的群聊回复条数不符合本轮目标数量");
       if ((payload.innerVoiceRequired ?? true) && !innerVoice) {
         throw new ProviderError("format", "\u7fa4\u804a\u89d2\u8272\u5fc3\u58f0\u7f3a\u5931\uff0c\u6574\u8f6e\u56de\u590d\u9700\u8981\u91cd\u65b0\u751f\u6210");
       }
@@ -1796,6 +1814,13 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
             ? "群聊角色回复仍违反线上聊天距离约束"
             : "审查后的群聊回复仍不符合本地格式要求",
         );
+    } else if (needsGroupReview) {
+      throw new ProviderError(
+        "format",
+        "\u672c\u89d2\u8272\u672c\u8f6e\u6a21\u578b\u8c03\u7528\u989d\u5ea6\u5df2\u7528\u5b8c\uff0c\u56de\u590d\u672a\u901a\u8fc7\u672c\u5730\u6821\u9a8c",
+        "",
+        createApiErrorInfo("format", { providerCode: "local_validation_after_budget", failureStage: "role-protocol" }),
+      );
     }
     await updatePhase(task, "saving");
     const selectedSticker = generatedTurn.stickerId
@@ -2183,22 +2208,13 @@ export async function chatReplyDiagnostic(eventId: string) {
 }
 
 export function chatReplyPhaseText(phase?: ChatReplyTaskPayload["phase"]) {
-  if (phase === "queued") return "????";
-  if (phase === "preparing") return "????";
-  if (phase === "generating" || phase === "requesting") return "????";
-  if (phase === "parsing") return "????";
-  if (phase === "validating" || phase === "reviewing") return "??????";
-  if (phase === "saving") return "????";
-  if (phase === "completed") return "????";
-  if (phase === "failed" || phase === "paused") return "????";
-  return "????";
+  if (phase === "queued") return "\u6392\u961f\u4e2d";
+  if (phase === "preparing") return "\u51c6\u5907\u4e2d";
+  if (phase === "generating" || phase === "requesting") return "\u751f\u6210\u4e2d";
+  if (phase === "parsing") return "\u89e3\u6790\u4e2d";
+  if (phase === "validating" || phase === "reviewing") return "\u6821\u9a8c\u4e2d";
+  if (phase === "saving") return "\u4fdd\u5b58\u4e2d";
+  if (phase === "completed") return "\u5df2\u5b8c\u6210";
+  if (phase === "failed" || phase === "paused") return "\u751f\u6210\u5931\u8d25";
+  return "\u51c6\u5907\u4e2d";
 }
-
-
-
-
-
-
-
-
-

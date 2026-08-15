@@ -117,6 +117,53 @@ function parseJson(value: string) {
     throw new ProviderError("format", "模型没有返回有效 JSON");
   }
 }
+function canonicalReviewResult(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const row = value as Record<string, unknown>;
+  const compactVoice = row.v && typeof row.v === "object" && !Array.isArray(row.v)
+    ? row.v as Record<string, unknown>
+    : undefined;
+  const sections = compactVoice?.s && typeof compactVoice.s === "object" && !Array.isArray(compactVoice.s)
+    ? compactVoice.s as Record<string, unknown>
+    : undefined;
+  const continuity = compactVoice?.q && typeof compactVoice.q === "object" && !Array.isArray(compactVoice.q)
+    ? compactVoice.q as Record<string, unknown>
+    : undefined;
+  const compactInnerVoice = compactVoice
+    ? {
+        sections: {
+          physicalState: sections?.physicalState ?? sections?.p,
+          emotionAndMind: sections?.emotionAndMind ?? sections?.e,
+          unspokenWords: sections?.unspokenWords ?? sections?.u,
+          selfDeception: sections?.selfDeception ?? sections?.d,
+          triggeredMemory: sections?.triggeredMemory ?? sections?.r,
+          angelThought: sections?.angelThought ?? sections?.a,
+          devilThought: sections?.devilThought ?? sections?.x,
+        },
+        continuity: {
+          emotion: continuity?.emotion ?? continuity?.e,
+          physicalState: continuity?.physicalState ?? continuity?.p,
+          concern: continuity?.concern ?? continuity?.c,
+          pendingIntent: continuity?.pendingIntent ?? continuity?.i,
+        },
+      }
+    : undefined;
+  const compactIssues = Array.isArray(row.i)
+    ? row.i.map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+        const issue = item as Record<string, unknown>;
+        return { type: issue.type ?? issue.t, reason: issue.reason ?? issue.r };
+      })
+    : undefined;
+  return {
+    ...row,
+    passed: row.passed ?? row.p,
+    issues: row.issues ?? compactIssues ?? [],
+    revisedMessages: row.revisedMessages ?? row.m,
+    revisedTranslations: row.revisedTranslations ?? row.t,
+    revisedInnerVoice: row.revisedInnerVoice ?? compactInnerVoice,
+  };
+}
 export function stableContentHash(value: string) {
   let hash = 2166136261;
   for (let i = 0; i < value.length; i++) {
@@ -610,6 +657,8 @@ export async function reviewCharacterReply(input: {
   innerVoiceRequired?: boolean;
   presence?: ChatPresenceContext;
   crossModeContinuity?: string;
+  /** The local bubble target selected before generation. */
+  targetCount?: number;
   signal?: AbortSignal;
   invokeProvider?: ProviderChatInvoker;
 }) {
@@ -669,6 +718,7 @@ export async function reviewCharacterReply(input: {
       input.regenerationInstruction?.trim()
         ? `只作用于本次重新生成的导演要求：${input.regenerationInstruction.trim()}。该要求低于角色核心设定和世界书硬规则。`
         : "",
+      input.targetCount ? `\u672c\u8f6e\u6700\u7ec8\u5fc5\u987b\u4fdd\u7559\u6070\u597d ${input.targetCount} \u6761\u5b8c\u6574\u6d88\u606f\u6c14\u6ce1\uff0c\u4e0d\u80fd\u589e\u51cf\u6216\u5408\u5e76\u8bed\u4e49\u3002` : "",
       "\u5ba1\u67e5\u56de\u590d\u662f\u5426\u6cb9\u817b\u3001\u6d6e\u5938\u3001\u5957\u8def\u5316\u64a9\u62e8\u3001\u6ee5\u7528\u4eb2\u6635\u79f0\u547c\u3001\u9738\u603b\u5f0f\u5360\u6709\u6216\u8fc7\u91cf\u751c\u8a00\u871c\u8bed\uff1b\u82e5\u4e0d\u7b26\u5408\u4eba\u8bbe\u3001\u5173\u7cfb\u8fdb\u5ea6\u548c\u8bed\u5883\uff0c\u5fc5\u987b\u4fee\u6b63\uff0c\u4e0d\u5f97\u628a\u89d2\u8272\u7edf\u4e00\u5199\u6210\u9ecf\u4eba\u5ba0\u6eba\u6a21\u677f\u3002",
       `待审查回复：\n${drafts.map((message, index) => `${index + 1}. ${message}`).join("\n")}`,
       input.innerVoiceRequired && input.draftInnerVoice
@@ -696,7 +746,7 @@ export async function reviewCharacterReply(input: {
           input.signal,
           input.invokeProvider,
         ),
-        parsed = reviewSchema.parse(parseJson(raw));
+        parsed = reviewSchema.parse(canonicalReviewResult(parseJson(raw)));
       if (!parsed.revisedMessages.length)
         throw new ProviderError("format", "审查器没有返回最终消息");
       if (input.innerVoiceRequired && !parsed.revisedInnerVoice)
@@ -715,4 +765,3 @@ export async function reviewCharacterReply(input: {
     ? last
     : new ProviderError("format", "角色一致性审查失败");
 }
-

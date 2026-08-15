@@ -5,7 +5,6 @@ import type { Character, Message, ProviderSettings } from "./types";
 import type { ChatItem } from "./context";
 import { compactChatItemsForRetry, fitChatItemsToInternalBudget } from "./tokenBudget";
 import {
-  adaptiveReplyRetryReason,
   parseStrictReplyTurn,
   replyBubbleInstruction,
   replyBubblePlanOf,
@@ -107,8 +106,7 @@ export async function generateCharacterReplyTurn(
 ): Promise<GeneratedReplyTurn> {
   const plan = replyBubblePlanOf(character, context, scene),
     range = plan.range;
-  let lastFormatError: unknown,
-    adaptiveRetryReason = "";
+  let lastFormatError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     const compactStreamingRetry = attempt === 1 && shouldUseCompactStreamingRetry(lastFormatError);
     const request: ChatItem = {
@@ -128,7 +126,7 @@ export async function generateCharacterReplyTurn(
         (attempt
           ? compactStreamingRetry
             ? " The previous provider response was cut or its API envelope was damaged. Generate the entire turn again from the beginning as compact complete JSON. Do not continue, quote, or merge any previous partial output."
-            : " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field." + (adaptiveRetryReason ? " " + adaptiveRetryReason : "")
+            : " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field."
           : ""),
     };
     try {
@@ -170,15 +168,10 @@ export async function generateCharacterReplyTurn(
         range,
         innerVoiceRequired,
         response,
+        plan.targetCount,
       );
-      if (normalized.compliant) {
-        const retryReason = adaptiveReplyRetryReason(plan, normalized.parts);
-        if (!retryReason || attempt === 1) return normalized;
-        adaptiveRetryReason = retryReason;
-        lastFormatError = new ProviderError("format", "角色回复在自适应模式下过度展开或连续重复相同条数");
-        continue;
-      }
-      lastFormatError = new ProviderError("format", "角色回复条数不在设置范围内");
+      if (normalized.compliant) return { ...normalized, targetCount: plan.targetCount };
+      lastFormatError = new ProviderError("format", "角色回复条数不符合本轮目标数量");
     } catch (error) {
       if (error instanceof ProviderError && error.kind === "aborted") throw error;
       if (!(error instanceof ProviderError) || (error.kind !== "format" && !isContextOverflowError(error)))

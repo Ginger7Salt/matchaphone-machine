@@ -4,6 +4,7 @@ import {
   normalizeReplyBubbles,
   parseReplyBubbles,
   parseReplyTurn,
+  parseStrictReplyTurn,
   replyBubbleInstruction,
   replyBubblePlanOf,
   replyBubbleRangeOf,
@@ -83,6 +84,19 @@ describe("reply bubble normalization", () => {
     const complexPlan = replyBubblePlanOf(character, [{ role: "user", content: "今天发生了很多事。你觉得我应该先和同事解释吗？还是等明天冷静一点再说？我也有点担心自己说错话。" }], "private");
     expect(complexPlan).toMatchObject({ preferredMin: 3, preferredMax: 6 });
     expect(replyBubbleInstruction(character, false, "private", false, false, false, shortPlan)).toContain("Never default to five bubbles");
+  });
+
+  it("enforces the locally selected exact bubble count for strict turns", () => {
+    const parsed = parseStrictReplyTurn(
+      JSON.stringify({ m: [{ c: "one" }, { c: "two" }] }),
+      false,
+      { min: 1, max: 8, adaptive: true },
+      false,
+      undefined,
+      3,
+    );
+    expect(parsed.parts).toHaveLength(2);
+    expect(parsed.compliant).toBe(false);
   });
 
   it("removes ordered-list markers from generated bubbles", () => {
@@ -316,4 +330,45 @@ describe("reply sticker actions", () => {
     expect(parsed.innerVoice?.sections.unspokenWords).toContain("\u8ba4\u771f\u542c");
   });
 
+});
+
+
+describe("compact reply wire protocol", () => {
+  it("parses the compact m/v wire protocol and derives inner voice content locally", () => {
+    const parsed = parseReplyTurn(
+      JSON.stringify({
+        m: [{ c: "\u5148\u62b1\u62b1\u4f60" }],
+        v: {
+          s: {
+            p: "\u547c\u5438\u653e\u6162",
+            e: "\u62c5\u5fc3\u4f46\u8ba4\u771f",
+            u: "\u5176\u5b9e\u5f88\u60f3\u966a\u4f60",
+            d: "\u5047\u88c5\u6ca1\u90a3\u4e48\u5728\u610f",
+            r: "\u6b64\u523b\u6ca1\u6709\u88ab\u89e6\u53d1\u7684\u5177\u4f53\u56de\u5fc6",
+            a: "\u5148\u542c\u4f60\u8bf4\u5b8c",
+            x: "\u60f3\u7acb\u523b\u8ffd\u95ee",
+          },
+          q: { e: "\u62c5\u5fc3", p: "\u80a9\u8180\u653e\u677e", c: "\u6015\u4f60\u96be\u53d7", i: "\u5148\u966a\u7740\u4f60" },
+        },
+      }),
+      false,
+      { min: 1, max: 8, adaptive: true },
+      true,
+    );
+    expect(parsed.parts).toEqual([{ content: "\u5148\u62b1\u62b1\u4f60", translation: undefined }]);
+    expect(parsed.innerVoice?.sections.physicalState).toBe("\u547c\u5438\u653e\u6162");
+    expect(parsed.innerVoice?.content).toContain("\u8eab\u4f53\u6b64\u523b");
+  });
+
+  it("rejects an oversized compact field instead of truncating it", () => {
+    expect(() => parseReplyTurn(
+      JSON.stringify({
+        m: [{ c: "a".repeat(81) }],
+        v: { s: { p: "p", e: "e", u: "u", d: "d", r: "r", a: "a", x: "x" }, q: { e: "e" } },
+      }),
+      false,
+      { min: 1, max: 8, adaptive: true },
+      true,
+    )).toThrow();
+  });
 });

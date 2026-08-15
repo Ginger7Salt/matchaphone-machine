@@ -19,6 +19,7 @@ export interface ReplyBubblePlan {
   recentCounts: number[];
   latestUserLength: number;
   adaptive: boolean;
+  targetCount: number;
 }
 type ReplyContextItem = { role: "system" | "user" | "assistant"; content: string };
 export interface NormalizedReplyBubbles {
@@ -28,6 +29,8 @@ export interface NormalizedReplyBubbles {
 export interface GeneratedReplyTurn extends NormalizedReplyBubbles {
   innerVoice?: GeneratedInnerVoice;
   innerVoiceFormatError?: boolean;
+  /** The local target chosen before the provider call. */
+  targetCount?: number;
   musicAction?: CharacterMusicAction;
   islandAction?: CharacterIslandAction;
   stickerId?: string;
@@ -82,6 +85,16 @@ function recentAssistantTurnCounts(context: ReplyContextItem[], limit = 3) {
 function punctuationCount(value: string, pattern: RegExp) {
   return value.match(pattern)?.length ?? 0;
 }
+function targetBubbleCount(range: ReplyBubbleRange, preferredMin: number, preferredMax: number) {
+  if (!range.adaptive && range.min === range.max) return range.min;
+  return Math.max(range.min, Math.min(range.max, Math.floor((preferredMin + preferredMax) / 2)));
+}
+function isSyntheticTurnPrompt(value: string) {
+  const normalized = value.trim();
+  return normalized.startsWith("\u8bf7\u6839\u636e\u4ee5\u4e0a\u5b8c\u6574\u5bf9\u8bdd") ||
+    normalized.startsWith("\u8bf7\u4f9d\u636e\u4f60\u7684\u89d2\u8272\u8bbe\u5b9a") ||
+    normalized.startsWith("Please participate naturally in the current group chat as ");
+}
 export function replyBubblePlanOf(
   character: Character,
   context: ReplyContextItem[],
@@ -96,8 +109,9 @@ export function replyBubblePlanOf(
       recentCounts: recentAssistantTurnCounts(context),
       latestUserLength: 0,
       adaptive: false,
+      targetCount: targetBubbleCount(range, range.min, range.max),
     };
-  const latestUser = [...context].reverse().find((item) => item.role === "user")?.content.trim() ?? "",
+  const latestUser = [...context].reverse().find((item) => item.role === "user" && !isSyntheticTurnPrompt(item.content))?.content.trim() ?? "",
     latestUserLength = visibleCharacterCount(latestUser),
     questionCount = punctuationCount(latestUser, /[?!\uFF1F]/gu),
     sentenceCount = punctuationCount(latestUser, /[\u3002\uFF01\uFF1F!?]/gu),
@@ -130,6 +144,7 @@ export function replyBubblePlanOf(
     recentCounts: recentAssistantTurnCounts(context),
     latestUserLength,
     adaptive: true,
+    targetCount: targetBubbleCount(range, preferredMin, preferredMax),
   };
 }
 export function adaptiveReplyRetryReason(
@@ -242,6 +257,7 @@ function mergeToMaximum(parts:ReplyBubblePart[],maximum:number){
 export function normalizeReplyBubbles(
   input: ReplyBubblePart[],
   range: ReplyBubbleRange,
+  expectedCount?: number,
 ): NormalizedReplyBubbles {
   let parts: ReplyBubblePart[] = input
     .map((item) => ({
@@ -270,19 +286,106 @@ export function normalizeReplyBubbles(
     parts.splice(candidate.index, 1, ...candidate.split);
   }
   parts = mergeToMaximum(parts, range.max);
+  const target = Number.isInteger(expectedCount)
+    ? Math.max(range.min, Math.min(range.max, Number(expectedCount)))
+    : undefined;
   return {
     parts,
-    compliant: parts.length >= range.min && parts.length <= range.max,
+    compliant: target === undefined
+      ? parts.length >= range.min && parts.length <= range.max
+      : parts.length === target,
   };
 }
 function parsedReplyRoot(raw: string): unknown {
   return parseStructuredJson(raw);
+}
+function canonicalReplyRoot(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const row = value as Record<string, unknown>;
+  const canonical: Record<string, unknown> = { ...row };
+  if (!Array.isArray(canonical.messages) && Array.isArray(row.m)) {
+    canonical.messages = row.m.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+      const source = item as Record<string, unknown>;
+      return {
+        ...source,
+        content: source.content ?? source.c,
+        ...(source.translation !== undefined || source.t !== undefined
+          ? { translation: source.translation ?? source.t }
+          : {}),
+      };
+    });
+  }
+  if (!canonical.innerVoice && row.v && typeof row.v === "object" && !Array.isArray(row.v)) {
+    const voice = row.v as Record<string, unknown>;
+    const sections = voice.s && typeof voice.s === "object" && !Array.isArray(voice.s)
+      ? voice.s as Record<string, unknown>
+      : {};
+    const continuity = voice.q && typeof voice.q === "object" && !Array.isArray(voice.q)
+      ? voice.q as Record<string, unknown>
+      : {};
+    canonical.innerVoice = {
+      sections: {
+        physicalState: sections.physicalState ?? sections.p,
+        emotionAndMind: sections.emotionAndMind ?? sections.e,
+        unspokenWords: sections.unspokenWords ?? sections.u,
+        selfDeception: sections.selfDeception ?? sections.d,
+        triggeredMemory: sections.triggeredMemory ?? sections.r,
+        angelThought: sections.angelThought ?? sections.a,
+        devilThought: sections.devilThought ?? sections.x,
+      },
+      continuity: {
+        emotion: continuity.emotion ?? continuity.e,
+        physicalState: continuity.physicalState ?? continuity.p,
+        concern: continuity.concern ?? continuity.c,
+        pendingIntent: continuity.pendingIntent ?? continuity.i,
+      },
+    };
+  }
+  return canonical;
+}
+function isCompactReplyRoot(value: unknown) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) &&
+    ("m" in (value as Record<string, unknown>) || "v" in (value as Record<string, unknown>)));
+}
+function validateCompactReplyWire(value: unknown) {
+  if (!isCompactReplyRoot(value)) return;
+  const row = value as Record<string, unknown>;
+  const messages = Array.isArray(row.m) ? row.m : [];
+  for (const item of messages) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const itemRow = item as Record<string, unknown>;
+    const content = typeof itemRow.c === "string" ? itemRow.c : "";
+    const translation = typeof itemRow.t === "string" ? itemRow.t : "";
+    if (visibleCharacterCount(content) > 80 || visibleCharacterCount(translation) > 100)
+      throw new ProviderError("format", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u7684\u6d88\u606f\u5b57\u6bb5\u8d85\u8fc7\u4f20\u8f93\u957f\u5ea6\u9650\u5236");
+  }
+  const voice = row.v && typeof row.v === "object" && !Array.isArray(row.v)
+    ? row.v as Record<string, unknown>
+    : {};
+  const sections = voice.s && typeof voice.s === "object" && !Array.isArray(voice.s)
+    ? voice.s as Record<string, unknown>
+    : {};
+  for (const key of ["p", "e", "u", "d", "a", "x"]) {
+    if (typeof sections[key] === "string" && visibleCharacterCount(sections[key]) > 28)
+      throw new ProviderError("format", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u5b57\u6bb5\u8d85\u8fc7\u4f20\u8f93\u957f\u5ea6\u9650\u5236");
+  }
+  if (typeof sections.r === "string" && visibleCharacterCount(sections.r) > 40)
+    throw new ProviderError("format", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u5b57\u6bb5\u8d85\u8fc7\u4f20\u8f93\u957f\u5ea6\u9650\u5236");
+  const continuity = voice.q && typeof voice.q === "object" && !Array.isArray(voice.q)
+    ? voice.q as Record<string, unknown>
+    : {};
+  for (const key of ["e", "p", "c", "i"]) {
+    if (typeof continuity[key] === "string" && visibleCharacterCount(continuity[key]) > (key === "e" ? 16 : 24))
+      throw new ProviderError("format", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u7684\u8fde\u7eed\u6027\u5b57\u6bb5\u8d85\u8fc7\u4f20\u8f93\u957f\u5ea6\u9650\u5236");
+  }
 }
 function messageRowsOf(value: unknown): unknown[] | undefined {
   if (Array.isArray(value)) return value;
   if (!value || typeof value !== "object") return;
   const row = value as Record<string, unknown>;
   if (Array.isArray(row.messages)) return row.messages;
+  if (Array.isArray(row.m)) return row.m;
   for (const key of ["content", "message", "reply"] as const) {
     const candidate = row[key];
     if (typeof candidate === "string") return [candidate];
@@ -378,6 +481,7 @@ function normalizedBubblesFromRows(
   messages: unknown[],
   bilingual: boolean,
   range: ReplyBubbleRange,
+  expectedCount?: number,
 ): NormalizedReplyBubbles {
   const parts: ReplyBubblePart[] = [];
   for (const item of messages) {
@@ -391,8 +495,8 @@ function normalizedBubblesFromRows(
     if (!item || typeof item !== "object")
       throw new ProviderError("format", "角色回复气泡格式无法识别");
     const row = item as Record<string, unknown>;
-    const content = row.content ?? row.message ?? row.reply;
-    const translation = row.translation;
+    const content = row.content ?? row.c ?? row.message ?? row.reply;
+    const translation = row.translation ?? row.t;
     if (typeof content !== "string" || !content.trim())
       throw new ProviderError("format", "角色回复包含空气泡");
     if (bilingual && (typeof translation !== "string" || !translation.trim()))
@@ -403,7 +507,7 @@ function normalizedBubblesFromRows(
     });
   }
   if (!parts.length) throw new ProviderError("format", "角色没有返回非空消息");
-  return normalizeReplyBubbles(parts, range);
+  return normalizeReplyBubbles(parts, range, expectedCount);
 }
 
 function turnFromRoot(
@@ -412,17 +516,20 @@ function turnFromRoot(
   range: ReplyBubbleRange,
   innerVoiceRequired: boolean,
   strict: boolean,
+  expectedCount?: number,
 ): GeneratedReplyTurn {
-  const row = root && typeof root === "object" && !Array.isArray(root)
-    ? root as Record<string, unknown>
+  const canonicalRoot = canonicalReplyRoot(root);
+  const row = canonicalRoot && typeof canonicalRoot === "object" && !Array.isArray(canonicalRoot)
+    ? canonicalRoot as Record<string, unknown>
     : undefined;
   const messages = strict ? (row && Array.isArray(row.messages) ? row.messages : undefined) : messageRowsOf(root);
   if (!messages) throw new ProviderError("format", "角色回复缺少 messages 数组");
-  const normalized = normalizedBubblesFromRows(messages, bilingual, range);
+  const normalized = normalizedBubblesFromRows(messages, bilingual, range, expectedCount);
+  validateCompactReplyWire(root);
   let innerVoice: GeneratedInnerVoice | undefined;
   let innerVoiceFormatError = false;
   try {
-    innerVoice = parseGeneratedInnerVoiceFromRoot(root, innerVoiceRequired);
+    innerVoice = parseGeneratedInnerVoiceFromRoot(canonicalRoot, innerVoiceRequired);
   } catch (error) {
     if (!innerVoiceRequired || !(error instanceof ProviderError) || error.kind !== "format") throw error;
     if (strict) throw error;
@@ -432,9 +539,9 @@ function turnFromRoot(
     ...normalized,
     innerVoice,
     innerVoiceFormatError,
-    musicAction: parseMusicActionFromRoot(root),
-    islandAction: parseIslandActionFromRoot(root),
-    stickerId: parseStickerIdFromRoot(root),
+    musicAction: parseMusicActionFromRoot(canonicalRoot),
+    islandAction: parseIslandActionFromRoot(canonicalRoot),
+    stickerId: parseStickerIdFromRoot(canonicalRoot),
   };
 }
 
@@ -493,6 +600,7 @@ export function parseStrictReplyTurn(
   range: ReplyBubbleRange,
   innerVoiceRequired: boolean,
   response?: ProviderChatResult,
+  expectedCount?: number,
 ): GeneratedReplyTurn {
   let root: unknown;
   let diagnostics: StructuredJsonDiagnostics | undefined;
@@ -500,7 +608,7 @@ export function parseStrictReplyTurn(
     const parsed = parseStructuredJsonWithMeta(raw, {
       transportMarkedIncomplete: response?.truncated,
     });
-    root = parsed.value;
+    root = canonicalReplyRoot(parsed.value);
     diagnostics = parsed.diagnostics;
   } catch (error) {
     const structuredError = error instanceof StructuredJsonError ? error : undefined;
@@ -518,13 +626,15 @@ export function parseStrictReplyTurn(
       structuredError?.diagnostics,
     );
   }
+  if (isCompactReplyRoot(root) && raw.length > 2400)
+    throw strictTurnError("invalid_role_protocol", "\u7d27\u51d1\u89d2\u8272\u56de\u590d\u8d85\u8fc7\u5b89\u5168\u4f20\u8f93\u957f\u5ea6", response, "role-protocol", diagnostics);
   if (!root || typeof root !== "object" || Array.isArray(root))
     throw strictTurnError("invalid_role_protocol", "服务返回的 JSON 不是完整角色回复对象", response, "role-protocol", diagnostics);
   const row = root as Record<string, unknown>;
   if (!Array.isArray(row.messages) || !row.messages.length)
     throw strictTurnError("missing_messages", "服务返回的 JSON 缺少非空 messages 数组", response, "role-protocol", diagnostics);
   try {
-    const turn = turnFromRoot(root, bilingual, range, innerVoiceRequired, true);
+    const turn = turnFromRoot(root, bilingual, range, innerVoiceRequired, true, expectedCount);
     if (innerVoiceRequired && !turn.innerVoice)
       throw strictTurnError("missing_inner_voice", "服务返回的 JSON 缺少完整心声结构", response, "inner-voice", diagnostics);
     return turn;
@@ -559,10 +669,11 @@ export function replyBubbleInstruction(
     range = resolvedPlan.range,
     setting = scene === "group" ? "current group chat" : scene === "proactive" ? "proactive private message" : "private chat",
     messageShape = bilingual
-      ? '{"messages":[{"content":"original character message","translation":"faithful Simplified Chinese translation"}]'
-      : '{"messages":[{"content":"character message"}]';
+      ? '{"m":[{"c":"\\u89d2\\u8272\\u6b63\\u6587","t":"\\u7b80\\u4f53\\u4e2d\\u6587\\u8bd1\\u6587"}]'
+      : '{"m":[{"c":"\\u89d2\\u8272\\u6b63\\u6587"}]';
   let shape = messageShape;
-  if (innerVoiceRequired) shape += ',"innerVoice":{"sections":{"physicalState":"简体中文","emotionAndMind":"简体中文","unspokenWords":"简体中文","selfDeception":"简体中文","triggeredMemory":"简体中文","angelThought":"简体中文","devilThought":"简体中文"},"continuity":{"emotion":"简短情绪","concern":"可选","pendingIntent":"可选","physicalState":"可选"}}';
+  if (innerVoiceRequired)
+    shape += ',"v":{"s":{"p":"\\u8eab\\u4f53","e":"\\u60c5\\u7eea","u":"\\u672a\\u8bf4","d":"\\u9632\\u5fa1","r":"\\u56de\\u5fc6","a":"\\u514b\\u5236","x":"\\u51b2\\u52a8"},"q":{"e":"\\u60c5\\u7eea","p":"\\u53ef\\u9009","c":"\\u53ef\\u9009","i":"\\u53ef\\u9009"}}';
   if (musicActionEnabled) shape += ',"musicAction":null';
   if (islandActionEnabled) shape += ',"islandAction":null';
   if (stickerCatalog.length) shape += ',"stickerId":null';
@@ -570,25 +681,16 @@ export function replyBubbleInstruction(
   return [
     "Reply as " + character.name + " in the " + setting + ".",
     range.adaptive
-      ? "There is no preset reply count. Decide the number of separate message bubbles naturally from the immediate context, the character persona, emotion, and conversational rhythm. For this turn, usually prefer " + resolvedPlan.preferredMin + "-" + resolvedPlan.preferredMax + " bubbles, but semantic necessity matters more than hitting that soft range."
-      : "Return between " + range.min + " and " + range.max + " separate message bubbles.",
-    range.adaptive && resolvedPlan.recentCounts.length
-      ? "Recent character turns used these bubble counts, newest first: " + resolvedPlan.recentCounts.join(", ") + ". Vary the rhythm when natural instead of mechanically repeating the same count."
-      : "",
-    range.adaptive ? "Never default to five bubbles. Use one or two for a simple reply, and add another bubble only when it contributes a new complete meaning." : "",
-    "Each item is one message the character actually sends. Do not put multiple intended bubbles into one item with blank lines.",
-    "Keep each bubble around 20 visible characters including punctuation and emoji. Finish one semantically complete sentence or phrase, then continue the remaining thought in a new bubble. Semantic completeness matters more than an exact character or bubble count.",
-    "Never prefix bubble content with a number, ordered-list marker, or bullet such as 1., 2), or ①.",
-    "Choose the exact count naturally. Do not repeat content, add filler, restate the same concern, or mechanically cut one sentence merely to reach the count.",
+      ? "There is no preset reply count. The local planner selected exactly " + resolvedPlan.targetCount + " bubbles for this turn; return exactly that count."
+      : "Return exactly " + resolvedPlan.targetCount + " separate message bubbles. This must remain within the user setting range " + range.min + "-" + range.max + ".",
+    "Each item is one complete message the character actually sends. Do not put multiple bubbles into one item with blank lines. Never default to five bubbles. Keep each bubble around 20 visible characters when natural and finish a semantically complete sentence or phrase.",
+    "Keep each visible bubble at or below 80 characters and each translation at or below 100 characters. Do not add filler, repetition, numbering or explanation.",
     innerVoiceRequired ? innerVoiceInstruction(bilingual) : "",
-    musicActionEnabled ? "When listening context is present, use at most one musicAction and only when naturally relevant. Track actions may only use candidate IDs explicitly supplied by the listening context. Balanced mode requires propose-control for pause, next, or clear-queue." : "",
+    musicActionEnabled ? "When listening context is present, use at most one musicAction and only when naturally relevant. Track actions may only use candidate IDs explicitly supplied by the listening context." : "",
     islandActionEnabled ? "When the island context explicitly requires an invitation decision, islandAction must not be null. Otherwise use at most one islandAction and only when naturally relevant." : "",
-    stickerCatalog.length ? `Available stickers (use only an exact id from this list): ${JSON.stringify(stickerCatalog)}. Set stickerId only when one sticker naturally adds an in-character emotion or attitude to this exact turn. Use at most one, use stickers sparingly, never send one merely because it is available, and do not explain or repeat the sticker meaning in visible text. Otherwise return stickerId as null.` : "",
-    options.compactComplete
-      ? "This is the one complete compact rewrite. Return exactly one single-line minified JSON object with no Markdown, code fence, explanation, or surrounding text. Keep every visible bubble short but semantically complete. Keep all seven innerVoice section values concise, specific, non-empty Simplified Chinese. In continuity, emotion is mandatory; omit concern, pendingIntent, and physicalState unless essential. Never omit messages, required translations, or any of the seven innerVoice sections."
-      : "",
+    stickerCatalog.length ? "Available stickers (use only an exact id from this list): " + JSON.stringify(stickerCatalog) + ". Use at most one, use sparingly, do not explain, and otherwise return stickerId as null." : "",
+    "Return exactly one single-line minified JSON object with no Markdown, code fence, explanation, reasoning, analysis or surrounding text. Use the compact wire fields m and v. Do not return innerVoice.content; the client derives it locally.",
+    options.compactComplete ? "This is the complete retry. Regenerate the entire turn from the beginning; do not continue, quote or merge any previous output." : "",
     "Return strict JSON only: " + shape,
   ].filter(Boolean).join(" ");
 }
-
-
