@@ -198,6 +198,7 @@ function feedSystem(
   books: any[],
   memories: any[],
   appSettings?: AppSettings,
+  at = new Date(),
 ) {
   const chat = chatSettingsOf(character),
     lore = matchLore(
@@ -215,7 +216,7 @@ function feedSystem(
     `角色：${character.name}\n核心设定：${coreSettingOf(character)}\n人物设定：${personaOf(character)}`,
     loreEntriesBlock(loreGroups["after-character"]),
     userPersonaContext(appSettings),
-    localTimeContext({enabled:character.proactive.timeAware}),
+    localTimeContext({enabled:character.proactive.timeAware, at}),
     languageStyleInstruction(chat.language),
     relationshipContextOf(character),
     ownMemories.length
@@ -1007,6 +1008,7 @@ async function createFeedDraft(
   appSettings: AppSettings,
   rejectedContents: Array<{content:string;reason:string}> = [],
 ) {
+  const generationTime = new Date();
   const recent = posts
       .filter(
         (x) =>
@@ -1029,7 +1031,7 @@ async function createFeedDraft(
         [
           {
             role: "system",
-            content: feedSystem(character, books, memories, appSettings),
+            content: feedSystem(character, books, memories, appSettings, generationTime),
           },
           { role: "user", content: prompt },
         ],
@@ -1199,7 +1201,8 @@ export async function runProactive(
       due = characterDue(c, Date.now(), counts, onlineSince),
       cv = privateConversation(c.id, conversations);
     if (cv && due.message > 0) {
-      const history = (
+      const generationTime = new Date(),
+        history = (
           await db.messages
             .where("conversationId")
             .equals(cv.id)
@@ -1239,6 +1242,7 @@ export async function runProactive(
           scene: "proactive-message",
           presence,
           crossModeContinuity,
+          timeAt: generationTime,
         });
       if (!canCharacterInteract(c)) {
         if (c.contactState?.status === "blocked")
@@ -1296,6 +1300,7 @@ function commentPrompt(
   target?: FeedComment,
   imageUrls: string[] = [],
   bilingual = false,
+  at = new Date(),
 ): ChatItem[] {
   const descriptions = [
       post.imageDescription,
@@ -1307,7 +1312,7 @@ function commentPrompt(
       ? `用户正在直接回复你：${target.content}`
       : "请自然评论这条动态，不要替其他角色说话。";
   return [
-    { role: "system", content: feedSystem(character, [], [], appSettings) },
+    { role: "system", content: feedSystem(character, [], [], appSettings, at) },
     {
       role: "user",
       content: `动态作者：${authorName}\n动态正文：${post.content || "（无文字）"}\n图片说明：${descriptions || ((post.images?.length ?? 0) > 0 ? `用户分享了${post.images?.length}张图片` : "无")}\n已有评论：\n${comments.map((c) => c.content).join("\n") || "暂无"}\n${instruction}\n只返回 JSON：{\"content\":\"回复内容\"}${bilingual ? `\nReturn a translation field containing a faithful Simplified Chinese translation.` : ""}`,
@@ -1339,7 +1344,8 @@ export async function processFeedInteractions(provider: ProviderSettings) {
         continue;
       }
       try {
-        const authorName =
+        const generationTime = new Date(),
+          authorName =
             (post.authorType ?? "character") === "user"
               ? appSettings.userName?.trim() || "用户"
               : (characters.find((c) => c.id === post.authorId)?.name ??
@@ -1356,8 +1362,9 @@ export async function processFeedInteractions(provider: ProviderSettings) {
               : undefined,
             images,
             autoTranslateCharacter(character),
+            generationTime,
           );
-        prompt[0].content = feedSystem(character, books, memories, appSettings);
+        prompt[0].content = feedSystem(character, books, memories, appSettings, generationTime);
         const bilingual = autoTranslateCharacter(character),
           generated = await twice(async () =>
             proactiveContentItem(

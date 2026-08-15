@@ -2,6 +2,7 @@
 import { db } from "./db";
 import { configuredProvider, getModelServiceSettings } from "./modelServices";
 import { OpenAIProvider } from "./provider";
+import { meetLengthRangeViolation } from "./meet";
 import type {
   Character,
   MeetCompiledStyle,
@@ -278,13 +279,10 @@ export function meetStyleViolation(
   turn: { prose: string; thought: string; dialogue: string },
   settings: MeetNarrativeSettings,
 ) {
-  const styled = `${turn.prose}\n${turn.thought}`,
-    labels = /(^|\n)\s*(动作|表情|现场|分析|镜头|内心分析)\s*[:：]/,
-    tooLong = styled.length > settings.maxChars * 2.2,
-    tooShort =
-      Boolean(styled.trim()) &&
-      styled.length < Math.min(40, settings.minChars * 0.2);
-  if (labels.test(styled) || tooLong || tooShort) return true;
+  const styled = `${turn.prose}\n${turn.thought}\n${turn.dialogue}`,
+    labels = /(^|\n)\s*(?:\u52a8\u4f5c|\u8868\u60c5|\u73b0\u573a|\u5206\u6790|\u955c\u5934|\u5185\u5fc3\u5206\u6790)\s*[:\uFF1A]/u,
+    length = meetLengthRangeViolation(turn, settings);
+  if (labels.test(styled) || !length.valid) return true;
   const compiled = validMeetCompiledStyle(settings);
   if (
     compiled?.forbiddenTraits.some(

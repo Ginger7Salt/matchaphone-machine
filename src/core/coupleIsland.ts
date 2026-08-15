@@ -243,19 +243,53 @@ export async function storeIslandObject(objectId: string) { const object = await
 export async function waterIslandPlant(objectId: string, actorType: "user" | "character" = "user") { const object = await db.coupleIslandObjects.get(objectId); if (!object || object.kind !== "plant") return { executed: false, reason: "植物不存在" }; const island = await db.coupleIslands.get(object.islandId); if (!island || island.status !== "active") return { executed: false, reason: "岛屿不可编辑" }; const today = dayKey(), last = String(object.state?.lastWateredDate ?? ""); if (last === today) return { executed: false, reason: "今天已经浇过水" }; const growth = Number(object.state?.growthPoints ?? 0) + 2, stage = Math.min(4, Math.floor(growth / 8)), at = now(); await db.coupleIslandObjects.update(object.id, { state: { ...object.state, growthPoints: growth, stage, lastWateredDate: today }, updatedAt: at }); await db.coupleIslandEvents.add({ id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, islandId: island.id, type: "water-plant", actorType, sourceId: `water:${object.id}:${today}:${actorType}`, summary: "给岛上的植物浇了水" }); return { executed: true }; }
 export async function interactIslandPet(objectId: string, action: string, actorType: "user" | "character" = "user") { const object = await db.coupleIslandObjects.get(objectId); if (!object || object.kind !== "pet") return { executed: false, reason: "宠物不存在" }; const island = await db.coupleIslands.get(object.islandId); if (!island || island.status !== "active") return { executed: false, reason: "岛屿不可编辑" }; const at = now(), bond = Math.min(100, Number(object.state?.bond ?? 0) + 2); await db.coupleIslandObjects.update(object.id, { state: { ...object.state, bond, mood: action.trim().slice(0, 20) || "开心", lastInteractionAt: at }, updatedAt: at }); await db.coupleIslandEvents.add({ id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, islandId: island.id, type: "pet-interaction", actorType, summary: `和宠物${action.trim().slice(0, 40) || "玩了一会儿"}` }); return { executed: true }; }
 
-export interface CoupleIslandContext { island?: CoupleIsland; pendingInvitation?: Message; recentEvents: CoupleIslandEvent[]; activeWishes: CoupleIslandEntry[]; objects: CoupleIslandObject[]; unreadLetters: CoupleIslandEntry[]; strategyMode: boolean; }
+export function normalizeDiaryText(value: string) {
+  return value
+    .toLocaleLowerCase()
+    .replace(/\s+/gu, "")
+    .replace(/[\p{P}\p{S}]/gu, "");
+}
+
+function diaryBigrams(value: string) {
+  const normalized = normalizeDiaryText(value);
+  const grams = new Set<string>();
+  if (normalized.length < 2) {
+    if (normalized) grams.add(normalized);
+    return grams;
+  }
+  for (let index = 0; index < normalized.length - 1; index += 1)
+    grams.add(normalized.slice(index, index + 2));
+  return grams;
+}
+
+export function diarySimilarity(left: string, right: string) {
+  const a = diaryBigrams(left), b = diaryBigrams(right);
+  if (!a.size || !b.size) return 0;
+  let intersection = 0;
+  for (const gram of a) if (b.has(gram)) intersection += 1;
+  return intersection / (a.size + b.size - intersection);
+}
+
+export function isRepeatedCharacterDiary(text: string, recent: Array<Pick<CoupleIslandEntry, "text">>) {
+  const normalized = normalizeDiaryText(text);
+  if (normalized.length < 12) return recent.some((entry) => normalizeDiaryText(entry.text) === normalized);
+  return recent.some((entry) => diarySimilarity(text, entry.text) >= 0.58);
+}
+
+export interface CoupleIslandContext { island?: CoupleIsland; pendingInvitation?: Message; recentEvents: CoupleIslandEvent[]; activeWishes: CoupleIslandEntry[]; objects: CoupleIslandObject[]; unreadLetters: CoupleIslandEntry[]; recentCharacterDiaries?: CoupleIslandEntry[]; strategyMode: boolean; }
 export async function buildCoupleIslandContext(conversationId: string, characterId: string): Promise<CoupleIslandContext | undefined> {
   const [island, character, invitation] = await Promise.all([coupleIslandForConversation(conversationId, characterId), db.characters.get(characterId), latestCoupleIslandInvitation(conversationId, characterId)]);
   if (!character) return;
   const pending = invitation?.attachments?.some((item) => item.type === "couple-island-invitation" && item.cardRole !== "response" && item.state === "pending") ? invitation : undefined;
   if (!island && !pending) return;
-  const [events, wishes, objects, letters] = island ? await Promise.all([
+  const [events, wishes, objects, letters, diaries] = island ? await Promise.all([
     db.coupleIslandEvents.where("islandId").equals(island.id).reverse().sortBy("createdAt"),
     db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "wish" && entry.state === "active").toArray(),
     db.coupleIslandObjects.where("islandId").equals(island.id).toArray(),
     db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "letter" && entry.state === "active").toArray(),
-  ]) : [[], [], [], []];
-  return { island, pendingInvitation: pending, recentEvents: events.slice(0, 6), activeWishes: wishes.slice(0, 3), objects, unreadLetters: letters.slice(-3), strategyMode: chatSettingsOf(character).strategyMode.enabled };
+    db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "diary" && entry.authorType === "character").reverse().sortBy("createdAt"),
+  ]) : [[], [], [], [], []];
+  return { island, pendingInvitation: pending, recentEvents: events.slice(0, 6), activeWishes: wishes.slice(0, 3), objects, unreadLetters: letters.slice(-3), recentCharacterDiaries: diaries.slice(0, 6), strategyMode: chatSettingsOf(character).strategyMode.enabled };
 }
 export function coupleIslandContextPrompt(context?: CoupleIslandContext) {
   if (!context) return "";
@@ -264,7 +298,7 @@ export function coupleIslandContextPrompt(context?: CoupleIslandContext) {
   if (context.island.status === "archived") return `【茶侣岛】你与用户的岛屿“${context.island.name}”目前被封存。可以记得共同经历，但不要自行修改岛屿。`;
   const pets = context.objects.filter((item) => item.kind === "pet").map((item) => `${COUPLE_ISLAND_CATALOG.find((c) => c.id === item.catalogId)?.name ?? "宠物"}(亲近度${Number(item.state?.bond ?? 0)})`).join("、") || "尚未领养";
   const plants = context.objects.filter((item) => item.kind === "plant").map((item) => `${COUPLE_ISLAND_CATALOG.find((c) => c.id === item.catalogId)?.name ?? "植物"}(阶段${Number(item.state?.stage ?? 0)})`).join("、") || "暂无";
-  return ["【当前茶侣岛】", `岛屿：${context.island.name}；等级 ${context.island.level}；天气：${context.island.weather}；心贝 ${context.island.heartShells}。`, `进行中的心愿：${context.activeWishes.map((entry) => entry.text).join("；") || "无"}。`, `植物：${plants}。宠物：${pets}。`, `最近公开事件：${context.recentEvents.map((event) => event.summary).join("；") || "无"}。`, "你可以在 islandAction 中选择一次轻量、符合当前情境的岛屿操作；不要编造未发生的约会、旅行、礼物或关系进展。对象与心愿 ID 必须来自当前上下文。", `可用对象ID：${context.objects.map((item) => `${item.id}:${item.kind}`).join("，") || "无"}。可用心愿ID：${context.activeWishes.map((entry) => entry.id).join("，") || "无"}。`].join("\n");
+  return ["【当前茶侣岛】", `岛屿：${context.island.name}；等级 ${context.island.level}；天气：${context.island.weather}；心贝 ${context.island.heartShells}。`, `进行中的心愿：${context.activeWishes.map((entry) => entry.text).join("；") || "无"}。`, `植物：${plants}。宠物：${pets}。`, `最近公开事件：${context.recentEvents.map((event) => event.summary).join("；") || "无"}。`, `\u8fd1\u671f\u89d2\u8272\u65e5\u8bb0\uff08\u4e0d\u5f97\u91cd\u590d\u5176\u53e5\u5f0f\u3001\u4e8b\u4ef6\u3001\u60c5\u7eea\u7ed3\u8bba\u6216\u7ed3\u5c3e\uff09\uff1a${context.recentCharacterDiaries?.map((entry) => entry.text).join("\uFF1B") || "\u65e0"}\u3002`, "你可以在 islandAction 中选择一次轻量、符合当前情境的岛屿操作；不要编造未发生的约会、旅行、礼物或关系进展。对象与心愿 ID 必须来自当前上下文。", `可用对象ID：${context.objects.map((item) => `${item.id}:${item.kind}`).join("，") || "无"}。可用心愿ID：${context.activeWishes.map((entry) => entry.id).join("，") || "无"}。`].join("\n");
 }
 export async function executeCharacterIslandAction(input: { conversationId: string; characterId: string; action: CharacterIslandAction }) {
   const action = input.action;
@@ -272,7 +306,7 @@ export async function executeCharacterIslandAction(input: { conversationId: stri
   if (action.type === "accept-invite" || action.type === "decline-invite") { if (!context.pendingInvitation) return { executed: false, reason: "当前没有待处理邀请" }; return { executed: true, result: await respondCoupleIslandInvitation(context.pendingInvitation.id, action.type === "accept-invite" ? "accept" : "decline", action.type === "decline-invite" ? action.reason : undefined) }; }
   if (!context.island || context.island.status !== "active") return { executed: false, reason: "茶侣岛未开放" };
   if (action.type === "leave-letter") { const entry = await addIslandEntry({ islandId: context.island.id, kind: "letter", authorType: "character", title: action.title, text: action.text, state: "active" }); return { executed: true, entry }; }
-  if (action.type === "write-diary") { const entry = await addIslandEntry({ islandId: context.island.id, kind: "diary", authorType: "character", text: action.text }); return { executed: true, entry }; }
+  if (action.type === "write-diary") { if (isRepeatedCharacterDiary(action.text, context.recentCharacterDiaries ?? [])) return { executed: false, reason: "\u8fd9\u7bc7\u65e5\u8bb0\u4e0e\u8fd1\u671f\u5185\u5bb9\u8fc7\u4e8e\u76f8\u4f3c\uff0c\u672a\u4fdd\u5b58" }; const entry = await addIslandEntry({ islandId: context.island.id, kind: "diary", authorType: "character", text: action.text }); return { executed: true, entry }; }
   if (action.type === "water-plant") { const object = context.objects.find((item) => item.id === action.objectId); if (!object) return { executed: false, reason: "对象不属于当前岛屿" }; return waterIslandPlant(object.id, "character"); }
   if (action.type === "interact-pet") { const object = context.objects.find((item) => item.id === action.objectId); if (!object) return { executed: false, reason: "对象不属于当前岛屿" }; return interactIslandPet(object.id, action.action, "character"); }
   if (action.type === "move-decoration") { const object = context.objects.find((item) => item.id === action.objectId); if (!object) return { executed: false, reason: "对象不属于当前岛屿" }; const distance = Math.hypot((object.x ?? 50) - action.x, (object.y ?? 50) - action.y); if (distance > 28) { const at = now(); await db.coupleIslandEvents.add({ id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, islandId: context.island.id, type: "layout-suggestion", actorType: "character", summary: `角色想重新摆放${COUPLE_ISLAND_CATALOG.find((item) => item.id === object.catalogId)?.name ?? "装饰"}，等待你的确认` }); return { executed: false, reason: "大幅布局修改需要用户确认" }; } await placeIslandObject(object.id, object.zone, action.x, action.y); return { executed: true }; }
@@ -291,15 +325,37 @@ export async function queueIslandFirstOpenUpdate(islandId: string) { const islan
 const aiUpdateSchema = z.object({ kind: z.enum(["letter", "diary"]), title: z.string().max(80).optional(), text: z.string().min(1).max(1200) });
 function parseStrictJson(text: string) { try { return JSON.parse(text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")); } catch { throw new ProviderError("format", "茶侣岛更新格式无法识别"); } }
 export async function runCoupleIslandUpdate(islandId: string, provider: ProviderSettings) {
-  const island = await db.coupleIslands.get(islandId), character = island ? await db.characters.get(island.characterId) : undefined; if (!island || island.status !== "active" || !character) return;
-  const at = now(); if (at - (island.lastAiActionAt ?? 0) < ISLAND_AI_COOLDOWN_MS) return;
-  const todayCount = await db.coupleIslandEvents.where("islandId").equals(islandId).filter((event) => event.type.startsWith("ai-") && dayKey(event.createdAt) === dayKey(at)).count(); if (todayCount >= ISLAND_AI_DAILY_LIMIT) return;
-  const context = await buildCoupleIslandContext(island.conversationId, island.characterId); if (!context) return;
-  const raw = await new OpenAIProvider({ ...provider, stream: false }).chat([{ role: "system", content: `${localTimeContext({enabled:character.proactive.timeAware,label:"茶侣岛当前时间"})}\n你是${character.name}，只根据真实提供的共同事件，为茶侣岛写一封短信或一篇极短日记。符合人物性格，不提系统、模型、数值，不编造事件。只输出 JSON：{"kind":"letter|diary","title":"可选","text":"正文"}` }, { role: "user", content: coupleIslandContextPrompt(context) }], { stream: false });
-  const parsed = aiUpdateSchema.parse(parseStrictJson(raw)), entry = await addIslandEntry({ islandId, kind: parsed.kind, authorType: "character", title: parsed.title, text: parsed.text, state: parsed.kind === "letter" ? "active" : undefined });
-  await db.transaction("rw", [db.coupleIslands, db.coupleIslandEvents], async () => { await db.coupleIslands.update(islandId, { lastAiActionAt: at, lastActivityAt: at, updatedAt: at }); await db.coupleIslandEvents.add({ id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, islandId, type: `ai-${parsed.kind}`, actorType: "character", sourceId: entry.id, summary: parsed.kind === "letter" ? "角色在漂流信箱留下了一封信" : "角色写下了一篇岛屿日记" }); }); return entry;
+  const island = await db.coupleIslands.get(islandId), character = island ? await db.characters.get(island.characterId) : undefined;
+  if (!island || island.status !== "active" || !character) return;
+  const at = now();
+  if (at - (island.lastAiActionAt ?? 0) < ISLAND_AI_COOLDOWN_MS) return;
+  const todayCount = await db.coupleIslandEvents.where("islandId").equals(islandId).filter((event) => event.type.startsWith("ai-") && dayKey(event.createdAt) === dayKey(at)).count();
+  if (todayCount >= ISLAND_AI_DAILY_LIMIT) return;
+  const context = await buildCoupleIslandContext(island.conversationId, island.characterId);
+  if (!context) return;
+  const timeSnapshot = new Date(at);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const retryInstruction = attempt
+      ? "\u4e0a\u4e00\u7248\u65e5\u8bb0\u4e0e\u8fd1\u671f\u5185\u5bb9\u8fc7\u4e8e\u76f8\u4f3c\u3002\u8bf7\u5b8c\u6574\u91cd\u65b0\u751f\u6210\u4e00\u7bc7\u4e0d\u540c\u7684\u77ed\u65e5\u8bb0\uff0c\u5fc5\u987b\u66f4\u6362\u5f00\u5934\u3001\u5177\u4f53\u4e8b\u4ef6\u3001\u60c5\u7eea\u7ed3\u8bba\u548c\u7ed3\u5c3e\uff1b\u4e0d\u8981\u89e3\u91ca\u3002"
+      : "";
+    const raw = await new OpenAIProvider({ ...provider, stream: false }).chat([
+      {
+        role: "system",
+        content: `${localTimeContext({ enabled: character.proactive.timeAware, at: timeSnapshot, label: "\u8336\u4fa3\u5c9b\u5f53\u524d\u65f6\u95f4" })}\n\u4f60\u662f${character.name}\uff0c\u53ea\u6839\u636e\u771f\u5b9e\u63d0\u4f9b\u7684\u5171\u540c\u4e8b\u4ef6\uff0c\u4e3a\u8336\u4fa3\u5c9b\u5199\u4e00\u5c01\u77ed\u4fe1\u6216\u4e00\u7bc7\u6781\u77ed\u65e5\u8bb0\u3002\u7b26\u5408\u4eba\u7269\u6027\u683c\uff0c\u4e0d\u63d0\u7cfb\u7edf\u3001\u6a21\u578b\u3001\u6570\u503c\uff0c\u4e0d\u7f16\u9020\u4e8b\u4ef6\u3002${retryInstruction}\u53ea\u8f93\u51fa JSON\uff1a{"kind":"letter|diary","title":"\u53ef\u9009","text":"\u6b63\u6587"}`,
+      },
+      { role: "user", content: coupleIslandContextPrompt(context) },
+    ], { stream: false });
+    const parsed = aiUpdateSchema.parse(parseStrictJson(raw));
+    if (parsed.kind === "diary" && isRepeatedCharacterDiary(parsed.text, context.recentCharacterDiaries ?? [])) continue;
+    const entry = await addIslandEntry({ islandId, kind: parsed.kind, authorType: "character", title: parsed.title, text: parsed.text, state: parsed.kind === "letter" ? "active" : undefined });
+    await db.transaction("rw", [db.coupleIslands, db.coupleIslandEvents], async () => {
+      await db.coupleIslands.update(islandId, { lastAiActionAt: at, lastActivityAt: at, updatedAt: at });
+      await db.coupleIslandEvents.add({ id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, islandId, type: `ai-${parsed.kind}`, actorType: "character", sourceId: entry.id, summary: parsed.kind === "letter" ? "\u89d2\u8272\u5728\u6f02\u6d41\u4fe1\u7bb1\u7559\u4e0b\u4e86\u4e00\u5c01\u4fe1" : "\u89d2\u8272\u5199\u4e0b\u4e86\u4e00\u7bc7\u5c9b\u5c7f\u65e5\u8bb0" });
+    });
+    return entry;
+  }
+  return undefined;
 }
-
 export async function deleteCoupleIslandDataForCharacter(characterId: string) {
   const islands = await db.coupleIslands.where("characterId").equals(characterId).toArray(), ids = islands.map((row) => row.id); if (!ids.length) return;
   await db.coupleIslandObjects.where("islandId").anyOf(ids).delete(); await db.coupleIslandEntries.where("islandId").anyOf(ids).delete(); await db.coupleIslandEvents.where("islandId").anyOf(ids).delete(); await db.coupleIslands.bulkDelete(ids);

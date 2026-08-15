@@ -33,6 +33,7 @@ import { autoTranslateCharacter, completedTranslation } from "./bilingual";
 import { maybeAttachCharacterVoice } from "./speech";
 import {
   normalizeReplyBubbles,
+  replyBubblePlanOf,
   replyBubbleRangeOf,
   type ReplyBubblePart,
 } from "./replyBubbles";
@@ -161,6 +162,45 @@ function groupBudgetOf(
     state: "pending",
   };
 }
+async function ensurePersistedBubbleTarget(
+  task: BackgroundTask,
+  character: Character,
+  context: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  scene: "private" | "group",
+  actorId?: string,
+) {
+  const initialPayload = taskPayload(task);
+  const existing = actorId
+    ? initialPayload.targetBubbleCounts?.[actorId]
+    : initialPayload.targetBubbleCount;
+  if (Number.isInteger(existing) && Number(existing) > 0) return Number(existing);
+  const selected = replyBubblePlanOf(character, context, scene).targetCount;
+  let target = selected;
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
+    const payload = taskPayload(stored!);
+    const storedTarget = actorId
+      ? payload.targetBubbleCounts?.[actorId]
+      : payload.targetBubbleCount;
+    target = Number.isInteger(storedTarget) && Number(storedTarget) > 0
+      ? Number(storedTarget)
+      : selected;
+    const nextPayload: ChatReplyTaskPayload = actorId
+      ? {
+          ...payload,
+          targetBubbleCounts: {
+            ...(payload.targetBubbleCounts ?? {}),
+            [actorId]: target,
+          },
+        }
+      : { ...payload, targetBubbleCount: target };
+    await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
+    task.payload = nextPayload;
+  });
+  return target;
+}
+
 async function reserveProviderCall(
   task: BackgroundTask,
   purpose: ChatProviderCallPurpose,
@@ -536,6 +576,23 @@ export async function ensureRunnableChatReplyTask(
         : (actors.find(
             (actor) => actor.id === speakerOrder?.[input.startIndex ?? 0],
           )?.character ?? actors[0].character);
+  const bubbleContext = sourcePool.map((message) => ({
+    role: (message.senderType === "user" ? "user" : "assistant") as "user" | "assistant",
+    content: message.content,
+  }));
+  const targetBubbleCount = input.mode === "private"
+    ? replyBubblePlanOf(sender, bubbleContext, "private").targetCount
+    : undefined;
+  const targetBubbleCounts = input.mode === "group"
+    ? Object.fromEntries(
+        (speakerOrder ?? []).flatMap((speakerId) => {
+          const actor = actors.find((item) => item.id === speakerId);
+          return actor
+            ? [[speakerId, replyBubblePlanOf(actor.character, bubbleContext, "group").targetCount]]
+            : [];
+        }),
+      )
+    : undefined;
   const generation = {
     model: provider.model,
     temperature: provider.temperature,
@@ -601,6 +658,8 @@ export async function ensureRunnableChatReplyTask(
     providerCallLimit: CHAT_PROVIDER_CALL_LIMIT,
     providerCallCount: 0,
     providerCallTrace: [],
+    targetBubbleCount,
+    targetBubbleCounts,
     groupProviderCallBudgets: input.mode === "group" ? {} : undefined,
     originalMessage: target && !originalMessages ? { ...target } : undefined,
     originalMessages: originalMessages?.map((message) => ({ ...message })),
@@ -1160,6 +1219,7 @@ async function processPrivate(
   task: BackgroundTask,
   controller: AbortController,
 ) {
+  const generationTime = new Date();
   const payload = taskPayload(task),
     data = await loadTaskData(task),
     {
@@ -1249,9 +1309,11 @@ async function processPrivate(
       forceAllLore: payload.regenerationReasons?.includes("lore-conflict"),
       presence,
       crossModeContinuity,
+      timeAt: generationTime,
     });
   const continuityContext = innerVoiceContinuityContext(history, character.id);
   if (continuityContext) ctx.push({ role: "system", content: continuityContext });
+  const targetBubbleCount = await ensurePersistedBubbleTarget(task, character, ctx, "private");
   const listeningContext = await buildListeningContext(conversation.id);
   const listeningPrompt = listeningContextPrompt(listeningContext);
   if (listeningPrompt) ctx.push({ role: "system", content: listeningPrompt });
@@ -1281,6 +1343,7 @@ async function processPrivate(
     })),
     undefined,
     providerInvokerForTask(task),
+      targetBubbleCount,
     );
     let parts = generatedTurn.parts,
     innerVoice: GeneratedInnerVoice | undefined = generatedTurn.innerVoice;
@@ -1290,7 +1353,7 @@ async function processPrivate(
     translations: parts.map((part) => part.translation),
     characterName: character.name,
     presence,
-  }), timeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), new Date()) : null;
+  }), timeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), generationTime) : null;
   const providerBudgetAvailable = (taskPayload(task).providerCallCount ?? 0) < (taskPayload(task).providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT);
   const needsLocalReview = Boolean(payload.regenerationTargetId || localValidation.issues.length || timeConflict);
   if (needsLocalReview && providerBudgetAvailable) {
@@ -1346,9 +1409,9 @@ async function processPrivate(
       characterName: character.name,
       presence,
     });
-    const reviewedTimeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), new Date()) : null;
+    const reviewedTimeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), generationTime) : null;
     if (reviewedTimeConflict) {
-      const factual = currentTimeFactReply(new Date());
+      const factual = currentTimeFactReply(generationTime);
       parts = bilingual ? [{ content: factual, translation: factual }] : [{ content: factual }];
       if (!(payload.innerVoiceRequired ?? true)) innerVoice = undefined;
       else throw new ProviderError("format", "\u65f6\u95f4\u4fee\u6b63\u540e\u65e0\u6cd5\u4fdd\u7559\u5fc5\u8981\u5fc3\u58f0\uff0c\u8bf7\u91cd\u8bd5");
@@ -1592,6 +1655,7 @@ async function nextGroupPlaceholder(
   emit();
 }
 async function processGroup(task: BackgroundTask, controller: AbortController) {
+  const generationTime = new Date();
   const data = await loadTaskData(task),
     {
       conversation,
@@ -1710,7 +1774,15 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         regenerationInstruction: payload.regenerationInstruction,
         presence,
         crossModeContinuity,
+        timeAt: generationTime,
       });
+    const targetBubbleCount = await ensurePersistedBubbleTarget(
+      task,
+      speaker.character,
+      ctx,
+      "group",
+      speaker.id,
+    );
     const continuityContext = payload.innerVoiceRequired
       ? innerVoiceContinuityContext(history, speaker.id)
       : "";
@@ -1739,6 +1811,7 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
       })),
     undefined,
     providerInvokerForTask(task, false, speaker.id),
+      targetBubbleCount,
     );
     let parts: Array<{ content: string; translation?: string }> =
         generatedTurn.parts,

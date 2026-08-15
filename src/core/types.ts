@@ -695,6 +695,10 @@ export interface ChatReplyTaskPayload {
   generationCycle?: number;
   /** Provider calls made in the current generation cycle. */
   providerCallCount?: number;
+  /** Private-chat bubble target selected before the task starts. */
+  targetBubbleCount?: number;
+  /** Per-speaker bubble targets selected before a group task starts. */
+  targetBubbleCounts?: Record<string, number>;
   /** Shared private-chat limit; retained as a legacy field for group tasks. */
   providerCallLimit?: 2;
   /** Sanitized provider call lifecycle; never stores prompts or response text. */

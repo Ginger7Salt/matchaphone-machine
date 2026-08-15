@@ -102,6 +102,22 @@ describe("persistent chat reply tasks", () => {
     expect(rows[0].status).toBe("generating");
     expect(rows[0].generation?.taskEventId).toBe(first.eventId);
   });
+  it("persists private and per-speaker group bubble targets across task recovery", async () => {
+    await db.conversations.bulkAdd([privateConversation, groupConversation]);
+    const privateTask = await enqueueChatReply({ conversationId: privateConversation.id, mode: "private" });
+    const privateTarget = (privateTask.payload as any).targetBubbleCount;
+    expect(privateTarget).toBeTypeOf("number");
+    await db.backgroundTasks.update(privateTask.id, { state: "running", leaseExpiresAt: 1 });
+    const recoveredPrivate = await ensureRunnableChatReplyTask({ conversationId: privateConversation.id, mode: "private" });
+    expect((recoveredPrivate.task.payload as any).targetBubbleCount).toBe(privateTarget);
+
+    const groupTask = await enqueueChatReply({ conversationId: groupConversation.id, mode: "group", speakerOrder: [character.id] });
+    const groupTargets = (groupTask.payload as any).targetBubbleCounts;
+    expect(groupTargets).toEqual({ [character.id]: expect.any(Number) });
+    await db.backgroundTasks.update(groupTask.id, { state: "running", leaseExpiresAt: 1 });
+    const recoveredGroup = await ensureRunnableChatReplyTask({ conversationId: groupConversation.id, mode: "group", speakerOrder: [character.id] });
+    expect((recoveredGroup.task.payload as any).targetBubbleCounts).toEqual(groupTargets);
+  });
   it("requeues a permanently failed task when the user generates again", async () => {
     await db.conversations.add(privateConversation);
     const first = await enqueueChatReply({ conversationId: privateConversation.id, mode: "private" });

@@ -1,5 +1,6 @@
 import {describe,expect,it} from "vitest";
 import {buildContext,matchLore} from "./context";
+import {localTimeSnapshot} from "./localTime";
 import {defaultProvider,type Character,type Conversation,type LoreBook} from "./types";
 const character:Character={id:"c",schemaVersion:1,createdAt:1,updatedAt:1,name:"月白",avatar:"",bio:"旅人",personality:"安静",speakingStyle:"简洁",background:"来自旧城",language:"中文",proactive:{messages:false,timeAware:false,frequency:"medium",quietStart:"23:00",quietEnd:"08:00",catchupLimit:3,dailyLimit:10},relationship:{intimacy:1,trust:2,mood:"平静",recentEvents:[]},lastActiveAt:1};const conversation:Conversation={id:"v",schemaVersion:1,createdAt:1,updatedAt:1,title:"月白",type:"private",memberIds:["c"],presetIds:[],loreBookIds:[],lastActivityAt:1};
 const book: LoreBook={id:"b",schemaVersion:1,createdAt:1,updatedAt:1,name:"雾港",description:"",enabled:true,entries:[{id:"g",title:"常驻",keywords:[],content:"全局规则",priority:99,enabled:true,scope:{type:"global"}},{id:"c",title:"角色",keywords:["Moon"],content:"角色规则",priority:1,enabled:true,scope:{type:"character",id:"c"}},{id:"v",title:"会话",keywords:["moon"],content:"会话规则",priority:1,enabled:true,scope:{type:"conversation",id:"v"}},{id:"off",keywords:[],content:"关闭内容",priority:999,enabled:false,scope:{type:"global"}}]};
@@ -13,4 +14,6 @@ describe("sticker model context",()=>{
   expect(ctx[1].content).toContain("无语地看着你");
   expect(sticker.content).toBe("[表情包]");
  });
+ it("uses the supplied generation time snapshot only when time awareness is enabled",()=>{const at=new Date(2026,0,2,3,4),aware={...character,proactive:{...character.proactive,timeAware:true}},snapshot=localTimeSnapshot(at),enabled=buildContext({character:aware,conversation,messages:[],loreBooks:[],memories:[],userText:"hello",settings:{},provider:defaultProvider,timeAt:at})[0].content,disabled=buildContext({character,conversation,messages:[],loreBooks:[],memories:[],userText:"hello",settings:{},provider:defaultProvider,timeAt:at})[0].content;expect(enabled).toContain(snapshot.time);expect(enabled).toContain(snapshot.timezoneOffset);expect(disabled).not.toContain(snapshot.time)});
+
 });

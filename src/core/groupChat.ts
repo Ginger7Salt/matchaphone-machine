@@ -103,8 +103,10 @@ export async function generateCharacterReplyTurn(
   stickerCatalog: ReplyStickerCatalogItem[] = [],
   onProviderAttempt?: (attempt: number) => void | Promise<void>,
   invokeProvider?: ProviderChatInvoker,
+  targetCountOverride?: number,
 ): Promise<GeneratedReplyTurn> {
-  const plan = replyBubblePlanOf(character, context, scene),
+  const basePlan = replyBubblePlanOf(character, context, scene),
+    plan = targetCountOverride === undefined ? basePlan : { ...basePlan, targetCount: targetCountOverride },
     range = plan.range;
   let lastFormatError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {

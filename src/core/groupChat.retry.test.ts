@@ -183,4 +183,30 @@ describe("generateCharacterReplyTurn strict retry", () => {
     );
     expect(streams).toEqual([false, false]);
   });
+  it("uses the persisted local bubble target instead of selecting again", async () => {
+    let prompt = "";
+    const invoke: ProviderChatInvoker = async (_settings, messages) => {
+      prompt = messages.at(-1)?.content ?? "";
+      return result(JSON.stringify({ messages: [{ content: "one" }], innerVoice: voice }));
+    };
+    const turn = await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false },
+      [{ role: "user", content: "hello" }],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+      1,
+    );
+    expect(turn.targetCount).toBe(1);
+    expect(turn.parts).toHaveLength(1);
+    expect(prompt).toContain("selected exactly 1 bubbles for this turn");
+  });
+
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "./db";
 import {
   ISLAND_AI_COOLDOWN_MS,
@@ -18,8 +18,12 @@ import {
   rewardIslandChat,
   scheduleCoupleIslandUpdate,
   waterIslandPlant,
+  diarySimilarity,
+  isRepeatedCharacterDiary,
+  runCoupleIslandUpdate,
 } from "./coupleIsland";
-import type { Character, Conversation, CoupleIsland, CoupleIslandObject, MeetSession } from "./types";
+import { defaultProvider, type Character, type Conversation, type CoupleIsland, type CoupleIslandObject, type MeetSession } from "./types";
+import { OpenAIProvider } from "./provider";
 
 const baseTime = Date.UTC(2026, 7, 9, 1, 0, 0);
 const character = (id: string, strategy = false): Character => ({
@@ -45,6 +49,7 @@ async function activeIsland(id = "a", strategy = false) {
 
 describe("couple island domain", () => {
   beforeEach(async () => { await db.delete(); await db.open(); });
+  afterEach(() => vi.restoreAllMocks());
 
   it("creates one private invitation, pauses an active meet, and grants idempotent starter items", async () => {
     const { ch, conv } = await seedPair();
@@ -147,4 +152,33 @@ describe("couple island domain", () => {
     const task = await scheduleCoupleIslandUpdate(island.id, "new-event");
     expect(task?.scheduledAt).toBe(lastAiActionAt + ISLAND_AI_COOLDOWN_MS);
   });
+  it("rejects repeated character diary candidates without touching user entries",()=>{const previous=[{text:"A quiet morning by the sea, we watched the light change."}];expect(diarySimilarity(previous[0].text,previous[0].text)).toBe(1);expect(isRepeatedCharacterDiary("A quiet morning by the sea, we watched the light change.",previous)).toBe(true);expect(isRepeatedCharacterDiary("We repaired the old lamp together and laughed at the rain.",previous)).toBe(false)});
+  it("regenerates one repeated automatic diary and saves only the distinct candidate", async () => {
+    const { island } = await activeIsland();
+    const repeated = "A quiet morning by the sea, we watched the light change.";
+    const distinct = "We repaired the old lamp together and laughed when the rain began.";
+    await addIslandEntry({ islandId: island.id, kind: "diary", authorType: "character", text: repeated });
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chat")
+      .mockResolvedValueOnce(JSON.stringify({ kind: "diary", text: repeated }))
+      .mockResolvedValueOnce(JSON.stringify({ kind: "diary", text: distinct }));
+    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, apiKey: "test" });
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(saved?.text).toBe(distinct);
+    const diaries = await db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "diary" && entry.authorType === "character").toArray();
+    expect(diaries.map((entry) => entry.text).sort()).toEqual([repeated, distinct].sort());
+  });
+
+  it("skips automatic diary persistence after two repeated candidates", async () => {
+    const { island } = await activeIsland();
+    const repeated = "A quiet morning by the sea, we watched the light change.";
+    await addIslandEntry({ islandId: island.id, kind: "diary", authorType: "character", text: repeated });
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chat")
+      .mockResolvedValue(JSON.stringify({ kind: "diary", text: repeated }));
+    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, apiKey: "test" });
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(saved).toBeUndefined();
+    const diaries = await db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "diary" && entry.authorType === "character").toArray();
+    expect(diaries.map((entry) => entry.text)).toEqual([repeated]);
+  });
+
 });

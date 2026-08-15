@@ -107,6 +107,27 @@ export function migrateMeetSessionNarrative(session: MeetSession): MeetSession {
     narrativeSettings: normalizeNarrativeSettings(session.narrativeSettings),
   };
 }
+export function meetVisibleCharacterCount(turn: { prose?: string; thought?: string; dialogue?: string }) {
+  return Array.from(`${turn.prose ?? ""}\n${turn.thought ?? ""}\n${turn.dialogue ?? ""}`)
+    .filter((character) => /[\p{L}\p{N}]/u.test(character))
+    .length;
+}
+
+export function meetLengthRangeViolation(
+  turn: { prose?: string; thought?: string; dialogue?: string },
+  settings: Pick<MeetNarrativeSettings, "minChars" | "maxChars">,
+) {
+  const count = meetVisibleCharacterCount(turn);
+  return {
+    count,
+    min: settings.minChars,
+    max: settings.maxChars,
+    belowMinimum: count < settings.minChars,
+    aboveMaximum: count > settings.maxChars,
+    valid: count >= settings.minChars && count <= settings.maxChars,
+  };
+}
+
 export function meetTimeContext(
   session: Pick<MeetSession, "timeAware" | "scene">,
   at = new Date(),

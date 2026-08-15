@@ -474,6 +474,7 @@ async function generateMeetTurnInternal(
           { id: "character-core", content: `当前角色：${character.name}\n核心设定：${coreSettingOf(character)}\n完整人设：${personaOf(character)}\n${performanceProfileContext(prepared.character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}`, required: true },
           { id: "character-lore", content: loreEntriesBlock(loreGroups["after-character"]), priority: 94 },
           { id: "user-persona", content: userPersonaContext(appSettings), required: true },
+          { id: "time-awareness", content: meetTimeContext(sessionForTurn, new Date(t)), required: Boolean(sessionForTurn.timeAware) },
           { id: "scene-outline", content: `剧情大纲（软方向）：${session.scene.outline ?? "无"}`, priority: 92 },
           { id: "scene-state", content: `场景状态：${JSON.stringify(nextState)}`, priority: 94 },
           { id: "plot-state", content: `剧情状态：${JSON.stringify(nextPlotState)}`, priority: 92 },
@@ -596,8 +597,11 @@ async function generateMeetTurnInternal(
           ) {
             throw new Error("\u53cc\u8bed\u56de\u590d\u7f3a\u5c11\u5fc5\u8981\u8bd1\u6587");
           }
-          if (meetStyleViolation(parsed, settings) && attempt === 0) {
-            throw new Error("\u56de\u590d\u672a\u6ee1\u8db3\u7ebf\u4e0b\u7bc7\u5e45\u6216\u6587\u98ce\u8981\u6c42");
+          if (meetStyleViolation(parsed, settings)) {
+            throw new ProviderError(
+              "format",
+              `\u89c1\u9762\u56de\u590d\u7bc7\u5e45\u672a\u8fbe\u5230\u8bbe\u7f6e\u8303\u56f4\uff08\u9700\u8981 ${settings.minChars}-${settings.maxChars} \u5b57\uff09`,
+            );
           }
           turn = parsed;
           lastTurnError = undefined;
@@ -1144,6 +1148,7 @@ export async function regenerateMeetCharacterEntry(
     bilingual = autoTranslateCharacter(character),
     characters = [character],
     names = { [character.id]: character.name },
+    generationTime = new Date(),
     history = session.entries
       .filter((entry) => entry.id !== entryId)
       .slice(-60)
@@ -1154,7 +1159,8 @@ export async function regenerateMeetCharacterEntry(
     reply = fallbackReply(character, source.content, settings.thoughtsEnabled)
       .replies[0];
   } else {
-    const prompt = `请重新写当前角色在本轮线下见面中的帖子。只扮演 ${character.name}，不得新增用户输入，不得代替用户行动或心理。将环境承接、外观和动作自然写入 prose，dialogue 只写说出口的话。${visibleCharacterThoughtPrompt(settings.thoughtsEnabled)}prose 与 dialogue 合计约 ${settings.minChars}–${settings.maxChars} 字。\n\n叙事规则：\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}\n\n${userPersonaContext(appSettings)}\n\n场景：\n${sceneText(session.scene)}${meetTimeContext(session) ? `\n\n${meetTimeContext(session)}` : ""}\n\n用户本轮输入：\n${source.content}\n\n此前记录：\n${history}\n\n只返回严格 JSON：{"replies":[{"characterId":"${character.id}","prose":"小说式环境、外观与动作正文","thought":"较详细的角色反应、情绪变化、联想、顾虑与内心独白，或空字符串","dialogue":"角色台词","suggestions":[]}]}${bilingual ? `\nAlso return replies[0].translations with faithful Simplified Chinese prose, thought and dialogue.` : ""}`;
+    const timeContext = meetTimeContext(session, generationTime),
+      prompt = `请重新写当前角色在本轮线下见面中的帖子。只扮演 ${character.name}，不得新增用户输入，不得代替用户行动或心理。将环境承接、外观和动作自然写入 prose，dialogue 只写说出口的话。${visibleCharacterThoughtPrompt(settings.thoughtsEnabled)}prose 与 dialogue 合计约 ${settings.minChars}–${settings.maxChars} 字。\n\n叙事规则：\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}\n\n${userPersonaContext(appSettings)}\n\n场景：\n${sceneText(session.scene)}${timeContext ? `\n\n${timeContext}` : ""}\n\n用户本轮输入：\n${source.content}\n\n此前记录：\n${history}\n\n只返回严格 JSON：{"replies":[{"characterId":"${character.id}","prose":"小说式环境、外观与动作正文","thought":"较详细的角色反应、情绪变化、联想、顾虑与内心独白，或空字符串","dialogue":"角色台词","suggestions":[]}]}${bilingual ? `\nAlso return replies[0].translations with faithful Simplified Chinese prose, thought and dialogue.` : ""}`;
     const draft = await new OpenAIProvider(provider).chat(
         [
           {
@@ -1186,6 +1192,11 @@ export async function regenerateMeetCharacterEntry(
     } catch {}
     reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled)
       .replies[0];
+    if (meetStyleViolation(reply, settings))
+      throw new ProviderError(
+        "format",
+        `\u89c1\u9762\u56de\u590d\u7bc7\u5e45\u672a\u8fbe\u5230\u8bbe\u7f6e\u8303\u56f4\uff08\u9700\u8981 ${settings.minChars}-${settings.maxChars} \u5b57\uff09`,
+      );
   }
   const current = await db.meetSessions.get(sessionId);
   if (!current || current.status !== "active")
