@@ -1,5 +1,6 @@
 ﻿import { z } from "zod";
 import { db } from "./db";
+import { parseStructuredJsonWithMeta, replyProtocolPresenceOf } from "./structuredJson";
 import { configuredProvider, getModelServiceSettings } from "./modelServices";
 import { OpenAIProvider } from "./provider";
 import { meetLengthRangeViolation } from "./meet";
@@ -120,6 +121,35 @@ export const meetTurnSchema = z
       .default({}),
   })
   ;
+export class MeetProtocolError extends Error {
+  readonly code = "invalid_meet_protocol" as const;
+  constructor(message = "见面回复未遵循见面专用协议") { super(message); this.name = "MeetProtocolError"; }
+}
+function meetRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+export function parseMeetTurnResponse(raw: string, characterId: string) {
+  let value: unknown;
+  try { value = parseStructuredJsonWithMeta(raw).value; }
+  catch (error) { throw new MeetProtocolError(error instanceof Error ? error.message : "见面回复 JSON 无法解析"); }
+  const root = meetRecord(value);
+  if (root && replyProtocolPresenceOf(root).wireFormat) throw new MeetProtocolError("收到普通聊天回复协议，未收到见面回复协议");
+  let candidate: unknown = Array.isArray(value) ? value[0] : value;
+  const row = meetRecord(candidate);
+  if (row && Array.isArray(row.replies)) candidate = row.replies.find(item => meetRecord(item)?.characterId === characterId) ?? row.replies[0];
+  const candidateRow = meetRecord(candidate);
+  if (!candidateRow) throw new MeetProtocolError();
+  if (!candidateRow.characterId) candidate = { ...candidateRow, characterId };
+  try {
+    const parsed = meetTurnSchema.parse(candidate);
+    if (parsed.characterId !== characterId) throw new MeetProtocolError("见面回复角色 ID 与当前角色不一致");
+    if (!(parsed.prose || parsed.thought || parsed.dialogue)) throw new MeetProtocolError("见面回复没有可保存的角色内容");
+    return parsed;
+  } catch (error) {
+    if (error instanceof MeetProtocolError) throw error;
+    throw new MeetProtocolError("见面回复字段不完整或格式不符合要求");
+  }
+}
 const strip = (v: string) =>
   v
     .trim()

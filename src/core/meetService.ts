@@ -69,7 +69,7 @@ import {
   ensureMeetCompiledStyle,
   meetStyleContract,
   meetStyleViolation,
-  meetTurnSchema,
+  parseMeetTurnResponse,
   selectMeetResponders,
 } from "./meetEngine";
 import { resolveSecondaryProvider } from "./modelServices";
@@ -402,11 +402,15 @@ async function generateMeetTurnInternal(
     nextPlotState = plotState,
     injectedLoreEntries = 0,
     skippedLoreEntries = 0;
+  const characterResults: NonNullable<NonNullable<MeetEntry["generation"]>["characterResults"]> = [...new Map(plan.responders.map((item) => [item.characterId, { characterId: item.characterId, status: "generating" as const, attempts: 0 }])).values()];
+  generationMeta.characterResults = characterResults;
   for (const selected of plan.responders) {
     const character = characters.find(
       (item) => item.id === selected.characterId,
     );
     if (!character) continue;
+    const characterResult = characterResults.find((item) => item.characterId === character.id);
+    if (!characterResult) continue;
     try {
       const cv = conversation ?? {
           id: session.id,
@@ -496,9 +500,10 @@ async function generateMeetTurnInternal(
       skippedLoreEntries += loreDecisions.length - lore.length;
       generationMeta.injectedLoreEntries = injectedLoreEntries;
       generationMeta.skippedLoreEntries = skippedLoreEntries;
-      let turn: ReturnType<typeof meetTurnSchema.parse> | undefined;
+      let turn: ReturnType<typeof parseMeetTurnResponse> | undefined;
       let lastTurnError: unknown;
       for (let attempt = 0; attempt < 2; attempt++) {
+        characterResult.attempts = attempt + 1;
         try {
           const fittedPrompt = fitPrioritizedPromptSections(
             [
@@ -556,53 +561,11 @@ async function generateMeetTurnInternal(
           await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
           const raw = response.text;
 
-          const structured = parseStructuredJsonWithMeta(raw, {
-            transportMarkedIncomplete: response.truncated,
-          });
-          let candidate: unknown = structured.value;
-
-          if (Array.isArray(candidate)) candidate = candidate[0];
-          if (candidate && typeof candidate === "object") {
-            const root = candidate as Record<string, unknown>;
-            if (Array.isArray(root.replies)) {
-              candidate = root.replies[0];
-            } else if (typeof root.content === "string" && !root.characterId) {
-              candidate = {
-                characterId: character.id,
-                prose: root.content,
-                thought: "",
-                dialogue: "",
-                suggestions: [],
-              };
-            }
-          }
-
-          if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
-            const row = candidate as Record<string, unknown>;
-            if (!row.characterId) candidate = { ...row, characterId: character.id };
-          }
           generationMeta.stage = "validating";
           await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-          const parsed = meetTurnSchema.parse(candidate);
-          if (parsed.characterId !== character.id) {
-            throw new Error("\u89d2\u8272 ID \u4e0e\u5f53\u524d\u89d2\u8272\u4e0d\u4e00\u81f4");
-          }
-          if (
-            bilingual &&
-            ((!parsed.translations?.prose && parsed.prose) ||
-              (!parsed.translations?.dialogue && parsed.dialogue) ||
-              (settings.thoughtsEnabled &&
-                parsed.thought &&
-                !parsed.translations?.thought))
-          ) {
-            throw new Error("\u53cc\u8bed\u56de\u590d\u7f3a\u5c11\u5fc5\u8981\u8bd1\u6587");
-          }
-          if (meetStyleViolation(parsed, settings)) {
-            throw new ProviderError(
-              "format",
-              `\u89c1\u9762\u56de\u590d\u7bc7\u5e45\u672a\u8fbe\u5230\u8bbe\u7f6e\u8303\u56f4\uff08\u9700\u8981 ${settings.minChars}-${settings.maxChars} \u5b57\uff09`,
-            );
-          }
+          const parsed = parseMeetTurnResponse(raw, character.id);
+          if (bilingual && ((!parsed.translations?.prose && parsed.prose) || (!parsed.translations?.dialogue && parsed.dialogue) || (settings.thoughtsEnabled && parsed.thought && !parsed.translations?.thought))) throw new Error("双语回复缺少必要译文");
+          if (meetStyleViolation(parsed, settings)) throw new ProviderError("format", `见面回复篇幅未达到设置范围（需要 ${settings.minChars}-${settings.maxChars} 字）`);
           turn = parsed;
           lastTurnError = undefined;
           break;
@@ -614,7 +577,10 @@ async function generateMeetTurnInternal(
         }
       }
       if (!turn) {
-        throw lastTurnError ?? new Error("\u89d2\u8272\u56de\u590d\u683c\u5f0f\u65e0\u6cd5\u6062\u590d");
+        characterResult.status = "silent";
+        characterResult.providerCode = lastTurnError instanceof ProviderError ? lastTurnError.apiError?.providerCode : undefined;
+        failures.push(character.name);
+        continue;
       }
       const createdAt = t + entries.length + 1,
         entry: MeetEntry = {
@@ -660,6 +626,7 @@ async function generateMeetTurnInternal(
           createdAt,
         };
       entries.push(entry);
+      characterResult.status = "complete";
       nextState = applyMeetScenePatch(
         nextState,
         character.id,
@@ -673,36 +640,27 @@ async function generateMeetTurnInternal(
         entry.id,
       );
     } catch (error) {
-      if (error instanceof ProviderError && error.kind === "aborted") throw error;
-      failures.push(
-        `${character.name}：${
-          error instanceof Error ? error.message : "\u56de\u590d\u751f\u6210\u5931\u8d25"
-        }`,
-      );
+      if (error instanceof ProviderError && error.kind === "aborted" && !entries.length) throw error;
+      characterResult.status = "silent";
+      characterResult.providerCode = error instanceof ProviderError ? error.apiError?.providerCode : undefined;
+      failures.push(character.name);
     }
   }
-  if (!entries.length) {
-    const reason = failures[0] ?? "角色没有生成有效回复";
-    const latest = await db.meetSessions.get(session.id);
-    if (latest) await db.meetSessions.update(session.id, {
-      entries: latest.entries.map(entry => entry.id === userEntry.id ? { ...entry, generation: { ...generationMeta, status: "failed" as const, error: reason, model: provider.model, saveResult: "failed" as const } } : entry),
-      updatedAt: now(),
-    });
-    throw new Error(reason);
-  }
+  const finalStatus: NonNullable<MeetEntry["generation"]>["status"] = entries.length === 0 ? "failed" : failures.length ? "partial" : "complete";
   generationMeta.stage = "saving";
   await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
   const current = await db.meetSessions.get(session.id);
   if (!current || current.status !== "active")
     throw new Error("见面状态已经变化");
   await db.meetSessions.update(session.id, {
-    entries: [...current.entries.map(entry => entry.id === userEntry.id ? { ...entry, generation: { ...generationMeta, status: "complete" as const, model: provider.model, saveResult: "saved" as const } } : entry), ...entries],
+    entries: [...current.entries.map(entry => entry.id === userEntry.id ? { ...entry, generation: { ...generationMeta, status: finalStatus, model: provider.model, saveResult: entries.length ? "saved" as const : "failed" as const, characterResults } } : entry), ...entries],
     narrativeSettings: settings,
     sceneState: nextState,
     plotState: nextPlotState,
-    lastActivityAt: entries[entries.length - 1]!.createdAt,
+    lastActivityAt: entries.length ? entries[entries.length - 1]!.createdAt : current.lastActivityAt,
     updatedAt: now(),
   });
+  if (!entries.length) throw new Error("本轮没有角色完成回应，请重新生成");
   for (const entry of entries) {
     const character = characters.find((item) => item.id === entry.senderId);
     if (character?.chatSettings?.strategyMode?.enabled)
@@ -720,9 +678,7 @@ async function generateMeetTurnInternal(
   }
   return {
     entries,
-    warning: failures.length
-      ? `\u90e8\u5206\u89d2\u8272\u672a\u5b8c\u6210\uff1a${failures.join("\uff1b")}`
-      : undefined,
+    warning: failures.length ? "部分角色本轮保持安静" : undefined,
   } satisfies MeetTurnResult;
 }
 async function enqueueMeetMemoryTasks(session: MeetSession, at: number) {

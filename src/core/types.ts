@@ -1529,7 +1529,7 @@ export interface MeetEntry {
   plotProgress?: MeetPlotProgress;
   favoritedAt?: number;
   generation?: {
-    status: "generating" | "complete" | "failed";
+    status: "generating" | "complete" | "partial" | "failed";
     stage?: "requesting" | "parsing" | "validating" | "saving";
     error?: string;
     model?: string;
@@ -1542,6 +1542,12 @@ export interface MeetEntry {
     injectedLoreEntries?: number;
     skippedLoreEntries?: number;
     saveResult?: "pending" | "saved" | "failed";
+    characterResults?: Array<{
+      characterId: string;
+      status: "generating" | "complete" | "silent";
+      attempts: number;
+      providerCode?: string;
+    }>;
   };
   createdAt: number;
 }

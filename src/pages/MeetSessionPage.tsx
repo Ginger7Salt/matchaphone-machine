@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   ChevronLeft,
@@ -427,7 +427,10 @@ export default function MeetSessionPage() {
                     <Paragraphs text={entry.content} />
                   </div>
                   {entry.generation?.status === "generating" && <p className="meet-generation-status" role="status">角色正在生成回复…</p>}
-                  {entry.generation?.status === "failed" && (
+                  {entry.generation?.status === "partial" && (
+                    <p className="meet-generation-status">部分角色本轮保持安静</p>
+                  )}
+                  {entry.generation?.status === "failed" && !session.entries.some((candidate) => candidate.senderType === "character" && candidate.roundId === entry.roundId) && (
                     <div className="meet-generation-failure" role="alert">
                       <span>{entry.generation.error ?? "\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5"}</span>
                       <div>
