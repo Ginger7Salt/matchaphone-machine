@@ -1,0 +1,15 @@
+﻿import {beforeEach,describe,expect,it,vi} from "vitest";
+import {db} from "./db";
+import {MESSAGE_PAGE_SIZE,readConversationMessagePage,readConversationSummaries} from "./messageStore";
+import {useStore} from "./store";
+import type {Message} from "./types";
+
+const row=(id:string,conversationId:string,createdAt:number,extra:Partial<Message>={}):Message=>({id,conversationId,createdAt,updatedAt:createdAt,schemaVersion:1,senderType:"user",senderId:"user",kind:"text",content:id,status:"complete",...extra});
+
+describe("paginated message store",()=>{
+ beforeEach(async()=>{await db.delete();await db.open();useStore.setState({ready:false,conversations:[],messageWindows:{},conversationSummaries:{},messageWindowOrder:[]});vi.restoreAllMocks()});
+ it("reads stable pages without duplicates when timestamps match",async()=>{const rows=Array.from({length:165},(_,index)=>row(`m-${String(index).padStart(3,"0")}`,"c",Math.floor(index/3)));await db.messages.bulkAdd(rows);const first=await readConversationMessagePage("c");expect(first.items).toHaveLength(MESSAGE_PAGE_SIZE);const second=await readConversationMessagePage("c",first.oldest);const third=await readConversationMessagePage("c",second.oldest);const ids=[...first.items,...second.items,...third.items].map(item=>item.id);expect(new Set(ids).size).toBe(165);expect(ids).toHaveLength(165);expect(third.hasMore).toBe(false)});
+ it("reload avoids messages.toArray and creates lightweight summaries",async()=>{await db.conversations.bulkAdd([{id:"a",schemaVersion:1,createdAt:1,updatedAt:1,type:"private",title:"A",memberIds:[],lastActivityAt:2},{id:"b",schemaVersion:1,createdAt:1,updatedAt:1,type:"private",title:"B",memberIds:[],lastActivityAt:3}] as any);await db.messages.bulkAdd([row("a1","a",1),row("a2","a",2,{origin:"proactive"}),row("b1","b",3)]);const spy=vi.spyOn(db.messages,"toArray");await useStore.getState().reload();expect(spy).not.toHaveBeenCalled();expect(useStore.getState().conversationSummaries.a).toMatchObject({proactiveUnreadCount:1,latestMessage:{id:"a2"}});expect(useStore.getState().messageWindows).toEqual({})});
+ it("loads eighty messages, pages older history and evicts the least recent fourth window",async()=>{for(const id of ["a","b","c","d"])await db.messages.bulkAdd(Array.from({length:90},(_,index)=>row(`${id}-${index}`,id,index)));await useStore.getState().loadConversationWindow("a");expect(useStore.getState().messageWindows.a.items).toHaveLength(80);await useStore.getState().loadOlderConversationMessages("a");expect(useStore.getState().messageWindows.a.items).toHaveLength(90);for(const id of ["b","c","d"])await useStore.getState().loadConversationWindow(id);expect(Object.keys(useStore.getState().messageWindows).sort()).toEqual(["b","c","d"]);expect(await db.messages.where("conversationId").equals("a").count()).toBe(90)});
+ it("summaries count only unread proactive messages",async()=>{await db.messages.bulkAdd([row("1","c",1,{origin:"proactive"}),row("2","c",2,{origin:"proactive",readAt:2}),row("3","c",3)]);const result=await readConversationSummaries([{id:"c"}]);expect(result.c.latestMessage?.id).toBe("3");expect(result.c.proactiveUnreadCount).toBe(1)});
+});

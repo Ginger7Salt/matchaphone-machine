@@ -1,4 +1,4 @@
-﻿import { Sparkles } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { Navigate, useNavigate, useParams } from "react-router-dom";
 import {
@@ -10,11 +10,13 @@ import { db } from "../core/db";
 import { conversationInnerVoiceEnabled } from "../core/innerVoice";
 import { selectInnerVoiceMessages } from "../core/innerVoiceView";
 import { useStore } from "../core/store";
+import type { Message } from "../core/types";
 
 export default function InnerVoicePage() {
   const { conversationId, actorType, actorId } = useParams(),
     nav = useNavigate(),
-    { conversations, characters, messages, reload } = useStore(),
+    { conversations, characters } = useStore(),
+    [conversationMessages, setConversationMessages] = useState<Message[]>([]),
     [npcAvatar, setNpcAvatar] = useState<string>(),
     [notice, setNotice] = useState("");
   const conversation = conversations.find((item) => item.id === conversationId),
@@ -32,6 +34,12 @@ export default function InnerVoicePage() {
       ? conversationInnerVoiceEnabled(conversation)
       : false;
 
+  const loadConversationMessages = async () => {
+    if (!conversationId || !actorId) return setConversationMessages([]);
+    setConversationMessages(await db.messages.where("conversationId").equals(conversationId).filter(message => message.senderId === actorId && Boolean(message.innerVoice)).sortBy("createdAt"));
+  };
+  useEffect(() => { void loadConversationMessages(); }, [conversationId, actorId]);
+
   useEffect(() => {
     if (!npc?.avatarAssetId) {
       setNpcAvatar(undefined);
@@ -42,14 +50,7 @@ export default function InnerVoicePage() {
       .then((asset) => setNpcAvatar(asset?.data));
   }, [npc?.avatarAssetId]);
 
-  const conversationMessages = useMemo(
-      () =>
-        messages
-          .filter((message) => message.conversationId === conversationId)
-          .sort((a, b) => a.createdAt - b.createdAt),
-      [messages, conversationId],
-    ),
-    entries = useMemo(
+  const entries = useMemo(
       () =>
         validActorType && conversationId && actorId
           ? selectInnerVoiceMessages(
@@ -92,7 +93,7 @@ export default function InnerVoicePage() {
                 actorName={name}
                 actorAvatar={avatar}
                 actorHandle={actorHandle}
-                onChanged={reload}
+                onChanged={loadConversationMessages}
                 onSource={(messageId) =>
                   nav(`/messages/${conversation.id}?message=${messageId}`)
                 }

@@ -31,7 +31,7 @@ describe("music listening reports", () => {
     expect(second?.totalListenedMs).toBe(10_000);
     expect(first?.characterMs.c1).toBe(10_000);
     expect(second?.tracks.night.title).toBe("歌曲night");
-    expect(db.verno).toBe(14);
+    expect(db.verno).toBe(15);
   });
 
   it("aggregates milestones, sources, artists and together-listening attribution", async () => {

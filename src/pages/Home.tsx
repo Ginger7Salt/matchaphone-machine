@@ -46,7 +46,7 @@ const targetKey=(target:DragTarget)=>target?target.kind+":"+(target.kind==="dock
 const arrangementsEqual=(a:DesktopArrangement,b:DesktopArrangement)=>JSON.stringify(a.dock)===JSON.stringify(b.dock)&&JSON.stringify(a.items)===JSON.stringify(b.items);
 
 export default function Home(){
-  const nav=useNavigate(),{appearance,imageAssets,messages,feedPosts,memoryExtractionBatches,reload}=useStore();
+  const nav=useNavigate(),{appearance,imageAssets,conversationSummaries,feedPosts,memoryExtractionBatches,reload}=useStore();
   const [page,setPage]=useState(0),[editing,setEditing]=useState(false),[draftArrangement,setDraftArrangement]=useState<DesktopArrangement|null>(null);
   const [dragOverlay,setDragOverlay]=useState<DragOverlayState|null>(null),[dragTarget,setDragTarget]=useState<DragTarget>(null),[dragPageCount,setDragPageCount]=useState(0),[dragError,setDragError]=useState("");
   const [textEdit,setTextEdit]=useState<TextEditState|null>(null),[imageTools,setImageTools]=useState<ImageToolState|null>(null);
@@ -113,7 +113,7 @@ export default function Home(){
   const basePages=Math.min(MAX_DESKTOP_PAGES,Math.max(1,...arrangement.items.map(item=>item.page+1)));
   const pages=dragOverlay?Math.min(MAX_DESKTOP_PAGES,Math.max(basePages,dragPageCount,page+1)):basePages;
   const wallpaper=sourceUrl(appearance.wallpaper,imageAssets),wallStyle=wallpaper?{backgroundImage:'url("'+wallpaper+'")'}:{background:appearance.wallpaper.value||"#fff"};
-  const unread=messages.filter(message=>message.origin==="proactive"&&!message.readAt).length+feedPosts.filter(post=>(post.origin==="proactive"&&!post.readAt)||post.comments.some(comment=>comment.origin==="proactive"&&!comment.readAt)).length;
+  const unread=Object.values(conversationSummaries??{}).reduce((sum,summary)=>sum+summary.proactiveUnreadCount,0)+feedPosts.filter(post=>(post.origin==="proactive"&&!post.readAt)||post.comments.some(comment=>comment.origin==="proactive"&&!comment.readAt)).length;
   const pending=memoryExtractionBatches.filter(batch=>batch.status==="pending").length;
   const quickEditing=Boolean(textEdit||imageTools);
 

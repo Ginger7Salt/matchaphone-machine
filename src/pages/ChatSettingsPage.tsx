@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   BookOpen,
@@ -192,7 +192,8 @@ export default function ChatSettingsPage() {
       conversations,
       characters,
       loreBooks,
-      messages,
+      messageWindows,
+      loadConversationWindow,
       imageAssets,
       provider,
       settings,
@@ -241,6 +242,7 @@ export default function ChatSettingsPage() {
     [pendingMemoryCount, setPendingMemoryCount] = useState(0),
     [summarizing, setSummarizing] = useState(false),
     [messageText, setMessageText] = useState(""),
+    [busyReply, setBusyReply] = useState(false),
     [saving, setSaving] = useState(false),
     [contextLimitDraft, setContextLimitDraft] = useState(
       character ? String(chatSettingsOf(character).contextLimit) : "",
@@ -281,7 +283,7 @@ export default function ChatSettingsPage() {
     void pendingCount(character, "chat", conversation.id).then(
       setPendingMemoryCount,
     );
-  }, [character?.id, conversation?.id, messages]);
+  }, [character?.id, conversation?.id, messageWindows[id ?? ""]?.items.length]);
   useEffect(() => {
     if (!conversation) return;
     setConversationDraft(conversationChatSettingsOf(conversation, character));
@@ -319,10 +321,9 @@ export default function ChatSettingsPage() {
       setMemoryDraft(memoryExtractionSettingsOf(character));
     }
   }, [conversation?.id, conversation?.updatedAt, character?.updatedAt]);
-  const currentMessages = useMemo(
-    () => messages.filter((message) => message.conversationId === id),
-    [messages, id],
-  );
+  useEffect(()=>{ if(!id)return; void loadConversationWindow(id); },[id,loadConversationWindow]);
+  const currentMessages = id ? (messageWindows[id]?.items ?? []) : [];
+  useEffect(()=>{setBusyReply(currentMessages.some(message=>message.status==="generating"))},[currentMessages]);
   if (!conversation || !settings || !provider)
     return <Navigate to="/messages/chats" replace />;
   const title = conversationDisplayName(conversation, character),
@@ -330,9 +331,6 @@ export default function ChatSettingsPage() {
     permissions = conversationDraft.permissions!,
     needsTranslation = members.some((member) =>
       shouldTranslateLanguage(member.language),
-    ),
-    busyReply = currentMessages.some(
-      (message) => message.status === "generating",
     );
 
   const updatePermission = (
@@ -542,17 +540,17 @@ export default function ChatSettingsPage() {
       stringifyChatArchive(data),
     );
   };
-  const exportText = () =>
+  const exportText = async () => {
+    const allMessages = await db.messages
+      .where("conversationId")
+      .equals(conversation.id)
+      .sortBy("createdAt");
     downloadFile(
       `${title}-聊天记录.txt`,
       "text/plain;charset=utf-8",
-      chatArchiveToText(
-        conversation,
-        currentMessages,
-        characters,
-        settings.userName,
-      ),
+      chatArchiveToText(conversation, allMessages, characters, settings.userName),
     );
+  };
   const readImport = async (file?: File) => {
     if (!file) return;
     try {

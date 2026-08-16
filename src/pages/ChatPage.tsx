@@ -191,7 +191,7 @@ export default function ChatPage() {
     {
       conversations,
       characters,
-      messages,
+      messageWindows,
       loreBooks,
       memories,
       provider,
@@ -200,7 +200,8 @@ export default function ChatPage() {
       imageAssets,
       reload,
     } = store;
-  const conversation = conversations.find((c) => c.id === id),
+  const messages = id ? (messageWindows[id]?.items ?? []) : [],
+    conversation = conversations.find((c) => c.id === id),
     [conversationRecoveryDone, setConversationRecoveryDone] = useState(false),
     [text, setText] = useState(""),
     [error, setError] = useState(""),
@@ -266,6 +267,7 @@ export default function ChatPage() {
     composerInput = useRef<HTMLTextAreaElement>(null),
     messageRefs = useRef<Map<string, HTMLDivElement>>(new Map()),
     nearBottom = useRef(true),
+    loadingOlder = useRef(false),
     restoredConversation = useRef<string | null>(null),
     pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
     pressStart = useRef<{ pointerId: number; x: number; y: number } | null>(
@@ -471,7 +473,7 @@ export default function ChatPage() {
       window.removeEventListener("mira:chat-reply-change", sync);
       window.removeEventListener("pageshow", sync);
     };
-  }, [id, store.reloadConversation]);
+  }, [id, store.loadConversationWindow, store.reloadConversation]);
   useEffect(() => {
     if (!conversation) return;
     void Promise.all([
