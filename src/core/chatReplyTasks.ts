@@ -1,4 +1,5 @@
-﻿import { db, getAppSettings, getProvider } from "./db";
+import { dataLifecycleMutationActive } from "./dataLifecycle";
+import { db, getAppSettings, getProvider } from "./db";
 import { buildContext } from "./context";
 import { buildListeningContext, executeCharacterMusicAction, listeningContextPrompt } from "./music";
 import { buildCoupleIslandContext, coupleIslandContextPrompt, executeCharacterIslandAction, respondCoupleIslandInvitation, rewardIslandChat } from "./coupleIsland";
@@ -2003,6 +2004,7 @@ async function pauseOrFail(task: BackgroundTask, error: unknown) {
   emit();
 }
 export async function claimNextChatReplyTask() {
+  if (dataLifecycleMutationActive()) return;
   return db.transaction("rw", db.backgroundTasks, async () => {
     const t = now(),
       running = await db.backgroundTasks
