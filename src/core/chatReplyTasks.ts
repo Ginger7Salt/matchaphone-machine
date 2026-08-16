@@ -46,6 +46,7 @@ import {
 } from "./relationshipStrategy";
 import { maybeCreateMeetInvitation } from "./meetService";
 import { notifyChatReplyCompleted } from "./notifications";
+import { processInvitationResponseTask, invitationResponseDiagnostic, retryInvitationResponse, ensureInvitationResponseTaskForMessage } from "./invitationResponseTasks";
 import { resolveConversationProvider } from "./providerPresets";
 import {
   now,
@@ -465,7 +466,7 @@ async function unfinishedTask(conversationId: string) {
   return db.backgroundTasks
     .where("conversationId")
     .equals(conversationId)
-    .filter((task) => task.type === "chat-reply" && task.state !== "completed")
+    .filter((task) => (task.type === "chat-reply" || task.type === "invitation-response") && task.state !== "completed")
     .first();
 }
 export async function chatReplyTaskForConversation(conversationId: string) {
@@ -801,6 +802,13 @@ export async function ensureRunnableChatReplyTask(
   return ensured;
 }
 export async function enqueueChatReply(input: EnqueueChatReplyInput) {
+  const messages = await db.messages.where("conversationId").equals(input.conversationId).sortBy("createdAt");
+  const candidate = input.targetMessageId ? messages.find((message) => message.id === input.targetMessageId) : [...messages].reverse().find((message) => message.senderType === "user" && message.status === "complete");
+  const attachment = candidate?.attachments?.find((item) => (item.type === "music-invitation" || item.type === "couple-island-invitation") && item.cardRole !== "response" && item.state === "pending");
+  if (candidate && attachment && candidate.senderType === "user") {
+    const task = await ensureInvitationResponseTaskForMessage(candidate.id, attachment.type === "music-invitation" ? "music" : "couple-island");
+    if (task) return task;
+  }
   return (await ensureRunnableChatReplyTask(input)).task;
 }
 async function updatePhase(
@@ -1317,10 +1325,13 @@ async function processPrivate(
   if (continuityContext) ctx.push({ role: "system", content: continuityContext });
   const targetBubbleCount = await ensurePersistedBubbleTarget(task, character, ctx, "private");
   const listeningContext = await buildListeningContext(conversation.id);
-  const listeningPrompt = listeningContextPrompt(listeningContext);
+  const listeningSession = listeningContext?.sessionId ? await db.listeningSessions.get(listeningContext.sessionId) : undefined;
+  const listeningTask = listeningSession?.invitationMessageId ? await db.backgroundTasks.where("eventId").equals(`invitation-response:music:${listeningSession.invitationMessageId}`).first() : undefined;
+  const listeningPrompt = listeningTask && listeningContext?.state === "invited" ? "" : listeningContextPrompt(listeningContext);
   if (listeningPrompt) ctx.push({ role: "system", content: listeningPrompt });
   const islandContext = await buildCoupleIslandContext(conversation.id, character.id);
-  const islandPrompt = coupleIslandContextPrompt(islandContext);
+  const islandTask = islandContext?.pendingInvitation ? await db.backgroundTasks.where("eventId").equals(`invitation-response:couple-island:${islandContext.pendingInvitation.id}`).first() : undefined;
+  const islandPrompt = islandTask ? "" : coupleIslandContextPrompt(islandContext);
   if (islandPrompt) ctx.push({ role: "system", content: islandPrompt });
   const replyStickers = await availableReplyStickers(
     conversation,
@@ -1996,7 +2007,7 @@ export async function claimNextChatReplyTask() {
     const t = now(),
       running = await db.backgroundTasks
         .where("type")
-        .equals("chat-reply")
+        .anyOf("chat-reply", "invitation-response")
         .filter(
           (task) => task.state === "running" && (task.leaseExpiresAt ?? 0) <= t,
         )
@@ -2011,7 +2022,7 @@ export async function claimNextChatReplyTask() {
       });
     const rows = await db.backgroundTasks
         .where("type")
-        .equals("chat-reply")
+        .anyOf("chat-reply", "invitation-response")
         .filter(
           (item) =>
             (item.state === "pending" || item.state === "failed") &&
@@ -2043,6 +2054,7 @@ export async function claimNextChatReplyTask() {
 export async function processChatReplyTask(
   task: BackgroundTask,
 ): Promise<ChatReplyProcessOutcome> {
+  if (task.type === "invitation-response") return processInvitationResponseTask(task);
   const controller = new AbortController();
   activeControllers.set(task.id, controller);
   let heartbeatRunning = false;
@@ -2146,6 +2158,7 @@ export async function retryChatReply(eventId: string) {
     .where("eventId")
     .equals(eventId)
     .first();
+  if (task?.type === "invitation-response") { await retryInvitationResponse(eventId); return; }
   if (!task || task.type !== "chat-reply") return;
   const payload = {
     ...taskPayload(task),
@@ -2191,6 +2204,7 @@ export async function retryChatReply(eventId: string) {
 }
 export async function chatReplyDiagnostic(eventId: string) {
   const task = await db.backgroundTasks.where("eventId").equals(eventId).first();
+  if (task?.type === "invitation-response") return invitationResponseDiagnostic(eventId);
   if (!task || task.type !== "chat-reply")
     return JSON.stringify({ feature: "chat-reply", stage: "task-not-found" }, null, 2);
   const payload = validReplyTaskPayload(task.payload) ? task.payload : undefined;

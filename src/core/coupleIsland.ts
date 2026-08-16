@@ -1,4 +1,6 @@
-import { z } from "zod";
+﻿import { z } from "zod";
+import { invitationResponseTask, invitationResponseTargetCount } from "./invitationResponseTaskModel";
+
 import { db } from "./db";
 import {localTimeContext} from "./localTime";
 import { enqueueBackgroundTask } from "./backgroundTasks";
@@ -108,17 +110,30 @@ export async function createCoupleIslandInvitation(input: { conversationId: stri
   if (previousAttachment?.type === "couple-island-invitation" && previousAttachment.state === "pending") return { island: existing, message: previous! };
   if (previousAttachment?.type === "couple-island-invitation" && previousAttachment.state === "declined" && (previousAttachment.processedAt ?? 0) + ISLAND_INVITE_RETRY_MS > now()) throw new Error("距离上次邀请还不到 24 小时");
   const at = now(), messageId = uid();
+  const previousMessages = await db.messages.where("conversationId").equals(conversation.id).sortBy("createdAt");
+  const task = invitationResponseTask({
+    invitationType: "couple-island",
+    invitationMessageId: messageId,
+    conversationId: conversation.id,
+    characterId: character.id,
+    targetBubbleCount: invitationResponseTargetCount(character, previousMessages),
+    createdAt: at,
+  });
   const message: Message = {
     id: messageId, schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, conversationId: conversation.id,
     senderType: "user", content: `邀请${character.name}一起建立茶侣岛。`, kind: "couple-island-invitation", status: "complete",
-    attachments: [{ type: "couple-island-invitation", cardRole: "invitation", characterId: character.id, islandId: existing?.status === "invited" ? existing.id : undefined, state: "pending" }],
+    attachments: [{ type: "couple-island-invitation", cardRole: "invitation", characterId: character.id, islandId: existing?.status === "invited" ? existing.id : undefined, state: "pending", responseStatus: "queued", responseTaskEventId: task.eventId }],
   };
-  await db.transaction("rw", [db.coupleIslands, db.messages, db.conversations, db.meetSessions], async () => {
+  await db.transaction("rw", [db.coupleIslands, db.messages, db.conversations, db.meetSessions, db.backgroundTasks], async () => {
+    const existingTask = await db.backgroundTasks.where("eventId").equals(task.eventId).first();
+    if (existingTask) return;
     await db.messages.add(message);
     await db.conversations.update(conversation.id, { lastActivityAt: at, updatedAt: at });
     if (existing?.status === "invited") await db.coupleIslands.update(existing.id, { invitationMessageId: messageId, lastActivityAt: at, updatedAt: at });
     await pauseActiveMeetForOnlineActivity(conversation.id, at);
+    await db.backgroundTasks.add(task);
   });
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("mira:chat-reply-change"));
   return { island: existing?.status === "invited" ? { ...existing, invitationMessageId: messageId, lastActivityAt: at, updatedAt: at } : undefined, message };
 }
 
@@ -131,7 +146,7 @@ export async function respondCoupleIslandInvitation(messageId: string, requested
   if (!character) return;
   const strategy = chatSettingsOf(character).strategyMode.enabled, decision = !strategy && requested === "decline" ? "accept" : requested, at = now();
   const islandId = decision === "accept" ? (legacyIsland?.id ?? uid()) : legacyIsland?.id;
-  const nextAttachment = { ...attachment, cardRole: "invitation" as const, islandId, state: decision === "accept" ? ("accepted" as const) : ("declined" as const), reason: decision === "decline" ? reason?.trim().slice(0, 240) || "现在还没有准备好" : undefined, processedAt: at };
+  const nextAttachment = { ...attachment, cardRole: "invitation" as const, islandId, state: decision === "accept" ? ("accepted" as const) : ("declined" as const), reason: decision === "decline" ? reason?.trim().slice(0, 240) || "现在还没有准备好" : undefined, responseStatus: undefined, responseTaskEventId: undefined, processedAt: at };
   const responseAttachment = { ...nextAttachment, cardRole: "response" as const };
   const responseMessage: Message = {
     id: responseId, schemaVersion: SCHEMA_VERSION, createdAt: at, updatedAt: at, conversationId: message.conversationId,

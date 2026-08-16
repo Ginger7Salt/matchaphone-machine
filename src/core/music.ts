@@ -1,4 +1,6 @@
-import { db, getSetting, setSetting } from "./db";
+﻿import { db, getSetting, setSetting } from "./db";
+import { invitationResponseTask, invitationResponseTargetCount } from "./invitationResponseTaskModel";
+
 import { pauseActiveMeetForOnlineActivity } from "./crossModeContinuity";
 import { rewardIslandListening } from "./coupleIsland";
 import {now,SCHEMA_VERSION,uid,type CharacterMusicAction,type ListeningContext,type ListeningSession,type Message,type MusicAccountProfile,type MusicClientSettings,type MusicEvent,type MusicEventType,type MusicFile,type MusicPlaylist,type MusicTrack} from "./types";
@@ -176,23 +178,44 @@ export async function createMusicInvitationMessage(input: { conversationId: stri
   if (input.trackId && !track) throw new Error("邀请歌曲不在当前音乐库中");
   const existing = await db.listeningSessions.where("state").anyOf("invited", "active").toArray();
   const session: ListeningSession = { id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, startedAt: t, conversationId: input.conversationId, characterId: input.characterId, state: "invited", invitedBy: input.invitedBy, invitationMessageId: messageId, currentTrackId: input.trackId, queue: input.trackId ? [input.trackId] : [], queueEntries: input.trackId ? [{ trackId: input.trackId, selectedBy: input.invitedBy, addedAt: t }] : [], currentIndex: 0, playbackState: "paused", positionMs: 0, selectedBy: input.invitedBy, totalListenedMs: 0, djTurnCount: 0 };
-  const message: Message = { id: messageId, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, conversationId: input.conversationId, senderType: input.invitedBy === "user" ? "user" : "character", senderId: input.invitedBy === "character" ? input.characterId : undefined, content: track ? `邀请一起听「${track.title}」` : "邀请一起听音乐", kind: "music-invitation", attachments: [{ type: "music-invitation", sessionId: session.id, characterId: input.characterId, state: "pending", trackId: input.trackId }], status: "complete", origin: input.invitedBy === "character" ? "proactive" : "manual" };
+  const history = input.invitedBy === "user" ? await db.messages.where("conversationId").equals(input.conversationId).sortBy("createdAt") : [];
+  const invitedCharacter = await db.characters.get(input.characterId);
+  const responseTask = input.invitedBy === "user" && invitedCharacter ? invitationResponseTask({ invitationType: "music", invitationMessageId: messageId, conversationId: input.conversationId, characterId: input.characterId, targetBubbleCount: invitationResponseTargetCount(invitedCharacter, history), createdAt: t }) : undefined;
+  const message: Message = { id: messageId, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, conversationId: input.conversationId, senderType: input.invitedBy === "user" ? "user" : "character", senderId: input.invitedBy === "character" ? input.characterId : undefined, content: track ? `邀请一起听「${track.title}」` : "邀请一起听音乐", kind: "music-invitation", attachments: [{ type: "music-invitation", cardRole: "invitation", sessionId: session.id, characterId: input.characterId, state: "pending", trackId: input.trackId, ...(responseTask ? { responseStatus: "queued" as const, responseTaskEventId: responseTask.eventId } : {}) }], status: "complete", origin: input.invitedBy === "character" ? "proactive" : "manual" };
   for (const current of existing) await endListeningSession(current.id, "system");
-  await db.transaction("rw", [db.messages, db.conversations, db.listeningSessions, db.musicEvents, db.meetSessions], async () => {
+  await db.transaction("rw", [db.messages, db.conversations, db.listeningSessions, db.musicEvents, db.meetSessions, db.backgroundTasks], async () => {
     if (input.invitedBy === "user") await pauseActiveMeetForOnlineActivity(input.conversationId, t);
     await db.listeningSessions.add(session); await addMusicEvent(session, "invite", input.invitedBy, input.trackId); await db.messages.add(message); await db.conversations.update(input.conversationId, { lastActivityAt: t, updatedAt: t });
+    if (responseTask && !(await db.backgroundTasks.where("eventId").equals(responseTask.eventId).first())) await db.backgroundTasks.add(responseTask);
   });
+  if (responseTask && typeof window !== "undefined") window.dispatchEvent(new Event("mira:chat-reply-change"));
   return { session, message };
 }
 
 export async function respondMusicInvitation(messageId: string, accept: boolean, actor: "user" | "character" = "character") {
-  const message = await db.messages.get(messageId), attachment = message?.attachments?.find((item) => item.type === "music-invitation");
-  if (!message || !attachment || attachment.type !== "music-invitation" || attachment.state !== "pending") return;
-  const session = await db.listeningSessions.get(attachment.sessionId); if (!session) return;
-  const t = now(), state = accept ? "accepted" : "declined";
-  await db.transaction("rw", [db.messages, db.listeningSessions, db.musicEvents], async () => { await db.messages.update(messageId, { updatedAt: t, attachments: message.attachments?.map((item) => item.type === "music-invitation" ? { ...item, state, processedAt: t } : item) }); await db.listeningSessions.update(session.id, { state: accept ? "active" : "ended", updatedAt: t, ...(!accept ? { endedAt: t } : {}), playbackState: accept && session.currentTrackId ? "playing" : "paused" }); await addMusicEvent(session, accept ? "accept" : "decline", actor, session.currentTrackId); });
+  const message = await db.messages.get(messageId), attachment = message?.attachments?.find((item): item is Extract<import("./types").MessageAttachment, { type: "music-invitation" }> => item.type === "music-invitation");
+  if (!message || !attachment) return;
+  const responseId = `music-invitation-response:${messageId}`, session = await db.listeningSessions.get(attachment.sessionId);
+  if (!session) return;
+  if (attachment.state !== "pending") return { ...session, state: attachment.state === "accepted" ? ("active" as const) : ("ended" as const), responseMessage: await db.messages.get(responseId) };
+  const t = now(), state = accept ? "accepted" as const : "declined" as const;
+  const originalAttachment = { ...attachment, cardRole: "invitation" as const, state, reason: accept ? undefined : "这次暂时不一起听", responseStatus: undefined, responseTaskEventId: undefined, processedAt: t };
+  const shouldCreateResponse = actor === "character" && message.senderType === "user";
+  const character = shouldCreateResponse ? await db.characters.get(attachment.characterId) : undefined;
+  const responseMessage: Message | undefined = shouldCreateResponse && character ? {
+    id: responseId, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, conversationId: message.conversationId,
+    senderType: "character", senderId: character.id, content: accept ? `${character.name}接受了一起听邀请。` : `${character.name}暂时拒绝了一起听邀请。`, kind: "music-invitation", status: "complete",
+    attachments: [{ ...originalAttachment, cardRole: "response" as const, reason: accept ? undefined : "这次暂时不一起听" }],
+  } : undefined;
+  await db.transaction("rw", [db.messages, db.listeningSessions, db.musicEvents, db.conversations], async () => {
+    await db.messages.update(messageId, { updatedAt: t, attachments: message.attachments?.map((item) => item === attachment ? originalAttachment : item) });
+    await db.listeningSessions.update(session.id, { state: accept ? "active" : "ended", updatedAt: t, ...(!accept ? { endedAt: t } : {}), playbackState: accept && session.currentTrackId ? "playing" : "paused" });
+    await addMusicEvent(session, accept ? "accept" : "decline", actor, session.currentTrackId);
+    await db.conversations.update(message.conversationId, { lastActivityAt: t, updatedAt: t });
+    if (responseMessage) await db.messages.put(responseMessage);
+  });
   if (accept && session.currentTrackId) window.dispatchEvent(new CustomEvent("mira:music-action", { detail: { type: "play", trackId: session.currentTrackId } }));
-  return { ...session, state: accept ? ("active" as const) : ("ended" as const) };
+  return { ...session, state: accept ? ("active" as const) : ("ended" as const), responseMessage };
 }
 
 export async function executeCharacterMusicAction(input: { conversationId: string; characterId: string; action: CharacterMusicAction }) {

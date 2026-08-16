@@ -70,7 +70,7 @@ import {
 import { useMusicPlayer } from "../core/musicPlayer";
 import { deleteMoodImprint, listMoodImprintsForTrack, setMoodImprintRecallEnabled } from "../core/musicMoodImprint";
 import { MusicNowPlaying } from "../components/MusicNowPlaying";
-import { enqueueChatReply } from "../core/chatReplyTasks";
+import { wakeChatReplyPump } from "../core/chatReplyRunner";
 import { canCharacterInteract } from "../core/conversationSettings";
 import type { Character, ListeningSession, MusicAccountProfile, MusicMoodImprint, MusicPlaylist, MusicTrack } from "../core/types";
 
@@ -218,7 +218,7 @@ export default function MusicPage() {
     try {
       const result = await createMusicInvitationMessage({ conversationId: conversation.id, characterId: character.id, invitedBy: "user", trackId: player.currentTrack?.id });
       setDjSession(result.session); setShowDjPicker(false);
-      await enqueueChatReply({ conversationId: conversation.id, mode: "private", targetMessageId: result.message.id });
+      wakeChatReplyPump({ source: "foreground" });
       showMessage("已发送角色 DJ 邀请");
     } catch (reason) { showMessage(reason instanceof Error ? reason.message : "邀请失败"); }
   };

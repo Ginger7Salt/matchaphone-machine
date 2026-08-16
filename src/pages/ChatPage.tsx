@@ -59,7 +59,7 @@ import {
 import { RegenerationDialog } from "../components/RegenerationDialog";
 import { db } from "../core/db";
 import { cleanupMoodImprintsForDeletedMessages } from "../core/musicMoodImprint";
-import { isCardOnlyMessage } from "../core/messagePresentation";
+import { isCardOnlyMessage, isStandaloneInvitationCard } from "../core/messagePresentation";
 import { pauseActiveMeetForOnlineActivity } from "../core/crossModeContinuity";
 import {
   prepareRoleplayResources,
@@ -1120,14 +1120,14 @@ export default function ChatPage() {
       await createMusicInvitationMessage({ conversationId: conversation.id, characterId: character.id, invitedBy: "user", trackId });
       close();
       await reload();
-      await enqueueChatReply({ conversationId: conversation.id, mode: "private" });
+      wakeChatReplyPump({ source: "foreground" });
     } catch (e) { setError(e instanceof Error ? e.message : "一起听邀请发送失败"); }
     finally { toolSending.current = false; }
   };
   const sendCoupleIslandInvitation = async () => {
     if (isGroup || interactionLocked || busy || toolSending.current || !character) return;
     toolSending.current = true; setError("");
-    try { await createCoupleIslandInvitation({ conversationId: conversation.id, characterId: character.id }); close(); await reload(); await enqueueChatReply({ conversationId: conversation.id, mode: "private" }); }
+    try { await createCoupleIslandInvitation({ conversationId: conversation.id, characterId: character.id }); close(); await reload(); wakeChatReplyPump({ source: "foreground" }); }
     catch (e) { setError(e instanceof Error ? e.message : "茶侣岛邀请发送失败"); }
     finally { toolSending.current = false; }
   };
@@ -1760,7 +1760,8 @@ export default function ChatPage() {
                 m.kind === "sticker" ||
                 (m.attachments?.length === 1 &&
                   m.attachments[0]?.type === "sticker"),
-              cardOnly = isCardOnlyMessage(m);
+              cardOnly = isCardOnlyMessage(m),
+              standaloneInvitation = isStandaloneInvitationCard(m);
             if ((m.status === "generating" || m.status === "error") && !content)
               return (
                 <div
@@ -1821,7 +1822,7 @@ export default function ChatPage() {
               );
             return (
               <div
-                className={`message-row ${m.kind === "director" ? "director" : m.senderType === "system" ? "system" : m.senderType === "user" ? "mine" : "theirs"} ${checked ? "selected" : ""} ${highlightedId === m.id ? "quote-highlight" : ""} ${stickerOnly ? "sticker-only" : ""} ${cardOnly ? "card-only" : ""}`}
+                className={`message-row ${m.kind === "director" ? "director" : m.senderType === "system" ? "system" : m.senderType === "user" ? "mine" : "theirs"} ${checked ? "selected" : ""} ${highlightedId === m.id ? "quote-highlight" : ""} ${stickerOnly ? "sticker-only" : ""} ${cardOnly ? "card-only" : ""} ${standaloneInvitation ? "standalone-invitation-card" : ""}`}
                 data-message-id={m.id}
                 ref={(element) => {
                   if (element) messageRefs.current.set(m.id, element);
@@ -1895,6 +1896,10 @@ export default function ChatPage() {
                                 : m.translation,
                           }}
                           assets={mediaAssets}
+                          onInvitationRetry={async (eventId) => {
+                            await retryChatReply(eventId);
+                            wakeChatReplyPump({ source: "foreground" });
+                          }}
                         />
                       </div>
                       {reaction && (

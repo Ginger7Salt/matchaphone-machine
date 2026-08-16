@@ -617,6 +617,7 @@ export type BackgroundTaskType =
   | "meet-summary"
   | "embedding"
   | "chat-reply"
+  | "invitation-response"
   | "roleplay-cache-refresh"
   | "couple-island-update"
   | "music-dj-turn";
@@ -711,6 +712,24 @@ export interface ChatReplyTaskPayload {
   /** Last deterministic failure stage, used only for status/diagnostics. */
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
   cancelled?: boolean;
+}
+export type InvitationResponseType = "couple-island" | "music";
+export type InvitationDecision =
+  | { type: "accept" }
+  | { type: "decline"; reason: string };
+export interface InvitationResponseTaskPayload {
+  invitationType: InvitationResponseType;
+  invitationMessageId: string;
+  phase: "queued" | "deciding" | "saving" | "completed" | "failed";
+  generationCycle: number;
+  providerCallLimit: 2;
+  providerCallCount: number;
+  providerCallTrace: ChatProviderCallTrace[];
+  targetBubbleCount: number;
+  cardSaved?: boolean;
+  textSaved?: boolean;
+  decision?: InvitationDecision;
+  lastApiError?: ApiErrorInfo;
 }
 export interface BackgroundTask extends BaseEntity {
   type: BackgroundTaskType;
@@ -1243,10 +1262,14 @@ export type MessageAttachment =
     }
   | {
       type: "music-invitation";
+      cardRole?: "invitation" | "response";
       sessionId: string;
       characterId: string;
       state: "pending" | "accepted" | "declined" | "ended";
       trackId?: string;
+      reason?: string;
+      responseStatus?: "queued" | "deciding" | "failed";
+      responseTaskEventId?: string;
       processedAt?: number;
     }
   | {
@@ -1293,6 +1316,8 @@ export type MessageAttachment =
       islandId?: string;
       state: "pending" | "accepted" | "declined";
       reason?: string;
+      responseStatus?: "queued" | "deciding" | "failed";
+      responseTaskEventId?: string;
       processedAt?: number;
     };
 export interface Message extends BaseEntity {

@@ -444,10 +444,12 @@ export function RichMessageContent({
   message,
   assets,
   onMusicInvitationResponse,
+  onInvitationRetry,
 }: {
   message: Message;
   assets: Map<string, MediaAsset>;
   onMusicInvitationResponse?: (messageId: string, accept: boolean) => Promise<void>;
+  onInvitationRetry?: (eventId: string) => Promise<void>;
 }) {
   const nav = useNavigate(),
     attachment = message.attachments?.[0],
@@ -482,7 +484,14 @@ export function RichMessageContent({
   useEffect(() => { if (attachment && "state" in attachment && typeof attachment.state === "string") setMusicCardState(attachment.state); }, [attachment]);
   if (!attachment) return <TranslatedMessageText message={message} />;
   if (attachment.type === "music-invitation") {
+    const response = attachment.cardRole === "response";
     const state = musicState ?? attachment.state;
+    const retry = async () => {
+      if (!onInvitationRetry || !attachment.responseTaskEventId || musicBusy) return;
+      setMusicBusy(true);
+      try { await onInvitationRetry(attachment.responseTaskEventId); }
+      finally { setMusicBusy(false); }
+    };
     const respond = async (accept: boolean) => {
       if (!onMusicInvitationResponse || musicBusy || state !== "pending") return;
       setMusicBusy(true);
@@ -490,14 +499,16 @@ export function RichMessageContent({
       finally { setMusicBusy(false); }
     };
     return (
-      <div className={"music-invitation-card " + state}>
+      <div className={"music-invitation-card " + state + (response ? " response" : " invitation")}>
         <button className="music-invitation-main" onClick={() => nav("/music")} aria-label="打开音乐 App">
           <span className="music-invitation-cover">{musicTrack?.coverUrl ? <img src={musicTrack.coverUrl} alt="" /> : <Music2 />}</span>
-          <span><small>一起听邀请</small><b>{musicTrack?.title ?? "一起听音乐"}</b><em>{musicTrack?.artists.join(" / ") ?? "打开音乐 App 选择歌曲"}</em></span>
+          <span><small>{response ? "LISTEN RESPONSE" : "一起听邀请"}</small><b>{musicTrack?.title ?? "一起听音乐"}</b><em>{musicTrack?.artists.join(" / ") ?? "打开音乐 App 选择歌曲"}</em></span>
         </button>
-        {message.senderType === "character" && state === "pending" && onMusicInvitationResponse ? (
+        {!response && message.senderType === "character" && state === "pending" && onMusicInvitationResponse ? (
           <div className="music-invitation-actions"><button disabled={musicBusy} onClick={() => void respond(false)}>拒绝</button><button disabled={musicBusy} onClick={() => void respond(true)}>接受</button></div>
-        ) : <footer>{state === "accepted" ? "已接受 · 正在一起听" : state === "declined" ? "已拒绝" : state === "ended" ? "一起听已结束" : message.senderType === "user" ? "等待角色回应" : "等待你的回应"}</footer>}
+        ) : !response && attachment.responseStatus === "failed" ? (
+          <footer className="invitation-response-failed"><span>角色回应未完成</span>{attachment.responseTaskEventId && onInvitationRetry ? <button type="button" disabled={musicBusy} onClick={() => void retry()}>重试</button> : null}</footer>
+        ) : <footer>{response ? (state === "accepted" ? "已接受 · 正在一起听" : state === "declined" ? attachment.reason || "这次暂时不一起听" : "回应已完成") : state === "accepted" ? "已接受 · 正在一起听" : state === "declined" ? "已拒绝" : state === "ended" ? "一起听已结束" : message.senderType === "user" ? "等待角色回应" : "等待你的回应"}</footer>}
       </div>
     );
   }
@@ -515,14 +526,21 @@ export function RichMessageContent({
     return <button type="button" className="music-dj-card summary" onClick={() => nav("/music")}><header><Music2 /><span><small>一起听小结</small><b>{musicTracks.length || attachment.trackIds.length} 首歌 · {Math.max(1, Math.round(attachment.listenedMs / 60000))} 分钟</b></span></header><div className="music-summary-tracks">{musicTracks.slice(0, 4).map((track) => <span key={track.id}>{track.coverUrl ? <img src={track.coverUrl} alt="" /> : <Music2 />}<b>{track.title}</b></span>)}</div>{attachment.closingNote ? <p>{attachment.closingNote}</p> : <footer>角色正在整理这段共同回忆…</footer>}</button>;
   }
   if (attachment.type === "couple-island-invitation") {
-    const response = attachment.cardRole === "response" || message.senderType === "character";
+    const response = attachment.cardRole === "response";
+    const retry = async () => {
+      if (!onInvitationRetry || !attachment.responseTaskEventId) return;
+      await onInvitationRetry(attachment.responseTaskEventId);
+    };
     const title = response ? (attachment.state === "accepted" ? "接受茶侣岛邀请" : "暂时拒绝邀请") : "茶侣岛邀请";
-    const detail = attachment.state === "accepted" ? (response ? "我愿意和你一起登岛" : "已接受 · 小岛已经开放") : attachment.state === "declined" ? attachment.reason || "这次邀请暂未接受" : "等待角色回应";
+    const detail = attachment.state === "accepted" ? (response ? "我愿意和你一起登岛" : "已接受 · 小岛已经开放") : attachment.state === "declined" ? attachment.reason || "这次邀请暂未接受" : attachment.responseStatus === "failed" ? "角色回应未完成" : "等待角色回应";
     return (
-      <button className={`couple-island-invitation-card ${attachment.state} ${response ? "response" : "invitation"}`} onClick={() => nav("/couple-island")} aria-label="打开茶侣岛角色列表">
-        <span className="couple-island-invitation-icon"><HeartHandshake /></span>
-        <span><small>{response ? "ISLAND RESPONSE" : "COUPLE ISLAND"}</small><b>{title}</b><em>{detail}</em></span>
-      </button>
+      <div className={`couple-island-invitation-card ${attachment.state} ${response ? "response" : "invitation"}`}>
+        <button onClick={() => nav("/couple-island")} aria-label="打开茶侣岛角色列表">
+          <span className="couple-island-invitation-icon"><HeartHandshake /></span>
+          <span><small>{response ? "ISLAND RESPONSE" : "COUPLE ISLAND"}</small><b>{title}</b><em>{detail}</em></span>
+        </button>
+        {!response && attachment.responseStatus === "failed" && attachment.responseTaskEventId && onInvitationRetry ? <button type="button" className="invitation-response-retry" onClick={() => void retry()}>重试角色回应</button> : null}
+      </div>
     );
   }
   if (attachment.type === "sticker") {
