@@ -43,6 +43,7 @@ type State={
 };
 
 const emptyWindow=():ConversationMessageWindow=>({items:[],hasMore:true,loading:false,initialized:false});
+const conversationWindowLoads=new Map<string,Promise<void>>();
 function touchedOrder(order:string[],conversationId:string){return [...order.filter(id=>id!==conversationId),conversationId]}
 function evictWindows(windows:Record<string,ConversationMessageWindow>,order:string[]){
  const next={...windows},kept=order.slice(-MESSAGE_WINDOW_LIMIT);
@@ -63,32 +64,38 @@ export const useStore=create<State>((set,get)=>({
  }),
  loadConversationWindow:async(conversationId)=>{
   const existing=get().messageWindows[conversationId];
-  if(existing?.loading||existing?.initialized){
-   if(existing?.initialized)set(state=>{const evicted=evictWindows(state.messageWindows,touchedOrder(state.messageWindowOrder,conversationId));return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});
-   return;
-  }
-  set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??emptyWindow()),loading:true}}}));
-  try{
-   const page=await readConversationMessagePage(conversationId);
-   set(state=>{const order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items:page.items,oldest:page.oldest,hasMore:page.hasMore,loading:false,initialized:true}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});
-  }catch(error){set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??emptyWindow()),loading:false}}}));throw error}
+  if(existing?.initialized){set(state=>{const evicted=evictWindows(state.messageWindows,touchedOrder(state.messageWindowOrder,conversationId));return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});return}
+  const pending=conversationWindowLoads.get(conversationId);
+  if(pending)return pending;
+  const task=(async()=>{
+   set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??emptyWindow()),loading:true,error:undefined}}}));
+   try{
+    const page=await readConversationMessagePage(conversationId);
+    set(state=>{const order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items:page.items,oldest:page.oldest,hasMore:page.hasMore,loading:false,initialized:true,error:undefined}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});
+   }catch(error){set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??emptyWindow()),loading:false,initialized:false,error:"initial"}}}));throw error}
+   finally{conversationWindowLoads.delete(conversationId)}
+  })();
+  conversationWindowLoads.set(conversationId,task);
+  return task;
  },
  loadOlderConversationMessages:async(conversationId)=>{
   const existing=get().messageWindows[conversationId];
   if(!existing?.initialized||existing.loading||!existing.hasMore||!existing.oldest)return;
-  set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...existing,loading:true}}}));
+  set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...existing,loading:true,error:undefined}}}));
   try{
    const page=await readConversationMessagePage(conversationId,existing.oldest);
    set(state=>{
-    const current=state.messageWindows[conversationId]??existing,items=[...page.items,...current.items].filter((message,index,all)=>all.findIndex(row=>row.id===message.id)===index).sort(compareMessages),order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items,oldest:items[0]?{createdAt:items[0].createdAt,id:items[0].id}:undefined,hasMore:page.hasMore,loading:false,initialized:true}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order};
+    const current=state.messageWindows[conversationId]??existing,items=[...page.items,...current.items].filter((message,index,all)=>all.findIndex(row=>row.id===message.id)===index).sort(compareMessages),order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items,oldest:items[0]?{createdAt:items[0].createdAt,id:items[0].id}:undefined,hasMore:page.hasMore,loading:false,initialized:true,error:undefined}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order};
    });
-  }catch(error){set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??existing),loading:false}}}));throw error}
+  }catch(error){set(state=>({messageWindows:{...state.messageWindows,[conversationId]:{...(state.messageWindows[conversationId]??existing),loading:false,error:"older"}}}));throw error}
  },
  refreshConversationWindow:async(conversationId)=>{
+  const pending=conversationWindowLoads.get(conversationId);
+  if(pending)await pending.catch(()=>undefined);
   const existing=get().messageWindows[conversationId];
   if(!existing?.initialized)return;
   const page=await readConversationMessagePage(conversationId,undefined,Math.max(MESSAGE_PAGE_SIZE,existing.items.length));
-  set(state=>{const current=state.messageWindows[conversationId];if(!current?.initialized)return{};const order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items:page.items,oldest:page.oldest,hasMore:page.hasMore,loading:false,initialized:true}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});
+  set(state=>{const current=state.messageWindows[conversationId];if(!current?.initialized)return{};const order=touchedOrder(state.messageWindowOrder,conversationId),messageWindows={...state.messageWindows,[conversationId]:{items:page.items,oldest:page.oldest,hasMore:page.hasMore,loading:false,initialized:true,error:undefined}},evicted=evictWindows(messageWindows,order);return{messageWindows:evicted.windows,messageWindowOrder:evicted.order}});
  },
  clearConversationWindow:(conversationId)=>set(state=>{const messageWindows={...state.messageWindows};delete messageWindows[conversationId];return{messageWindows,messageWindowOrder:state.messageWindowOrder.filter(id=>id!==conversationId)}}),
  refreshConversationSummaries:async()=>{const summaries=await readConversationSummaries(get().conversations);set({conversationSummaries:summaries})},

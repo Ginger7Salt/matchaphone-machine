@@ -22,6 +22,7 @@ export interface ConversationMessageWindow {
   hasMore: boolean;
   loading: boolean;
   initialized: boolean;
+  error?: "initial" | "older";
 }
 
 const messageBounds = (conversationId: string) => ({

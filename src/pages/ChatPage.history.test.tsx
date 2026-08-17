@@ -1,0 +1,20 @@
+import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
+import {act,cleanup,fireEvent,render,screen,waitFor} from "@testing-library/react";
+import {MemoryRouter,Route,Routes} from "react-router-dom";
+import {db} from "../core/db";
+import {useStore} from "../core/store";
+import {defaultAppSettings,defaultProvider,type Character,type Conversation,type Message} from "../core/types";
+
+vi.mock("../core/musicPlayer",()=>({useMusicPlayer:()=>({currentTrack:null,tracks:[]})}));
+import ChatPage from "./ChatPage";
+
+const character={id:"c",schemaVersion:1,createdAt:1,updatedAt:1,name:"茶茶",avatar:"",bio:"",personality:"温柔",speakingStyle:"自然",background:"",language:"中文",proactive:{messages:false,timeAware:false,frequency:"low",quietStart:"23:00",quietEnd:"08:00",catchupLimit:1,dailyLimit:1},relationship:{intimacy:10,trust:10,mood:"平静",recentEvents:[]},lastActiveAt:1,contactState:{status:"friend"}} as Character;
+const conversation={id:"v",schemaVersion:1,createdAt:1,updatedAt:1,title:"茶茶",type:"private",memberIds:["c"],presetIds:[],loreBookIds:[],lastActivityAt:100} as Conversation;
+const message=(index:number):Message=>({id:`history-${index}`,schemaVersion:1,createdAt:index,updatedAt:index,conversationId:"v",senderType:"user",senderId:"user",kind:"text",content:`history-${index}`,status:"complete"});
+
+describe("ChatPage history windows",()=>{
+ afterEach(()=>cleanup());
+ beforeEach(async()=>{Object.defineProperty(HTMLElement.prototype,"scrollIntoView",{configurable:true,value:vi.fn()});await db.delete();await db.open();await db.characters.put(character);await db.conversations.put(conversation);await db.messages.bulkAdd(Array.from({length:90},(_,index)=>message(index)));useStore.setState({ready:true,characters:[character],conversations:[conversation],messageWindows:{},conversationSummaries:{},messageWindowOrder:[],provider:defaultProvider,settings:{...defaultAppSettings,onboarded:true},appearance:null,imageAssets:[],loreBooks:[],memories:[],feedPosts:[],presets:[],memoryExtractionBatches:[],meetSessions:[],generating:null});});
+ it("loads the latest window on entry and exposes older history",async()=>{render(<MemoryRouter initialEntries={["/messages/v"]}><Routes><Route path="/messages/:id" element={<ChatPage/>}/></Routes></MemoryRouter>);expect(await screen.findByText("history-89")).toBeInTheDocument();expect(screen.queryByText("history-0")).not.toBeInTheDocument();const older=await screen.findByRole("button",{name:"加载更早消息"});fireEvent.click(older);expect(await screen.findByText("history-0")).toBeInTheDocument();await waitFor(()=>expect(useStore.getState().messageWindows.v.items).toHaveLength(90))});
+ it("reloads an evicted window on page restore",async()=>{render(<MemoryRouter initialEntries={["/messages/v"]}><Routes><Route path="/messages/:id" element={<ChatPage/>}/></Routes></MemoryRouter>);expect(await screen.findByText("history-89")).toBeInTheDocument();act(()=>useStore.getState().clearConversationWindow("v"));await waitFor(()=>expect(screen.queryByText("history-89")).not.toBeInTheDocument());fireEvent(window,new Event("pageshow"));expect(await screen.findByText("history-89")).toBeInTheDocument();});
+ it("loads an older page automatically near the top without duplicate requests",async()=>{await db.messages.bulkAdd(Array.from({length:80},(_,index)=>message(index+90)));render(<MemoryRouter initialEntries={["/messages/v"]}><Routes><Route path="/messages/:id" element={<ChatPage/>}/></Routes></MemoryRouter>);expect(await screen.findByText("history-169")).toBeInTheDocument();const pane=document.querySelector<HTMLElement>(".chat-messages")!;Object.defineProperty(pane,"scrollTop",{configurable:true,writable:true,value:0});Object.defineProperty(pane,"scrollHeight",{configurable:true,writable:true,value:2000});Object.defineProperty(pane,"clientHeight",{configurable:true,writable:true,value:600});fireEvent.scroll(pane);await waitFor(()=>expect(useStore.getState().messageWindows.v.items).toHaveLength(160));expect(screen.getByText("history-10")).toBeInTheDocument()});});

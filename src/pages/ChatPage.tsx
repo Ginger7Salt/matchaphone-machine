@@ -200,7 +200,8 @@ export default function ChatPage() {
       imageAssets,
       reload,
     } = store;
-  const messages = id ? (messageWindows[id]?.items ?? []) : [],
+  const messageWindow = id ? messageWindows[id] : undefined,
+    messages = messageWindow?.items ?? [],
     conversation = conversations.find((c) => c.id === id),
     [conversationRecoveryDone, setConversationRecoveryDone] = useState(false),
     [text, setText] = useState(""),
@@ -297,6 +298,20 @@ export default function ChatPage() {
         : [],
     groupProfiles = actors.map((actor) => actor.character);
 
+  const loadOlderHistory = async () => {
+    const pane = messagesPane.current;
+    if (!id || !pane || !messageWindow?.initialized || !messageWindow.hasMore || messageWindow.loading || loadingOlder.current) return;
+    loadingOlder.current = true;
+    const previousHeight = pane.scrollHeight, previousTop = pane.scrollTop;
+    try {
+      await store.loadOlderConversationMessages(id);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => {
+        if (messagesPane.current === pane) pane.scrollTop = previousTop + Math.max(0, pane.scrollHeight - previousHeight);
+        resolve();
+      }));
+    } catch {} finally { loadingOlder.current = false; }
+  };
+
   useEffect(() => {
     let active = true;
     setConversationRecoveryDone(false);
@@ -361,7 +376,12 @@ export default function ChatPage() {
   };
   useLayoutEffect(() => {
     const pane = messagesPane.current;
-    if (!pane || !id || restoredConversation.current === id) return;
+    if (!pane || !id) return;
+    if (!messageWindow?.initialized) {
+      if (restoredConversation.current === id) restoredConversation.current = null;
+      return;
+    }
+    if (restoredConversation.current === id) return;
     const raw = sessionStorage.getItem(`chacha-chat-scroll:${id}`);
     let saved:
       | {
@@ -395,7 +415,7 @@ export default function ChatPage() {
     nearBottom.current =
       pane.scrollHeight - pane.scrollTop - pane.clientHeight < 100;
     restoredConversation.current = id;
-  }, [id, list.length]);
+  }, [id, list.length, messageWindow?.initialized]);
   useEffect(() => () => saveScrollPosition(), [id]);
   useEffect(() => {
     void db.mediaAssets
@@ -465,8 +485,8 @@ export default function ChatPage() {
   }, [reload]);
   useEffect(() => {
     if (!id) return;
-    const sync = () => void store.reloadConversation(id).catch(() => {});
-    sync();
+    const sync = () => void store.loadConversationWindow(id).then(() => store.reloadConversation(id)).catch(() => {});
+    void store.loadConversationWindow(id).catch(() => {});
     window.addEventListener("mira:chat-reply-change", sync);
     window.addEventListener("pageshow", sync);
     return () => {
@@ -1711,6 +1731,7 @@ export default function ChatPage() {
           const el = e.currentTarget;
           nearBottom.current =
             el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+          if (el.scrollTop < 120) void loadOlderHistory();
           updateLastVisibleMessage();
           saveScrollPosition();
         }}
@@ -1724,7 +1745,30 @@ export default function ChatPage() {
             clearSelection();
         }}
       >
-        {list.length === 0 ? (
+        {messageWindow?.initialized && list.length > 0 && (messageWindow.hasMore || messageWindow.error === "older") && (
+          <div className="chat-history-loader">
+            <button type="button" disabled={messageWindow.loading} onClick={() => void loadOlderHistory()}>
+              {messageWindow.loading ? "正在加载更早消息…" : messageWindow.error === "older" ? "加载失败，点击重试" : "加载更早消息"}
+            </button>
+          </div>
+        )}
+        {!messageWindow?.initialized ? (
+          <div className="chat-history-state" role="status">
+            {messageWindow?.error === "initial" ? (
+              <>
+                <AlertCircle />
+                <b>聊天记录加载失败</b>
+                <p>记录仍保存在当前浏览器中，可以重新加载。</p>
+                <button type="button" onClick={() => id && void store.loadConversationWindow(id).catch(() => {})}>重新加载</button>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="is-spinning" />
+                <b>正在加载聊天记录…</b>
+              </>
+            )}
+          </div>
+        ) : list.length === 0 ? (
           isGroup ? (
             <div className="chat-welcome">
               <Users size={42} />
