@@ -1,5 +1,5 @@
-﻿import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderSettings } from "./types";
+import type { ChatItem } from "./context";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
@@ -40,7 +40,15 @@ export interface ProviderErrorMetadata {
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
   finishReason?: string;
-  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
+  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  countMode?: ReplyBubbleCountDiagnostics["countMode"];
+  allowedMin?: number;
+  allowedMax?: number;
+  preferredCount?: number;
+  rawMessageCount?: number;
+  finalMessageCount?: number;
+  countResolution?: ReplyBubbleCountDiagnostics["countResolution"];
+  countCompliant?: boolean;
 }
 export interface ProviderChatResult {
   text: string;
@@ -1036,6 +1044,7 @@ function parsedErrorBody(text: string, secrets: string[]) {
   return { message: sanitizeApiErrorText(message ?? fallback, secrets), providerCode, providerType, param };
 }
 function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
+  if (providerCode === "bubble_count_out_of_range") return "角色回复数量超出已设置范围，且无法安全调整";
   if (providerCode === "transport_truncated") return "服务返回内容在传输过程中被截断";
   if (providerCode === "malformed_envelope") return "服务返回的 API 外壳损坏";
   if (providerCode === "truncated_json") return "服务返回内容被截断或结构不完整";
@@ -1054,6 +1063,7 @@ function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
   return "API 返回的数据无法按兼容格式识别";
 }
 function troubleshootingOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
+  if (providerCode === "bubble_count_out_of_range") return ["可点击重试。", "自动模式允许自然生成 1–8 条，只有精确模式才要求严格数量。", "不会为了凑数添加或删除正文。"];
   if (providerCode === "transport_truncated")
     return ["重新生成完整回复。", "检查中转服务的流式传输或响应长度限制。", "若问题持续，请复制脱敏诊断信息。"];
   if (providerCode === "malformed_envelope")
@@ -1111,6 +1121,14 @@ export function createApiErrorInfo(kind: ApiErrorKind, meta: ProviderErrorMetada
     tailKind: meta.tailKind,
     finishReason: meta.finishReason,
     failureStage: meta.failureStage,
+    countMode: meta.countMode,
+    allowedMin: meta.allowedMin,
+    allowedMax: meta.allowedMax,
+    preferredCount: meta.preferredCount,
+    rawMessageCount: meta.rawMessageCount,
+    finalMessageCount: meta.finalMessageCount,
+    countResolution: meta.countResolution,
+    countCompliant: meta.countCompliant,
     troubleshooting: troubleshootingOf(kind, meta.httpStatus, meta.providerCode),
   };
 }

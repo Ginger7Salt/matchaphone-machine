@@ -1,5 +1,5 @@
-﻿import { db, getSetting, setSetting } from "./db";
-import { invitationResponseTask, invitationResponseTargetCount } from "./invitationResponseTaskModel";
+import { db, getSetting, setSetting } from "./db";
+import { invitationResponseBubbleCountPlan, invitationResponseTask } from "./invitationResponseTaskModel";
 
 import { pauseActiveMeetForOnlineActivity } from "./crossModeContinuity";
 import { rewardIslandListening } from "./coupleIsland";
@@ -180,7 +180,8 @@ export async function createMusicInvitationMessage(input: { conversationId: stri
   const session: ListeningSession = { id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, startedAt: t, conversationId: input.conversationId, characterId: input.characterId, state: "invited", invitedBy: input.invitedBy, invitationMessageId: messageId, currentTrackId: input.trackId, queue: input.trackId ? [input.trackId] : [], queueEntries: input.trackId ? [{ trackId: input.trackId, selectedBy: input.invitedBy, addedAt: t }] : [], currentIndex: 0, playbackState: "paused", positionMs: 0, selectedBy: input.invitedBy, totalListenedMs: 0, djTurnCount: 0 };
   const history = input.invitedBy === "user" ? await db.messages.where("conversationId").equals(input.conversationId).sortBy("createdAt") : [];
   const invitedCharacter = await db.characters.get(input.characterId);
-  const responseTask = input.invitedBy === "user" && invitedCharacter ? invitationResponseTask({ invitationType: "music", invitationMessageId: messageId, conversationId: input.conversationId, characterId: input.characterId, targetBubbleCount: invitationResponseTargetCount(invitedCharacter, history), createdAt: t }) : undefined;
+  const bubbleCountPlan = input.invitedBy === "user" && invitedCharacter ? invitationResponseBubbleCountPlan(invitedCharacter, history) : undefined;
+  const responseTask = input.invitedBy === "user" && invitedCharacter && bubbleCountPlan ? invitationResponseTask({ invitationType: "music", invitationMessageId: messageId, conversationId: input.conversationId, characterId: input.characterId, targetBubbleCount: bubbleCountPlan.preferred, bubbleCountPlan, createdAt: t }) : undefined;
   const message: Message = { id: messageId, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, conversationId: input.conversationId, senderType: input.invitedBy === "user" ? "user" : "character", senderId: input.invitedBy === "character" ? input.characterId : undefined, content: track ? `邀请一起听「${track.title}」` : "邀请一起听音乐", kind: "music-invitation", attachments: [{ type: "music-invitation", cardRole: "invitation", sessionId: session.id, characterId: input.characterId, state: "pending", trackId: input.trackId, ...(responseTask ? { responseStatus: "queued" as const, responseTaskEventId: responseTask.eventId } : {}) }], status: "complete", origin: input.invitedBy === "character" ? "proactive" : "manual" };
   for (const current of existing) await endListeningSession(current.id, "system");
   await db.transaction("rw", [db.messages, db.conversations, db.listeningSessions, db.musicEvents, db.meetSessions, db.backgroundTasks], async () => {

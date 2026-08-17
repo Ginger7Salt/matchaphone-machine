@@ -1,7 +1,7 @@
 import { createApiErrorInfo, ProviderError, type ProviderChatResult } from "./provider";
 import { parseStructuredJson, parseStructuredJsonWithMeta, StructuredJsonError, type StructuredJsonDiagnostics } from "./structuredJson";
 import { innerVoiceInstruction, parseGeneratedInnerVoice, parseGeneratedInnerVoiceFromRoot, type GeneratedInnerVoice } from "./innerVoice";
-import type { Character, CharacterIslandAction, CharacterMusicAction } from "./types";
+import type { Character, CharacterIslandAction, CharacterMusicAction, ReplyBubbleCountDiagnostics, ReplyBubbleCountPlan } from "./types";
 
 export interface ReplyBubblePart {
   content: string;
@@ -29,8 +29,10 @@ export interface NormalizedReplyBubbles {
 export interface GeneratedReplyTurn extends NormalizedReplyBubbles {
   innerVoice?: GeneratedInnerVoice;
   innerVoiceFormatError?: boolean;
-  /** The local target chosen before the provider call. */
+  /** The local preference chosen before the provider call. */
   targetCount?: number;
+  countPlan?: ReplyBubbleCountPlan;
+  countDiagnostics?: ReplyBubbleCountDiagnostics;
   musicAction?: CharacterMusicAction;
   islandAction?: CharacterIslandAction;
   stickerId?: string;
@@ -147,6 +149,28 @@ export function replyBubblePlanOf(
     targetCount: targetBubbleCount(range, preferredMin, preferredMax),
   };
 }
+export function replyBubbleCountPlanOf(
+  character: Character,
+  context: ReplyContextItem[],
+  scene: "private" | "group" | "proactive",
+  preferredOverride?: number,
+): ReplyBubbleCountPlan {
+  const plan = replyBubblePlanOf(character, context, scene);
+  const preferred = Number.isInteger(preferredOverride)
+    ? Math.max(plan.range.min, Math.min(plan.range.max, Number(preferredOverride)))
+    : plan.targetCount;
+  return {
+    mode: plan.range.adaptive
+      ? "adaptive"
+      : plan.range.min === plan.range.max
+        ? "exact"
+        : "range",
+    min: plan.range.min,
+    max: plan.range.max,
+    preferred,
+  };
+}
+
 export function adaptiveReplyRetryReason(
   plan: ReplyBubblePlan,
   parts: ReplyBubblePart[],
@@ -296,6 +320,139 @@ export function normalizeReplyBubbles(
       : parts.length === target,
   };
 }
+function resolveReplyBubbleCountPlan(
+  range: ReplyBubbleRange,
+  value?: ReplyBubbleCountPlan | number,
+): ReplyBubbleCountPlan {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    const exact = Math.max(range.min, Math.min(range.max, value));
+    return { mode: "exact", min: exact, max: exact, preferred: exact };
+  }
+  if (value && typeof value === "object") {
+    const min = Math.max(1, Math.min(8, Math.trunc(value.min)));
+    const max = Math.max(min, Math.min(8, Math.trunc(value.max)));
+    const mode = value.mode === "adaptive" || value.mode === "range" || value.mode === "exact"
+      ? value.mode
+      : range.adaptive
+        ? "adaptive"
+        : min === max
+          ? "exact"
+          : "range";
+    const exact = mode === "exact" ? Math.max(min, Math.min(max, Math.trunc(value.preferred))) : undefined;
+    const allowedMin = exact ?? min;
+    const allowedMax = exact ?? max;
+    return {
+      mode,
+      min: allowedMin,
+      max: allowedMax,
+      preferred: Math.max(allowedMin, Math.min(allowedMax, Math.trunc(value.preferred))),
+    };
+  }
+  const min = range.min;
+  const max = range.max;
+  return {
+    mode: range.adaptive ? "adaptive" : min === max ? "exact" : "range",
+    min,
+    max,
+    preferred: targetBubbleCount(range, min, max),
+  };
+}
+
+function mergePairWithinHardLimits(
+  left: ReplyBubblePart,
+  right: ReplyBubblePart,
+): ReplyBubblePart | undefined {
+  if (Boolean(left.translation) !== Boolean(right.translation)) return;
+  const content = joinText(left.content, right.content);
+  if (visibleCharacterCount(content) > 80) return;
+  const translation = left.translation && right.translation
+    ? joinText(left.translation, right.translation)
+    : undefined;
+  if (translation && visibleCharacterCount(translation) > 100) return;
+  return { content, translation };
+}
+
+function mergeStrictToMaximum(parts: ReplyBubblePart[], maximum: number) {
+  const rows = [...parts];
+  while (rows.length > maximum) {
+    let candidate: { index: number; merged: ReplyBubblePart; length: number } | undefined;
+    for (let index = 0; index < rows.length - 1; index += 1) {
+      const merged = mergePairWithinHardLimits(rows[index], rows[index + 1]);
+      if (!merged) continue;
+      const length = visibleCharacterCount(merged.content);
+      if (!candidate || length < candidate.length) candidate = { index, merged, length };
+    }
+    if (!candidate) break;
+    rows.splice(candidate.index, 2, candidate.merged);
+  }
+  return rows;
+}
+
+function splitStrictToMinimum(
+  parts: ReplyBubblePart[],
+  minimum: number,
+  maximum: number,
+) {
+  let rows = [...parts];
+  while (rows.length < minimum) {
+    const candidates = rows
+      .map((part, index) => ({ index, split: splitPair(part, "semantic") }))
+      .filter((item) => item.split.length > 1)
+      .sort((left, right) => right.split.length - left.split.length);
+    const candidate = candidates[0];
+    if (!candidate) break;
+    rows.splice(candidate.index, 1, ...candidate.split);
+    if (rows.length > maximum) rows = mergeStrictToMaximum(rows, maximum);
+  }
+  return rows;
+}
+
+export function normalizeStrictReplyBubbles(
+  input: ReplyBubblePart[],
+  range: ReplyBubbleRange,
+  countPlan?: ReplyBubbleCountPlan | number,
+): NormalizedReplyBubbles & { countPlan: ReplyBubbleCountPlan; countDiagnostics: ReplyBubbleCountDiagnostics } {
+  const plan = resolveReplyBubbleCountPlan(range, countPlan);
+  let parts: ReplyBubblePart[] = input.map((item) => ({
+    content: stripSequencePrefix(item.content.trim()),
+    translation: item.translation ? stripSequencePrefix(item.translation.trim()) || undefined : undefined,
+  }));
+  if (!parts.length || parts.some((item) => !item.content))
+    throw new ProviderError("format", "?????????");
+  if (parts.some((item) => visibleCharacterCount(item.content) > 80))
+    throw new ProviderError("format", "?????????? 80 ???");
+  if (parts.some((item) => item.translation && visibleCharacterCount(item.translation) > 100))
+    throw new ProviderError("format", "?????????? 100 ???");
+  const rawMessageCount = parts.length;
+  let countResolution: ReplyBubbleCountDiagnostics["countResolution"] = "unchanged";
+  if (parts.length > plan.max) {
+    parts = mergeStrictToMaximum(parts, plan.max);
+    if (parts.length < rawMessageCount) countResolution = "merged";
+  }
+  if (parts.length < plan.min) {
+    const before = parts.length;
+    parts = splitStrictToMinimum(parts, plan.min, plan.max);
+    if (parts.length > before) countResolution = "split";
+  }
+  const countCompliant = parts.length >= plan.min && parts.length <= plan.max;
+  if (!countCompliant) countResolution = "retry-required";
+  return {
+    parts,
+    compliant: countCompliant,
+    countPlan: plan,
+    countDiagnostics: {
+      countMode: plan.mode,
+      allowedMin: plan.min,
+      allowedMax: plan.max,
+      preferredCount: plan.preferred,
+      rawMessageCount,
+      finalMessageCount: parts.length,
+      countResolution,
+      countCompliant,
+    },
+  };
+}
+
 function parsedReplyRoot(raw: string): unknown {
   return parseStructuredJson(raw);
 }
@@ -481,8 +638,9 @@ function normalizedBubblesFromRows(
   messages: unknown[],
   bilingual: boolean,
   range: ReplyBubbleRange,
-  expectedCount?: number,
-): NormalizedReplyBubbles {
+  countPlan?: ReplyBubbleCountPlan | number,
+  preserveExplicitBoundaries = false,
+): NormalizedReplyBubbles & Partial<{ countPlan: ReplyBubbleCountPlan; countDiagnostics: ReplyBubbleCountDiagnostics }> {
   const parts: ReplyBubblePart[] = [];
   for (const item of messages) {
     if (typeof item === "string") {
@@ -507,7 +665,9 @@ function normalizedBubblesFromRows(
     });
   }
   if (!parts.length) throw new ProviderError("format", "角色没有返回非空消息");
-  return normalizeReplyBubbles(parts, range, expectedCount);
+  return preserveExplicitBoundaries
+    ? normalizeStrictReplyBubbles(parts, range, countPlan)
+    : normalizeReplyBubbles(parts, range, typeof countPlan === "number" ? countPlan : undefined);
 }
 
 function turnFromRoot(
@@ -516,7 +676,7 @@ function turnFromRoot(
   range: ReplyBubbleRange,
   innerVoiceRequired: boolean,
   strict: boolean,
-  expectedCount?: number,
+  countPlan?: ReplyBubbleCountPlan | number,
 ): GeneratedReplyTurn {
   const canonicalRoot = canonicalReplyRoot(root);
   const row = canonicalRoot && typeof canonicalRoot === "object" && !Array.isArray(canonicalRoot)
@@ -524,7 +684,7 @@ function turnFromRoot(
     : undefined;
   const messages = strict ? (row && Array.isArray(row.messages) ? row.messages : undefined) : messageRowsOf(root);
   if (!messages) throw new ProviderError("format", "角色回复缺少 messages 数组");
-  const normalized = normalizedBubblesFromRows(messages, bilingual, range, expectedCount);
+  const normalized = normalizedBubblesFromRows(messages, bilingual, range, countPlan, strict);
   validateCompactReplyWire(root);
   let innerVoice: GeneratedInnerVoice | undefined;
   let innerVoiceFormatError = false;
@@ -601,7 +761,7 @@ export function parseStrictReplyTurn(
   range: ReplyBubbleRange,
   innerVoiceRequired: boolean,
   response?: ProviderChatResult,
-  expectedCount?: number,
+  countPlan?: ReplyBubbleCountPlan | number,
 ): GeneratedReplyTurn {
   let root: unknown;
   let diagnostics: StructuredJsonDiagnostics | undefined;
@@ -633,7 +793,7 @@ export function parseStrictReplyTurn(
   if (!Array.isArray(row.messages) || !row.messages.length)
     throw strictTurnError("missing_messages", "服务返回的 JSON 缺少非空 messages 数组", response, "role-protocol", diagnostics);
   try {
-    const turn = turnFromRoot(root, bilingual, range, innerVoiceRequired, true, expectedCount);
+    const turn = turnFromRoot(root, bilingual, range, innerVoiceRequired, true, countPlan);
     if (innerVoiceRequired && !turn.innerVoice)
       throw strictTurnError("missing_inner_voice", "服务返回的 JSON 缺少完整心声结构", response, "inner-voice", diagnostics);
     return turn;
@@ -680,8 +840,10 @@ export function replyBubbleInstruction(
   return [
     "Reply as " + character.name + " in the " + setting + ".",
     range.adaptive
-      ? "There is no preset reply count. The local planner selected exactly " + resolvedPlan.targetCount + " bubbles for this turn; return exactly that count."
-      : "Return exactly " + resolvedPlan.targetCount + " separate message bubbles. This must remain within the user setting range " + range.min + "-" + range.max + ".",
+      ? "There is no preset reply count. Prefer around " + resolvedPlan.targetCount + " bubbles for this turn, but return any natural count from 1 to 8. Do not add filler merely to match the preference."
+      : range.min === range.max
+        ? "The client selected exactly " + range.min + " bubbles for this turn. Return exactly that many separate message bubbles."
+        : "Return between " + range.min + " and " + range.max + " separate message bubbles. Prefer around " + resolvedPlan.targetCount + " when natural, but do not add filler merely to match the preference.",
     "Each item is one complete message the character actually sends. Do not put multiple bubbles into one item with blank lines. Never default to five bubbles. Keep each bubble around 20 visible characters when natural and finish a semantically complete sentence or phrase.",
     "Keep each visible bubble at or below 80 characters and each translation at or below 100 characters. Do not add filler, repetition, numbering or explanation.",
     innerVoiceRequired ? innerVoiceInstruction(bilingual) : "",

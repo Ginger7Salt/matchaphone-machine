@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   adaptiveReplyRetryReason,
   normalizeReplyBubbles,
+  normalizeStrictReplyBubbles,
   parseReplyBubbles,
   parseReplyTurn,
   parseStrictReplyTurn,
@@ -381,4 +382,35 @@ describe("compact reply wire protocol", () => {
     expect(parseStrictReplyTurn(raw, false, { min: 1, max: 8, adaptive: true }, true).parts[0]?.content).toBe("\u5b8c\u6574\u56de\u590d");
   });
 
+  it("keeps strict m-array items as explicit bubble boundaries", () => {
+    const parsed = normalizeStrictReplyBubbles(
+      [{ content: "First sentence. Second sentence?" }],
+      { min: 1, max: 8, adaptive: true },
+      { mode: "adaptive", min: 1, max: 8, preferred: 1 },
+    );
+    expect(parsed.parts).toEqual([{ content: "First sentence. Second sentence?" }]);
+    expect(parsed.countDiagnostics).toMatchObject({
+      rawMessageCount: 1,
+      finalMessageCount: 1,
+      countResolution: "unchanged",
+      countCompliant: true,
+    });
+  });
+
+  it("accepts two natural bubbles when adaptive preference is one", () => {
+    const parsed = normalizeStrictReplyBubbles(
+      [{ content: "one" }, { content: "two" }],
+      { min: 1, max: 8, adaptive: true },
+      { mode: "adaptive", min: 1, max: 8, preferred: 1 },
+    );
+    expect(parsed.compliant).toBe(true);
+    expect(parsed.parts).toHaveLength(2);
+    expect(parsed.countDiagnostics).toMatchObject({
+      preferredCount: 1,
+      rawMessageCount: 2,
+      finalMessageCount: 2,
+      countResolution: "unchanged",
+      countCompliant: true,
+    });
+  });
 });

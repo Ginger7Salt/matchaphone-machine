@@ -209,4 +209,39 @@ describe("generateCharacterReplyTurn strict retry", () => {
     expect(prompt).toContain("selected exactly 1 bubbles for this turn");
   });
 
+  it("accepts two complete bubbles in one call when adaptive preference is one", async () => {
+    const invoke = vi.fn<ProviderChatInvoker>(async () => result(JSON.stringify({
+      messages: [{ content: "one" }, { content: "two" }],
+      innerVoice: voice,
+    })));
+    const diagnostics: unknown[] = [];
+    const turn = await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false },
+      [{ role: "user", content: "short" }],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+      { mode: "adaptive", min: 1, max: 8, preferred: 1 },
+      (_attempt, value) => { diagnostics.push(value); },
+    );
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(turn.parts.map((part) => part.content)).toEqual(["one", "two"]);
+    expect(turn.targetCount).toBe(1);
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        preferredCount: 1,
+        rawMessageCount: 2,
+        finalMessageCount: 2,
+        countResolution: "unchanged",
+        countCompliant: true,
+      }),
+    ]);
+  });
 });

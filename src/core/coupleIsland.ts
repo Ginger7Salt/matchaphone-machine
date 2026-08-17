@@ -1,5 +1,5 @@
-﻿import { z } from "zod";
-import { invitationResponseTask, invitationResponseTargetCount } from "./invitationResponseTaskModel";
+import { z } from "zod";
+import { invitationResponseBubbleCountPlan, invitationResponseTask } from "./invitationResponseTaskModel";
 
 import { db } from "./db";
 import {localTimeContext} from "./localTime";
@@ -111,12 +111,14 @@ export async function createCoupleIslandInvitation(input: { conversationId: stri
   if (previousAttachment?.type === "couple-island-invitation" && previousAttachment.state === "declined" && (previousAttachment.processedAt ?? 0) + ISLAND_INVITE_RETRY_MS > now()) throw new Error("距离上次邀请还不到 24 小时");
   const at = now(), messageId = uid();
   const previousMessages = await db.messages.where("conversationId").equals(conversation.id).sortBy("createdAt");
+  const bubbleCountPlan = invitationResponseBubbleCountPlan(character, previousMessages);
   const task = invitationResponseTask({
     invitationType: "couple-island",
     invitationMessageId: messageId,
     conversationId: conversation.id,
     characterId: character.id,
-    targetBubbleCount: invitationResponseTargetCount(character, previousMessages),
+    targetBubbleCount: bubbleCountPlan.preferred,
+    bubbleCountPlan,
     createdAt: at,
   });
   const message: Message = {

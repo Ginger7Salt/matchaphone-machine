@@ -643,6 +643,24 @@ export type ChatProviderCallPurpose =
 export type ChatProviderTransportMode = "non-stream" | "sse" | "ndjson" | "json-fallback";
 export type ChatReplyWireFormat = "legacy" | "compact";
 export type ChatProviderTailKind = "quote" | "object-close" | "array-close" | "comma" | "colon" | "escape" | "other";
+export type ReplyBubbleCountMode = "adaptive" | "range" | "exact";
+export type ReplyBubbleCountResolution = "unchanged" | "merged" | "split" | "retry-required";
+export interface ReplyBubbleCountPlan {
+  mode: ReplyBubbleCountMode;
+  min: number;
+  max: number;
+  preferred: number;
+}
+export interface ReplyBubbleCountDiagnostics {
+  countMode: ReplyBubbleCountMode;
+  allowedMin: number;
+  allowedMax: number;
+  preferredCount: number;
+  rawMessageCount: number;
+  finalMessageCount: number;
+  countResolution: ReplyBubbleCountResolution;
+  countCompliant: boolean;
+}
 export interface ChatProviderCallTrace {
   ordinal: 1 | 2;
   purpose: ChatProviderCallPurpose;
@@ -669,7 +687,15 @@ export interface ChatProviderCallTrace {
   protocolValidationReached?: boolean;
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
-  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
+  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  countMode?: ReplyBubbleCountMode;
+  allowedMin?: number;
+  allowedMax?: number;
+  preferredCount?: number;
+  rawMessageCount?: number;
+  finalMessageCount?: number;
+  countResolution?: ReplyBubbleCountResolution;
+  countCompliant?: boolean;
 }
 export interface ChatGroupProviderCallBudget {
   providerCallLimit: 2;
@@ -699,10 +725,18 @@ export interface ChatReplyTaskPayload {
   generationCycle?: number;
   /** Provider calls made in the current generation cycle. */
   providerCallCount?: number;
-  /** Private-chat bubble target selected before the task starts. */
+  /** Private-chat bubble target selected before the task starts (legacy preference field). */
   targetBubbleCount?: number;
-  /** Per-speaker bubble targets selected before a group task starts. */
+  /** Per-speaker bubble targets selected before a group task starts (legacy preference field). */
   targetBubbleCounts?: Record<string, number>;
+  /** Persisted hard bubble-count plan for this generation cycle. */
+  bubbleCountPlan?: ReplyBubbleCountPlan;
+  /** Persisted hard bubble-count plans for group speakers. */
+  bubbleCountPlans?: Record<string, ReplyBubbleCountPlan>;
+  /** Sanitized count diagnostics for the private task. */
+  bubbleCountDiagnostics?: ReplyBubbleCountDiagnostics;
+  /** Sanitized count diagnostics for group speakers. */
+  bubbleCountDiagnosticsByActor?: Record<string, ReplyBubbleCountDiagnostics>;
   /** Shared private-chat limit; retained as a legacy field for group tasks. */
   providerCallLimit?: 2;
   /** Sanitized provider call lifecycle; never stores prompts or response text. */
@@ -710,7 +744,7 @@ export interface ChatReplyTaskPayload {
   /** Per-speaker provider budgets for group chat; optional for legacy rows. */
   groupProviderCallBudgets?: Record<string, ChatGroupProviderCallBudget>;
   /** Last deterministic failure stage, used only for status/diagnostics. */
-  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
+  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
   cancelled?: boolean;
 }
 export type InvitationResponseType = "couple-island" | "music";
@@ -726,6 +760,8 @@ export interface InvitationResponseTaskPayload {
   providerCallCount: number;
   providerCallTrace: ChatProviderCallTrace[];
   targetBubbleCount: number;
+  bubbleCountPlan?: ReplyBubbleCountPlan;
+  bubbleCountDiagnostics?: ReplyBubbleCountDiagnostics;
   cardSaved?: boolean;
   textSaved?: boolean;
   decision?: InvitationDecision;
@@ -1082,7 +1118,15 @@ export interface ApiErrorInfo {
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
   finishReason?: string;
-  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "persistence";
+  failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  countMode?: ReplyBubbleCountMode;
+  allowedMin?: number;
+  allowedMax?: number;
+  preferredCount?: number;
+  rawMessageCount?: number;
+  finalMessageCount?: number;
+  countResolution?: ReplyBubbleCountResolution;
+  countCompliant?: boolean;
   troubleshooting: string[];
 }
 export interface ContentTranslation {

@@ -9,11 +9,11 @@ import { resolveConversationProvider } from "./providerPresets";
 import { autoTranslateCharacter, completedTranslation } from "./bilingual";
 import { chatSettingsOf } from "./character";
 import { createMessageInnerVoice, innerVoiceContinuityContext } from "./innerVoice";
-import { replyBubblePlanOf, parseStrictReplyTurn, type GeneratedReplyTurn } from "./replyBubbles";
+import { replyBubbleCountPlanOf, parseStrictReplyTurn, type GeneratedReplyTurn } from "./replyBubbles";
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import { apiErrorInfoOf, createApiErrorInfo, OpenAIProvider, ProviderError, type ProviderChatResult } from "./provider";
-import { now, SCHEMA_VERSION, uid, type BackgroundTask, type Character, type ChatProviderCallPurpose, type ChatProviderCallTrace, type InvitationDecision, type InvitationResponseTaskPayload, type Message, type ProviderSettings } from "./types";
-import { invitationResponseCardId, invitationResponseTargetCount } from "./invitationResponseTaskModel";
+import { now, SCHEMA_VERSION, uid, type BackgroundTask, type Character, type ChatProviderCallPurpose, type ChatProviderCallTrace, type InvitationDecision, type InvitationResponseTaskPayload, type Message, type ProviderSettings, type ReplyBubbleCountDiagnostics, type ReplyBubbleCountPlan } from "./types";
+import { invitationResponseBubbleCountPlan, invitationResponseCardId } from "./invitationResponseTaskModel";
 import { executeCharacterMusicAction } from "./music";
 
 const LEASE_MS = 30_000;
@@ -77,6 +77,46 @@ async function finish(task: BackgroundTask, ordinal: 1 | 2, response?: ProviderC
     task.payload = next;
   });
 }
+async function recordInvitationCountDiagnostics(task: BackgroundTask, ordinal: 1 | 2, diagnostics: ReplyBubbleCountDiagnostics) {
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!owns(stored, task)) return;
+    const payload = payloadOf(stored!);
+    const providerCallTrace = payload.providerCallTrace.map((trace) =>
+      trace.ordinal === ordinal ? { ...trace, ...diagnostics } : trace,
+    );
+    const next: InvitationResponseTaskPayload = { ...payload, bubbleCountDiagnostics: diagnostics, providerCallTrace };
+    await db.backgroundTasks.update(task.id, { payload: next, leaseExpiresAt: now() + LEASE_MS, updatedAt: now() });
+    task.payload = next;
+  });
+}
+function invitationCountError(diagnostics: ReplyBubbleCountDiagnostics, response: ProviderChatResult) {
+  const message = diagnostics.countMode === "exact"
+    ? `角色回复未达到已设置的精确 ${diagnostics.allowedMin} 条气泡`
+    : `角色回复超出已设置的 ${diagnostics.allowedMin}–${diagnostics.allowedMax} 条范围，且无法在不改变内容的情况下安全调整`;
+  return new ProviderError("format", message, "", createApiErrorInfo("format", {
+    providerCode: "bubble_count_out_of_range",
+    failureStage: "bubble-count",
+    responseShape: response.responseShape,
+    rawLength: response.rawLength,
+    finishReason: response.finishReason,
+    parseStatus: response.parseStatus,
+    strictParseSucceeded: response.strictParseSucceeded,
+    repairAttempted: response.repairAttempted,
+    repairedParseSucceeded: response.repairedParseSucceeded,
+    outerContainerClosed: response.outerContainerClosed,
+    unterminatedString: response.unterminatedString,
+    hasMessages: response.hasMessages,
+    hasInnerVoice: response.hasInnerVoice,
+    wireFormat: response.wireFormat,
+    protocolValidationReached: true,
+    transportMode: response.transportMode,
+    receivedChars: response.receivedChars,
+    receivedBytes: response.receivedBytes,
+    tailKind: response.tailKind,
+    ...diagnostics,
+  }));
+}
 async function markFailed(task: BackgroundTask, error: unknown) {
   const apiError = apiErrorInfoOf(error) ?? createApiErrorInfo("format", { providerCode: "invalid_invitation_decision", failureStage: "role-protocol" });
   await db.transaction("rw", db.backgroundTasks, async () => {
@@ -98,16 +138,22 @@ async function markInvitationCardStatus(task: BackgroundTask, status: "queued" |
   });
   await db.messages.update(message.id, { attachments, updatedAt: now() });
 }
-function invitationPrompt(type: "couple-island" | "music", character: Character, targetCount: number, decisionRequired: boolean) {
+function bubbleCountPrompt(plan: ReplyBubbleCountPlan) {
+  if (plan.mode === "exact") return `在 m 中返回恰好 ${plan.preferred} 条有意义的后续文字气泡。`;
+  if (plan.mode === "range") return `在 m 中返回 ${plan.min}–${plan.max} 条有意义的后续文字气泡，建议接近 ${plan.preferred} 条，但不要为了凑数添加填充句。`;
+  return `在 m 中自然返回 1–8 条有意义的后续文字气泡，建议接近 ${plan.preferred} 条，但偏好数量不是硬性要求。`;
+}
+function invitationPrompt(type: "couple-island" | "music", character: Character, countPlan: ReplyBubbleCountPlan, decisionRequired: boolean) {
   const decision = type === "couple-island" ? "茶侣岛" : "一起听";
   return [
     `这是一次${decision}邀请回应。你是${character.name}，只根据人物设定、关系和当前上下文作出自然决定。`,
-    decisionRequired ? "必须在 d 中返回 {\"type\":\"accept\"} 或 {\"type\":\"decline\",\"reason\":\"简短自然的理由\"}。" : "d 已由本地决定，仍需返回 d 字段并使用 {\"type\":\"accept\"}。",
-    `必须在 m 中返回恰好 ${targetCount} 条有意义的后续文字气泡；不要在气泡中重复卡片标题或接受/拒绝决定。`,
-    "v 必须包含完整七段心声 s.p、s.e、s.u、s.d、s.r、s.a、s.x，以及连续情绪 q.e；所有字段都要是简短非空字符串。",
-    "不要输出系统说明、攻略模式、数值、卡片文本、JSON 之外的内容，也不要用无意义句子填充气泡。",
-    "只输出一个紧凑单行 JSON，不要 Markdown 代码围栏：",
-    '{"d":{"type":"accept"},"m":[{"c":"符合当前情境的文字","t":"必要译文"}],"v":{"s":{"p":"身体此刻","e":"情绪与心理","u":"没说出口的话","d":"嘴硬与自我欺骗","r":"被触发的回忆","a":"天使的想法","x":"恶魔的想法"},"q":{"e":"当前情绪"}}}',
+    decisionRequired ? `必须在 d 中返回 {"type":"accept"} 或 {"type":"decline","reason":"简短自然的理由"}。` : `d 已由本地决定，仍需返回 d 字段并使用 {"type":"accept"}。`,
+    bubbleCountPrompt(countPlan),
+    "不要在气泡中重复卡片标题或接受/拒绝决定，不要为了数量添加重复句、编号或无意义语气词。",
+    "m 中每一项就是一个完整聊天气泡；不要把单项中的完整句子按标点再次拆分。",
+    "v 必须包含完整七段心声 s.p、s.e、s.u、s.d、s.r、s.a、s.x，以及连续情绪 q.e；所有字段都是简短非空字符串。",
+    "只输出一个紧凑单行 JSON，不要 Markdown、代码围栏、解释或 JSON 之外的内容。",
+    JSON.stringify({ d: { type: "accept" }, m: [{ c: "符合当前情境的文字", t: "必要译文" }], v: { s: { p: "身体此刻", e: "情绪与心理", u: "没说出口的话", d: "嘴硬与自我欺骗", r: "被触发的回忆", a: "天使的想法", x: "恶魔的想法" }, q: { e: "当前情绪" } } }),
   ].join(" ");
 }
 async function contextFor(task: BackgroundTask, conversation: import("./types").Conversation, character: Character, provider: ProviderSettings, settings: import("./types").AppSettings, messages: Message[]) {
@@ -146,27 +192,32 @@ async function processInvitation(task: BackgroundTask, controller: AbortControll
   if (!invitation) throw new Error("找不到待回应的邀请卡片");
   const strategyRequired = payload.invitationType === "couple-island" ? characterSettings.strategyMode.enabled : true;
   const forcedDecision: InvitationDecision | undefined = payload.invitationType === "couple-island" && !strategyRequired ? { type: "accept" } : undefined;
-  const plan = { ...replyBubblePlanOf(character, context, "private"), targetCount: payload.targetBubbleCount };
+  const bubbleCountPlan = payload.bubbleCountPlan ?? replyBubbleCountPlanOf(character, context, "private", payload.targetBubbleCount);
   let decision: InvitationDecision | undefined;
   let turn: GeneratedReplyTurn | undefined;
   let textError: unknown;
   let lastError: unknown;
   const attempts = forcedDecision ? 1 : 2;
-  for (let attempt = 0; attempt < attempts && !decision; attempt++) {
+  for (let attempt = 0; attempt < attempts && (!decision || !turn); attempt++) {
     const ordinal = await reserve(task, attempt ? "regeneration" : "generation");
     try {
-      const request = { role: "user" as const, content: invitationPrompt(payload.invitationType, character, payload.targetBubbleCount, Boolean(strategyRequired)) + " " + (attempt ? "上一次决策没有完整解析；从头生成，不要续写。" : "") };
+      const retryNote = attempt ? "上一次回应的决策或文字没有完整通过校验；从头生成完整 JSON，不要续写。" : "";
+      const request = { role: "user" as const, content: invitationPrompt(payload.invitationType, character, bubbleCountPlan, Boolean(strategyRequired)) + " " + retryNote };
       const response = await new OpenAIProvider({ ...provider, stream: attempt === 1 }).chatWithMeta([...context, request], { stream: attempt === 1, signal: controller.signal, temperature: attempt ? 0.1 : provider.temperature, timeoutMs: null });
       await finish(task, ordinal, response);
-      decision = decisionFromRoot(rootOf(response), forcedDecision);
+      decision = decisionFromRoot(rootOf(response), decision ?? forcedDecision);
       try {
-        const parsedTurn = parseStrictReplyTurn(response.text, bilingual, plan.range, true, response, payload.targetBubbleCount);
-        if (!parsedTurn.compliant) throw new ProviderError("format", "角色回复条数不符合本轮目标数量");
+        const parsedTurn = parseStrictReplyTurn(response.text, bilingual, { min: bubbleCountPlan.min, max: bubbleCountPlan.max, adaptive: bubbleCountPlan.mode === "adaptive" }, true, response, bubbleCountPlan);
+        if (parsedTurn.countDiagnostics) await recordInvitationCountDiagnostics(task, ordinal, parsedTurn.countDiagnostics);
+        if (!parsedTurn.compliant) throw invitationCountError(parsedTurn.countDiagnostics!, response);
         turn = parsedTurn;
-      } catch (error) { textError = error; }
+        textError = undefined;
+      } catch (error) {
+        textError = error;
+      }
     } catch (error) {
       await finish(task, ordinal, undefined, error).catch(() => {});
-      if (forcedDecision) { decision = forcedDecision; textError = error; }
+      if (forcedDecision || decision) { decision = decision ?? forcedDecision; textError = error; }
       else lastError = error;
     }
   }
@@ -221,7 +272,8 @@ export async function ensureInvitationResponseTaskForMessage(messageId: string, 
   const eventId = `invitation-response:${type}:${messageId}`, existing = await db.backgroundTasks.where("eventId").equals(eventId).first();
   if (existing) return existing;
   const history = await db.messages.where("conversationId").equals(message.conversationId).filter((row) => row.createdAt < message.createdAt).toArray();
-  const task: BackgroundTask = { id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: now(), updatedAt: now(), type: "invitation-response", entityId: messageId, characterId, conversationId: message.conversationId, state: "pending", scheduledAt: now(), nextAttemptAt: now(), attempts: 0, eventId, payload: { invitationType: type, invitationMessageId: messageId, phase: "queued", generationCycle: 1, providerCallLimit: 2, providerCallCount: 0, providerCallTrace: [], targetBubbleCount: invitationResponseTargetCount(character, history) } };
+  const bubbleCountPlan = invitationResponseBubbleCountPlan(character, history);
+  const task: BackgroundTask = { id: uid(), schemaVersion: SCHEMA_VERSION, createdAt: now(), updatedAt: now(), type: "invitation-response", entityId: messageId, characterId, conversationId: message.conversationId, state: "pending", scheduledAt: now(), nextAttemptAt: now(), attempts: 0, eventId, payload: { invitationType: type, invitationMessageId: messageId, phase: "queued", generationCycle: 1, providerCallLimit: 2, providerCallCount: 0, providerCallTrace: [], targetBubbleCount: bubbleCountPlan.preferred, bubbleCountPlan } };
   await db.transaction("rw", [db.messages, db.backgroundTasks], async () => {
     if (await db.backgroundTasks.where("eventId").equals(eventId).first()) return;
     await db.messages.update(messageId, { attachments: message.attachments?.map((item) => item === attachment ? { ...item, responseStatus: "queued", responseTaskEventId: eventId } : item), updatedAt: now() });

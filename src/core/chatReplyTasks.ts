@@ -34,7 +34,8 @@ import { autoTranslateCharacter, completedTranslation } from "./bilingual";
 import { maybeAttachCharacterVoice } from "./speech";
 import {
   normalizeReplyBubbles,
-  replyBubblePlanOf,
+  normalizeStrictReplyBubbles,
+  replyBubbleCountPlanOf,
   replyBubbleRangeOf,
   type ReplyBubblePart,
 } from "./replyBubbles";
@@ -60,6 +61,8 @@ import {
   type ChatProviderCallPurpose,
   type ChatProviderCallTrace,
   type ChatReplyTaskPayload,
+  type ReplyBubbleCountDiagnostics,
+  type ReplyBubbleCountPlan,
   type Conversation,
   type LoreBook,
   type MediaAsset,
@@ -164,7 +167,16 @@ function groupBudgetOf(
     state: "pending",
   };
 }
-async function ensurePersistedBubbleTarget(
+function validPersistedBubbleCountPlan(value: unknown): value is ReplyBubbleCountPlan {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const plan = value as Partial<ReplyBubbleCountPlan>;
+  return (plan.mode === "adaptive" || plan.mode === "range" || plan.mode === "exact") &&
+    Number.isInteger(plan.min) && Number.isInteger(plan.max) && Number.isInteger(plan.preferred) &&
+    Number(plan.min) >= 1 && Number(plan.max) <= 8 && Number(plan.min) <= Number(plan.max) &&
+    Number(plan.preferred) >= Number(plan.min) && Number(plan.preferred) <= Number(plan.max);
+}
+
+async function ensurePersistedBubbleCountPlan(
   task: BackgroundTask,
   character: Character,
   context: Array<{ role: "system" | "user" | "assistant"; content: string }>,
@@ -172,35 +184,49 @@ async function ensurePersistedBubbleTarget(
   actorId?: string,
 ) {
   const initialPayload = taskPayload(task);
-  const existing = actorId
+  const existingPlan = actorId
+    ? initialPayload.bubbleCountPlans?.[actorId]
+    : initialPayload.bubbleCountPlan;
+  if (validPersistedBubbleCountPlan(existingPlan)) return existingPlan;
+  const legacyTarget = actorId
     ? initialPayload.targetBubbleCounts?.[actorId]
     : initialPayload.targetBubbleCount;
-  if (Number.isInteger(existing) && Number(existing) > 0) return Number(existing);
-  const selected = replyBubblePlanOf(character, context, scene).targetCount;
-  let target = selected;
+  const selected = replyBubbleCountPlanOf(character, context, scene, legacyTarget);
+  let countPlan = selected;
   await db.transaction("rw", db.backgroundTasks, async () => {
     const stored = await db.backgroundTasks.get(task.id);
     if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
     const payload = taskPayload(stored!);
+    const storedPlan = actorId
+      ? payload.bubbleCountPlans?.[actorId]
+      : payload.bubbleCountPlan;
     const storedTarget = actorId
       ? payload.targetBubbleCounts?.[actorId]
       : payload.targetBubbleCount;
-    target = Number.isInteger(storedTarget) && Number(storedTarget) > 0
-      ? Number(storedTarget)
-      : selected;
+    countPlan = validPersistedBubbleCountPlan(storedPlan)
+      ? storedPlan
+      : replyBubbleCountPlanOf(character, context, scene, storedTarget ?? selected.preferred);
     const nextPayload: ChatReplyTaskPayload = actorId
       ? {
           ...payload,
           targetBubbleCounts: {
             ...(payload.targetBubbleCounts ?? {}),
-            [actorId]: target,
+            [actorId]: countPlan.preferred,
+          },
+          bubbleCountPlans: {
+            ...(payload.bubbleCountPlans ?? {}),
+            [actorId]: countPlan,
           },
         }
-      : { ...payload, targetBubbleCount: target };
+      : {
+          ...payload,
+          targetBubbleCount: countPlan.preferred,
+          bubbleCountPlan: countPlan,
+        };
     await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
     task.payload = nextPayload;
   });
-  return target;
+  return countPlan;
 }
 
 async function reserveProviderCall(
@@ -343,6 +369,49 @@ async function finishProviderCall(
     task.payload = nextPayload;
   });
 }
+async function recordBubbleCountValidation(
+  task: BackgroundTask,
+  ordinal: 1 | 2,
+  diagnostics: ReplyBubbleCountDiagnostics,
+  actorId?: string,
+) {
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(stored, task)) return;
+    const payload = taskPayload(stored!);
+    let nextPayload: ChatReplyTaskPayload;
+    if (payload.mode === "group" && actorId) {
+      const budget = groupBudgetOf(payload, actorId);
+      nextPayload = {
+        ...payload,
+        groupProviderCallBudgets: {
+          ...(payload.groupProviderCallBudgets ?? {}),
+          [actorId]: {
+            ...budget,
+            providerCallTrace: budget.providerCallTrace.map((trace) =>
+              trace.ordinal === ordinal ? { ...trace, ...diagnostics } : trace,
+            ),
+          },
+        },
+        bubbleCountDiagnosticsByActor: {
+          ...(payload.bubbleCountDiagnosticsByActor ?? {}),
+          [actorId]: diagnostics,
+        },
+      };
+    } else {
+      nextPayload = {
+        ...payload,
+        providerCallTrace: (payload.providerCallTrace ?? []).map((trace) =>
+          trace.ordinal === ordinal ? { ...trace, ...diagnostics } : trace,
+        ),
+        bubbleCountDiagnostics: diagnostics,
+      };
+    }
+    await db.backgroundTasks.update(task.id, { payload: nextPayload, updatedAt: now() });
+    task.payload = nextPayload;
+  });
+}
+
 function providerInvokerForTask(
   task: BackgroundTask,
   allowCompleted = false,
@@ -584,18 +653,22 @@ export async function ensureRunnableChatReplyTask(
     role: (message.senderType === "user" ? "user" : "assistant") as "user" | "assistant",
     content: message.content,
   }));
-  const targetBubbleCount = input.mode === "private"
-    ? replyBubblePlanOf(sender, bubbleContext, "private").targetCount
+  const bubbleCountPlan = input.mode === "private"
+    ? replyBubbleCountPlanOf(sender, bubbleContext, "private")
     : undefined;
-  const targetBubbleCounts = input.mode === "group"
+  const bubbleCountPlans = input.mode === "group"
     ? Object.fromEntries(
         (speakerOrder ?? []).flatMap((speakerId) => {
           const actor = actors.find((item) => item.id === speakerId);
           return actor
-            ? [[speakerId, replyBubblePlanOf(actor.character, bubbleContext, "group").targetCount]]
+            ? [[speakerId, replyBubbleCountPlanOf(actor.character, bubbleContext, "group")]]
             : [];
         }),
       )
+    : undefined;
+  const targetBubbleCount = bubbleCountPlan?.preferred;
+  const targetBubbleCounts = bubbleCountPlans
+    ? Object.fromEntries(Object.entries(bubbleCountPlans).map(([speakerId, plan]) => [speakerId, plan.preferred]))
     : undefined;
   const generation = {
     model: provider.model,
@@ -664,6 +737,8 @@ export async function ensureRunnableChatReplyTask(
     providerCallTrace: [],
     targetBubbleCount,
     targetBubbleCounts,
+    bubbleCountPlan,
+    bubbleCountPlans,
     groupProviderCallBudgets: input.mode === "group" ? {} : undefined,
     originalMessage: target && !originalMessages ? { ...target } : undefined,
     originalMessages: originalMessages?.map((message) => ({ ...message })),
@@ -1324,7 +1399,7 @@ async function processPrivate(
     });
   const continuityContext = innerVoiceContinuityContext(history, character.id);
   if (continuityContext) ctx.push({ role: "system", content: continuityContext });
-  const targetBubbleCount = await ensurePersistedBubbleTarget(task, character, ctx, "private");
+  const bubbleCountPlan = await ensurePersistedBubbleCountPlan(task, character, ctx, "private");
   const listeningContext = await buildListeningContext(conversation.id);
   const listeningSession = listeningContext?.sessionId ? await db.listeningSessions.get(listeningContext.sessionId) : undefined;
   const listeningTask = listeningSession?.invitationMessageId ? await db.backgroundTasks.where("eventId").equals(`invitation-response:music:${listeningSession.invitationMessageId}`).first() : undefined;
@@ -1357,8 +1432,9 @@ async function processPrivate(
     })),
     undefined,
     providerInvokerForTask(task),
-      targetBubbleCount,
-    );
+    bubbleCountPlan,
+    (attempt, diagnostics) => recordBubbleCountValidation(task, attempt, diagnostics).catch(() => {}),
+  );
     let parts = generatedTurn.parts,
     innerVoice: GeneratedInnerVoice | undefined = generatedTurn.innerVoice;
   await updatePhase(task, "validating");
@@ -1391,7 +1467,7 @@ async function processPrivate(
         innerVoiceRequired: payload.innerVoiceRequired ?? true,
         presence,
         crossModeContinuity,
-        targetCount: generatedTurn.targetCount,
+        targetCount: parts.length,
         signal: controller.signal,
         invokeProvider: providerInvokerForTask(task),
       }),
@@ -1401,10 +1477,10 @@ async function processPrivate(
           ? review.revisedTranslations?.[index]
           : undefined,
       })),
-      normalized = normalizeReplyBubbles(
+      normalized = normalizeStrictReplyBubbles(
         revised,
         replyBubbleRangeOf(character),
-        generatedTurn.targetCount,
+        { mode: "exact", min: parts.length, max: parts.length, preferred: parts.length },
       );
     if (
       !normalized.compliant ||
@@ -1790,7 +1866,7 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         crossModeContinuity,
         timeAt: generationTime,
       });
-    const targetBubbleCount = await ensurePersistedBubbleTarget(
+    const bubbleCountPlan = await ensurePersistedBubbleCountPlan(
       task,
       speaker.character,
       ctx,
@@ -1823,9 +1899,10 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         name,
         description,
       })),
-    undefined,
-    providerInvokerForTask(task, false, speaker.id),
-      targetBubbleCount,
+      undefined,
+      providerInvokerForTask(task, false, speaker.id),
+      bubbleCountPlan,
+      (attempt, diagnostics) => recordBubbleCountValidation(task, attempt, diagnostics, speaker.id).catch(() => {}),
     );
     let parts: Array<{ content: string; translation?: string }> =
         generatedTurn.parts,
@@ -1862,11 +1939,11 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         innerVoiceRequired: payload.innerVoiceRequired ?? true,
         presence,
         crossModeContinuity,
-        targetCount: generatedTurn.targetCount,
+        targetCount: parts.length,
         signal: controller.signal,
         invokeProvider: providerInvokerForTask(task, false, speaker.id),
       });
-      const revised = review.revisedMessages.slice(0, 6);
+      const revised = review.revisedMessages;
       if (bilingual) {
         const translated = (review.revisedTranslations ?? []).slice(
           0,
@@ -1883,8 +1960,8 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         }));
       } else parts = revised.map((content) => ({ content }));
       innerVoice = review.revisedInnerVoice;
-      if (generatedTurn.targetCount !== undefined && parts.length !== generatedTurn.targetCount)
-        throw new ProviderError("format", "审查后的群聊回复条数不符合本轮目标数量");
+      if (parts.length !== drafts.length)
+        throw new ProviderError("format", "\u5ba1\u67e5\u540e\u7684\u7fa4\u804a\u56de\u590d\u672a\u4fdd\u6301\u5df2\u63a5\u53d7\u7684\u6c14\u6ce1\u6570\u91cf");
       if ((payload.innerVoiceRequired ?? true) && !innerVoice) {
         throw new ProviderError("format", "\u7fa4\u804a\u89d2\u8272\u5fc3\u58f0\u7f3a\u5931\uff0c\u6574\u8f6e\u56de\u590d\u9700\u8981\u91cd\u65b0\u751f\u6210");
       }
@@ -2292,6 +2369,17 @@ export async function chatReplyDiagnostic(eventId: string) {
       completeVisibleFieldRecovered: payload?.lastApiError?.completeVisibleFieldRecovered ?? placeholder?.generation?.apiError?.completeVisibleFieldRecovered,
       finishReason: payload?.lastApiError?.finishReason ?? placeholder?.generation?.apiError?.finishReason,
       tailKind: payload?.lastApiError?.tailKind ?? placeholder?.generation?.apiError?.tailKind,
+      countMode: payload?.bubbleCountDiagnostics?.countMode ?? payload?.lastApiError?.countMode,
+      allowedMin: payload?.bubbleCountDiagnostics?.allowedMin ?? payload?.lastApiError?.allowedMin,
+      allowedMax: payload?.bubbleCountDiagnostics?.allowedMax ?? payload?.lastApiError?.allowedMax,
+      preferredCount: payload?.bubbleCountDiagnostics?.preferredCount ?? payload?.lastApiError?.preferredCount,
+      rawMessageCount: payload?.bubbleCountDiagnostics?.rawMessageCount ?? payload?.lastApiError?.rawMessageCount,
+      finalMessageCount: payload?.bubbleCountDiagnostics?.finalMessageCount ?? payload?.lastApiError?.finalMessageCount,
+      countResolution: payload?.bubbleCountDiagnostics?.countResolution ?? payload?.lastApiError?.countResolution,
+      countCompliant: payload?.bubbleCountDiagnostics?.countCompliant ?? payload?.lastApiError?.countCompliant,
+      bubbleCountPlan: payload?.bubbleCountPlan,
+      bubbleCountDiagnostics: payload?.bubbleCountDiagnostics,
+      bubbleCountDiagnosticsByActor: payload?.bubbleCountDiagnosticsByActor,
       lastError: task.lastError,
     },
     null,

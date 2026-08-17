@@ -1,11 +1,12 @@
 import { z } from "zod";
 import { createApiErrorInfo, OpenAIProvider, ProviderError, isContextOverflowError, type ProviderChatInvoker } from "./provider";
 import { coreSettingOf, personaOf } from "./character";
-import type { Character, Message, ProviderSettings } from "./types";
+import type { Character, Message, ProviderSettings, ReplyBubbleCountDiagnostics, ReplyBubbleCountPlan } from "./types";
 import type { ChatItem } from "./context";
 import { compactChatItemsForRetry, fitChatItemsToInternalBudget } from "./tokenBudget";
 import {
   parseStrictReplyTurn,
+  replyBubbleCountPlanOf,
   replyBubbleInstruction,
   replyBubblePlanOf,
   type GeneratedReplyTurn,
@@ -103,10 +104,21 @@ export async function generateCharacterReplyTurn(
   stickerCatalog: ReplyStickerCatalogItem[] = [],
   onProviderAttempt?: (attempt: number) => void | Promise<void>,
   invokeProvider?: ProviderChatInvoker,
-  targetCountOverride?: number,
+  countPlanOverride?: ReplyBubbleCountPlan | number,
+  onCountValidation?: (attempt: 1 | 2, diagnostics: ReplyBubbleCountDiagnostics) => void | Promise<void>,
 ): Promise<GeneratedReplyTurn> {
   const basePlan = replyBubblePlanOf(character, context, scene),
-    plan = targetCountOverride === undefined ? basePlan : { ...basePlan, targetCount: targetCountOverride },
+    countPlan = typeof countPlanOverride === "object"
+      ? countPlanOverride
+      : typeof countPlanOverride === "number"
+        ? { mode: "exact" as const, min: countPlanOverride, max: countPlanOverride, preferred: countPlanOverride }
+        : replyBubbleCountPlanOf(character, context, scene),
+    plan = {
+      ...basePlan,
+      range: { min: countPlan.min, max: countPlan.max, adaptive: countPlan.mode === "adaptive" },
+      adaptive: countPlan.mode === "adaptive",
+      targetCount: countPlan.preferred,
+    },
     range = plan.range;
   let lastFormatError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -170,10 +182,42 @@ export async function generateCharacterReplyTurn(
         range,
         innerVoiceRequired,
         response,
-        plan.targetCount,
+        countPlan,
       );
-      if (normalized.compliant) return { ...normalized, targetCount: plan.targetCount };
-      lastFormatError = new ProviderError("format", "角色回复条数不符合本轮目标数量");
+      if (normalized.countDiagnostics)
+        await onCountValidation?.((attempt + 1) as 1 | 2, normalized.countDiagnostics);
+      if (normalized.compliant)
+        return { ...normalized, targetCount: countPlan.preferred, countPlan };
+      const diagnostics = normalized.countDiagnostics;
+      lastFormatError = new ProviderError(
+        "format",
+        countPlan.mode === "exact"
+          ? "\u89d2\u8272\u56de\u590d\u672a\u8fbe\u5230\u5df2\u8bbe\u7f6e\u7684\u7cbe\u786e\u6c14\u6ce1\u6570\u91cf"
+          : `\u89d2\u8272\u56de\u590d\u8d85\u51fa\u5df2\u8bbe\u7f6e\u7684 ${countPlan.min}?${countPlan.max} \u6761\u8303\u56f4\uff0c\u4e14\u65e0\u6cd5\u5728\u4e0d\u6539\u53d8\u5185\u5bb9\u7684\u60c5\u51b5\u4e0b\u5b89\u5168\u8c03\u6574`,
+        "",
+        createApiErrorInfo("format", {
+          providerCode: "bubble_count_out_of_range",
+          failureStage: "bubble-count",
+          responseShape: response.responseShape,
+          rawLength: response.rawLength,
+          finishReason: response.finishReason,
+          parseStatus: response.parseStatus,
+          strictParseSucceeded: response.strictParseSucceeded,
+          repairAttempted: response.repairAttempted,
+          repairedParseSucceeded: response.repairedParseSucceeded,
+          outerContainerClosed: response.outerContainerClosed,
+          unterminatedString: response.unterminatedString,
+          hasMessages: response.hasMessages,
+          hasInnerVoice: response.hasInnerVoice,
+          wireFormat: response.wireFormat,
+          protocolValidationReached: true,
+          transportMode: response.transportMode,
+          receivedChars: response.receivedChars,
+          receivedBytes: response.receivedBytes,
+          tailKind: response.tailKind,
+          ...diagnostics,
+        }),
+      );
     } catch (error) {
       if (error instanceof ProviderError && error.kind === "aborted") throw error;
       if (!(error instanceof ProviderError) || (error.kind !== "format" && !isContextOverflowError(error)))
