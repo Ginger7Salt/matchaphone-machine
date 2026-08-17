@@ -24,6 +24,7 @@ import {
   generateMeetTurn,
   meetEntryPlainText,
   regenerateMeetCharacterEntry,
+  regenerateMeetRound,
   retryFailedMeetTurn,
   toggleMeetEntryFavorite,
   updateMeetScene,
@@ -139,7 +140,20 @@ export default function MeetSessionPage() {
     suggestions = lastSuggestions(session.entries),
     selected = session.entries.find((entry) => entry.id === selectedEntryId),
     editing = session.entries.find((entry) => entry.id === editingEntryId),
-    deleting = session.entries.find((entry) => entry.id === deletingEntryId);
+    deleting = session.entries.find((entry) => entry.id === deletingEntryId),
+    hasRoundResponse = (entry: MeetEntry) =>
+      session.entries.some(
+        (candidate) =>
+          candidate.senderType === "character" &&
+          candidate.roundId === entry.roundId,
+      ),
+    isLegacyFalseSavingFailure = (entry: MeetEntry) =>
+      entry.generation?.protocol !== "unified-round-v1" &&
+      entry.generation?.status === "failed" &&
+      entry.generation?.stage === "saving" &&
+      entry.generation?.saveResult === "failed" &&
+      !entry.generation?.rawLength &&
+      !hasRoundResponse(entry);
   const send = async () => {
     if (!text.trim() || generating || ended) return;
     const value = text;
@@ -151,9 +165,7 @@ export default function MeetSessionPage() {
       const result = await generateMeetTurn(id, value, controller.current.signal);
       await reload();
       if (result.warning) setToast(result.warning);
-    } catch (e) {
-      if (!(e instanceof Error && e.message.includes("停止")))
-        setError(e instanceof Error ? e.message : "生成失败");
+    } catch {
       await reload();
     } finally {
       setGenerating(false);
@@ -218,10 +230,43 @@ export default function MeetSessionPage() {
     await toggleMeetEntryFavorite(id, entryId);
     await reload();
   };
+  const roundEntriesOf = (roundId: string) =>
+    session.entries.filter(
+      (entry) => entry.roundId === roundId && entry.senderType !== "user",
+    );
+  const isLastUnifiedDialogue = (entry: MeetEntry) => {
+    if (entry.format !== "unified-round-v1" || entry.senderType !== "character")
+      return false;
+    return (
+      [...roundEntriesOf(entry.roundId)]
+        .reverse()
+        .find((candidate) => candidate.senderType === "character")?.id === entry.id
+    );
+  };
+  const isFirstCharacterInRound = (entry: MeetEntry) =>
+    session.entries.find(
+      (candidate) =>
+        candidate.roundId === entry.roundId &&
+        candidate.senderType === "character",
+    )?.id === entry.id;
   const copy = async (entry: MeetEntry) => {
     try {
-      await navigator.clipboard.writeText(meetEntryPlainText(entry));
-      setToast("已复制帖子");
+      const content =
+        entry.format === "unified-round-v1"
+          ? roundEntriesOf(entry.roundId)
+              .map((item) => {
+                if (item.senderType === "system")
+                  return meetEntryPlainText(item);
+                const name = characterMap.get(item.senderId ?? "")?.name ?? "角色";
+                return `${name}：${meetEntryPlainText(item)}`;
+              })
+              .filter(Boolean)
+              .join("\n\n")
+          : meetEntryPlainText(entry);
+      await navigator.clipboard.writeText(content);
+      setToast(
+        entry.format === "unified-round-v1" ? "已复制整轮场景" : "已复制帖子",
+      );
     } catch {
       setToast("复制失败，请长按正文复制");
     }
@@ -265,9 +310,7 @@ export default function MeetSessionPage() {
       await reload();
       if (result.warning) setToast(result.warning);
       else setToast("\u5df2\u91cd\u65b0\u751f\u6210\u8fd9\u4e00\u8f6e");
-    } catch (e) {
-      if (!(e instanceof Error && e.message.includes("\u505c\u6b62")))
-        setError(e instanceof Error ? e.message : "\u91cd\u65b0\u751f\u6210\u5931\u8d25");
+    } catch {
       await reload();
     } finally {
       setGenerating(false);
@@ -277,8 +320,21 @@ export default function MeetSessionPage() {
   const copyGenerationDiagnostic = async (entry: MeetEntry) => {
     const generation = entry.generation;
     if (!generation) return;
+    const attemptLines = (generation.attempts ?? []).flatMap((attempt) => [
+      `attempt${attempt.ordinal}.stage=${attempt.stage}`,
+      `attempt${attempt.ordinal}.responseShape=${attempt.responseShape ?? "unknown"}`,
+      `attempt${attempt.ordinal}.rawLength=${attempt.rawLength ?? "unknown"}`,
+      `attempt${attempt.ordinal}.outputTokens=${attempt.outputTokens ?? "unknown"}`,
+      `attempt${attempt.ordinal}.finishReason=${attempt.finishReason ?? "unknown"}`,
+      `attempt${attempt.ordinal}.truncated=${Boolean(attempt.truncated)}`,
+      `attempt${attempt.ordinal}.inputTokens=${attempt.inputTokens ?? "unknown"}`,
+      `attempt${attempt.ordinal}.errorKind=${attempt.errorKind ?? "none"}`,
+      `attempt${attempt.ordinal}.providerCode=${attempt.providerCode ?? "none"}`,
+    ]);
     const diagnostic = [
       "feature=meet",
+      "protocol=" + (generation.protocol ?? "legacy"),
+      "runId=" + (generation.runId ?? "legacy"),
       "stage=" + (generation.stage ?? "unknown"),
       "model=" + (generation.model ?? "unknown"),
       "responseShape=" + (generation.responseShape ?? "unknown"),
@@ -290,82 +346,124 @@ export default function MeetSessionPage() {
       "loreInjected=" + (generation.injectedLoreEntries ?? "unknown"),
       "loreSkipped=" + (generation.skippedLoreEntries ?? "unknown"),
       "saveResult=" + (generation.saveResult ?? "unknown"),
+      ...attemptLines,
     ].join("\n");
     try {
       await navigator.clipboard.writeText(diagnostic);
-      setToast("\u5df2\u590d\u5236\u8131\u654f\u8bca\u65ad");
+      setToast("已复制脱敏诊断");
     } catch {
-      setToast("\u590d\u5236\u5931\u8d25");
+      setToast("复制失败");
     }
   };
-  const regenerate = async (entryId: string) => {
+  const regenerate = async (entry: MeetEntry) => {
     setSelectedEntryId(null);
-    setRegeneratingId(entryId);
+    const key =
+      entry.format === "unified-round-v1"
+        ? `round:${entry.roundId}`
+        : entry.id;
+    setRegeneratingId(key);
     setError("");
     const aborter = new AbortController();
     controller.current = aborter;
     try {
-      await regenerateMeetCharacterEntry(id, entryId, aborter.signal);
+      if (entry.format === "unified-round-v1")
+        await regenerateMeetRound(id, entry.roundId, aborter.signal);
+      else await regenerateMeetCharacterEntry(id, entry.id, aborter.signal);
       await reload();
-      setToast("已重新写好这一段");
+      setToast(
+        entry.format === "unified-round-v1"
+          ? "已重新生成整轮场景"
+          : "已重新写好这一段",
+      );
     } catch (e) {
+      await reload();
       if (!(e instanceof Error && e.message.includes("停止")))
-        setError(e instanceof Error ? e.message : "重新生成失败");
+        setToast(
+          entry.format === "unified-round-v1"
+            ? e instanceof Error
+              ? e.message
+              : "整轮重新生成未完成，已保留原场景"
+            : e instanceof Error
+              ? e.message
+              : "重新生成失败",
+        );
     } finally {
       setRegeneratingId(null);
       controller.current = null;
     }
   };
-  const postActions = (entry: MeetEntry) => (
-    <div className="thread-post-actions">
-      <button
-        className={entry.favoritedAt ? "favorited" : ""}
-        aria-label={entry.favoritedAt ? "取消收藏" : "收藏帖子"}
-        aria-pressed={Boolean(entry.favoritedAt)}
-        onClick={() => void favorite(entry.id)}
-      >
-        <Heart fill={entry.favoritedAt ? "currentColor" : "none"} />
-      </button>
-      {entry.senderType === "character" ? (
+  const postActions = (entry: MeetEntry) => {
+    const regenerationKey =
+        entry.format === "unified-round-v1"
+          ? `round:${entry.roundId}`
+          : entry.id,
+      showThought =
+        entry.senderType === "character" &&
+        (entry.format !== "unified-round-v1" || Boolean(entry.thought?.trim())),
+      showRegenerate =
+        entry.senderType === "character" &&
+        (entry.format !== "unified-round-v1" || isLastUnifiedDialogue(entry));
+    return (
+      <div className="thread-post-actions">
         <button
-          className={`thread-thought-toggle ${thoughtEntryId === entry.id ? "active" : ""}`}
-          aria-label={
-            thoughtEntryId === entry.id ? "收起角色思维" : "查看角色思维"
-          }
-          aria-expanded={thoughtEntryId === entry.id}
-          onClick={() =>
-            setThoughtEntryId((current) =>
-              current === entry.id ? null : entry.id,
-            )
-          }
+          className={entry.favoritedAt ? "favorited" : ""}
+          aria-label={entry.favoritedAt ? "取消收藏" : "收藏帖子"}
+          aria-pressed={Boolean(entry.favoritedAt)}
+          onClick={() => void favorite(entry.id)}
         >
-          <MessageCircle
-            fill={thoughtEntryId === entry.id ? "currentColor" : "none"}
-          />
+          <Heart fill={entry.favoritedAt ? "currentColor" : "none"} />
         </button>
-      ) : (
-        <span aria-label="评论">
-          <MessageCircle />
+        {showThought ? (
+          <button
+            className={`thread-thought-toggle ${thoughtEntryId === entry.id ? "active" : ""}`}
+            aria-label={
+              thoughtEntryId === entry.id ? "收起角色思维" : "查看角色思维"
+            }
+            aria-expanded={thoughtEntryId === entry.id}
+            onClick={() =>
+              setThoughtEntryId((current) =>
+                current === entry.id ? null : entry.id,
+              )
+            }
+          >
+            <MessageCircle
+              fill={thoughtEntryId === entry.id ? "currentColor" : "none"}
+            />
+          </button>
+        ) : (
+          <span aria-label="评论">
+            <MessageCircle />
+          </span>
+        )}
+        {showRegenerate && (
+          <button
+            className={`thread-regenerate-button ${regeneratingId === regenerationKey ? "loading" : ""}`}
+            aria-label={
+              regeneratingId === regenerationKey
+                ? "正在重新生成"
+                : entry.format === "unified-round-v1"
+                  ? "重新生成整轮"
+                  : "重新生成这一段"
+            }
+            disabled={ended || generating || Boolean(regeneratingId)}
+            onClick={() => void regenerate(entry)}
+          >
+            <RefreshCw />
+            <span>
+              {regeneratingId === regenerationKey
+                ? "生成中"
+                : entry.format === "unified-round-v1"
+                  ? "重新生成整轮"
+                  : "重新生成"}
+            </span>
+          </button>
+        )}
+        <span aria-label="分享">
+          <Send />
         </span>
-      )}
-      {entry.senderType === "character" && (
-        <button
-          className={`thread-regenerate-button ${regeneratingId === entry.id ? "loading" : ""}`}
-          aria-label={
-            regeneratingId === entry.id ? "正在重新生成" : "重新生成这一段"
-          }
-          disabled={ended || generating || Boolean(regeneratingId)}
-          onClick={() => void regenerate(entry.id)}
-        >
-          <RefreshCw />
-          <span>{regeneratingId === entry.id ? "生成中" : "重新生成"}</span>
-        </button>
-      )}
-      <span aria-label="分享">
-        <Send />
-      </span>
-    </div>
-  );
+      </div>
+    );
+  };
   const postHeader = (entry: MeetEntry, name: string) => (
     <header>
       <b>{name}</b>
@@ -406,7 +504,11 @@ export default function MeetSessionPage() {
       </header>
       <main className="meet-transcript threads-feed">
         {session.entries
-          .filter((entry) => entry.senderType !== "system")
+          .filter(
+            (entry) =>
+              entry.senderType !== "system" ||
+              entry.format === "unified-round-v1",
+          )
           .map((entry) =>
             entry.senderType === "user" ? (
               <article
@@ -430,9 +532,9 @@ export default function MeetSessionPage() {
                   {entry.generation?.status === "partial" && (
                     <p className="meet-generation-status">部分角色本轮保持安静</p>
                   )}
-                  {entry.generation?.status === "failed" && !session.entries.some((candidate) => candidate.senderType === "character" && candidate.roundId === entry.roundId) && (
+                  {entry.generation?.status === "failed" && !hasRoundResponse(entry) && (
                     <div className="meet-generation-failure" role="alert">
-                      <span>{entry.generation.error ?? "\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5"}</span>
+                      <span>{isLegacyFalseSavingFailure(entry) ? "旧版生成未完成" : entry.generation.error ?? "本轮场景生成未完成，请重试"}</span>
                       <div>
                         <button type="button" disabled={generating} onClick={() => void retryFailedTurn(entry.id)}>
                           {generating ? "\u751f\u6210\u4e2d" : "\u91cd\u65b0\u751f\u6210"}
@@ -446,10 +548,21 @@ export default function MeetSessionPage() {
                   {postActions(entry)}
                 </div>
               </article>
+            ) : entry.senderType === "system" ? (
+              <article
+                id={`meet-entry-${entry.id}`}
+                className={`meet-round-narration ${targetEntryId === entry.id ? "targeted" : ""}`}
+                key={entry.id}
+              >
+                <div className="meet-round-narration-line" aria-hidden="true" />
+                <div className="meet-round-narration-copy">
+                  <Paragraphs text={entry.narration ?? entry.content} />
+                </div>
+              </article>
             ) : (
               <article
                 id={`meet-entry-${entry.id}`}
-                className={`thread-post character-thread ${targetEntryId === entry.id ? "targeted" : ""}`}
+                className={`thread-post character-thread ${entry.format === "unified-round-v1" ? "unified-round-dialogue" : ""} ${targetEntryId === entry.id ? "targeted" : ""}`}
                 key={entry.id}
               >
                 <div className="thread-rail">
@@ -467,11 +580,14 @@ export default function MeetSessionPage() {
                   <div className="thread-prose">
                     <Paragraphs
                       text={[
-                        session.entries.find(
-                          (item) =>
-                            item.senderType === "system" &&
-                            item.roundId === entry.roundId,
-                        )?.narration,
+                        entry.format === "unified-round-v1" ||
+                        !isFirstCharacterInRound(entry)
+                          ? undefined
+                          : session.entries.find(
+                              (item) =>
+                                item.senderType === "system" &&
+                                item.roundId === entry.roundId,
+                            )?.narration,
                         entry.narration,
                         entry.prose,
                         entry.appearance,
@@ -499,10 +615,10 @@ export default function MeetSessionPage() {
                       )}
                     </div>
                   )}
-                  {regeneratingId === entry.id && (
+                  {regeneratingId === (entry.format === "unified-round-v1" ? `round:${entry.roundId}` : entry.id) && (
                     <div className="thread-regenerating">
                       <RefreshCw />
-                      正在重新写这一段…
+                      {entry.format === "unified-round-v1" ? "正在重新生成整轮场景…" : "正在重新写这一段…"}
                     </div>
                   )}
                   {postActions(entry)}
@@ -629,7 +745,7 @@ export default function MeetSessionPage() {
             </header>
             <button onClick={() => void copy(selected)}>
               <Copy />
-              复制正文
+              {selected.format === "unified-round-v1" ? "复制整轮" : "复制正文"}
             </button>
             {!ended && selected.senderType === "user" && (
               <button onClick={() => startEdit(selected)}>
@@ -640,10 +756,12 @@ export default function MeetSessionPage() {
             {!ended && selected.senderType === "character" && (
               <button
                 disabled={Boolean(regeneratingId)}
-                onClick={() => void regenerate(selected.id)}
+                onClick={() => void regenerate(selected)}
               >
                 <RefreshCw />
-                重新生成这一段
+                {selected.format === "unified-round-v1"
+                  ? "重新生成整轮"
+                  : "重新生成这一段"}
               </button>
             )}
             {!ended && (
@@ -753,7 +871,7 @@ export default function MeetSessionPage() {
               />
             </label>
             <fieldset className="meet-length-settings">
-              <legend>每位角色描写篇幅</legend>
+              <legend>每轮场景总篇幅</legend>
               <div>
                 <label>
                   最少字数
@@ -786,7 +904,7 @@ export default function MeetSessionPage() {
                 </label>
               </div>
               <small>
-                群体见面按每位实际回复角色计算；不设固定最高值，但实际输出仍受模型上下文、最大 Token、网络和等待时间限制。
+                单人和多人都按本轮共享描写与全部角色台词的可见正文合计；思想、译文和 JSON 字段不计入篇幅。
               </small>
             </fieldset>
             <section className="meet-perspective-settings">
@@ -810,7 +928,7 @@ export default function MeetSessionPage() {
                 ))}
               </div>
               <small>
-                第三人称为默认；多人见面时第一人称会按每位角色分别叙述。
+                第三人称为默认；多人见面会使用一段连续场景，并按顺序区分每位角色的发言。
               </small>
             </section>
             <label className="switch-row meet-thought-chain-setting">
@@ -925,5 +1043,3 @@ export default function MeetSessionPage() {
     </div>
   );
 }
-
-

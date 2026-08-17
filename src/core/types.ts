@@ -1506,6 +1506,26 @@ export interface MeetResponderPlan {
   };
   sharedEnvironmentChange?: string;
 }
+export type MeetRoundSegment =
+  | { type: "narration"; text: string }
+  | { type: "dialogue"; characterId: string; text: string; translation?: string };
+export interface MeetRoundPayload {
+  version: 1;
+  segments: MeetRoundSegment[];
+  thoughts?: Array<{
+    characterId: string;
+    text: string;
+    translation?: string;
+  }>;
+  updates?: Array<{
+    characterId: string;
+    scenePatch?: MeetScenePatch;
+    plotProgress?: MeetPlotProgress;
+  }>;
+  suggestions?: string[];
+  warnings?: string[];
+}
+
 export interface MeetEntry {
   id: string;
   roundId: string;
@@ -1525,11 +1545,14 @@ export interface MeetEntry {
   thought?: string;
   dialogue?: string;
   suggestions?: string[];
+  format?: "unified-round-v1";
   scenePatch?: MeetScenePatch;
   plotProgress?: MeetPlotProgress;
   favoritedAt?: number;
   generation?: {
     status: "generating" | "complete" | "partial" | "failed";
+    protocol?: "unified-round-v1";
+    runId?: string;
     stage?: "requesting" | "parsing" | "validating" | "saving";
     error?: string;
     model?: string;
@@ -1541,7 +1564,20 @@ export interface MeetEntry {
     estimatedInputTokens?: number;
     injectedLoreEntries?: number;
     skippedLoreEntries?: number;
-    saveResult?: "pending" | "saved" | "failed";
+    saveResult?: "not-attempted" | "pending" | "saved" | "failed";
+    warnings?: string[];
+    attempts?: Array<{
+      ordinal: 1 | 2;
+      stage: "requesting" | "parsing" | "validating";
+      responseShape?: string;
+      rawLength?: number;
+      outputTokens?: number;
+      finishReason?: string;
+      truncated?: boolean;
+      inputTokens?: number;
+      errorKind?: string;
+      providerCode?: string;
+    }>;
     characterResults?: Array<{
       characterId: string;
       status: "generating" | "complete" | "silent";
@@ -2491,4 +2527,3 @@ export interface GitHubBackupSettings {
   lastBackupAt?: number;
   lastSha?: string;
 }
-

@@ -138,7 +138,7 @@ export function meetTimeContext(
 export function meetNarrativeInstructions(settings: MeetNarrativeSettings) {
   const perspective =
     settings.perspective === "first"
-      ? "叙事人称使用角色第一人称。每位角色在自己的帖子中以“我”叙述自身可感知的现场、动作与感受，多角色时不得混淆不同角色的第一人称。"
+      ? "叙事人称使用角色第一人称。共享描写保持清晰的现场视角；角色台词和可展示思想分别遵循各自的“我”，多人场景不得混淆说话者。"
       : settings.perspective === "second"
         ? "叙事人称使用第二人称，以“你”称呼用户并描写用户能够感知的现场；不得替用户补写动作、感受、心理或发言。"
         : "叙事人称使用第三人称，以角色姓名或合适代词叙述角色，以“你”称呼用户。";

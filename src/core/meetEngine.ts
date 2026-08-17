@@ -1,14 +1,15 @@
-﻿import { z } from "zod";
+import { z } from "zod";
 import { db } from "./db";
 import { parseStructuredJsonWithMeta, replyProtocolPresenceOf } from "./structuredJson";
 import { configuredProvider, getModelServiceSettings } from "./modelServices";
 import { OpenAIProvider } from "./provider";
-import { meetLengthRangeViolation } from "./meet";
+import { meetLengthRangeViolation, meetVisibleCharacterCount } from "./meet";
 import type {
   Character,
   MeetCompiledStyle,
   MeetNarrativeSettings,
   MeetPlotProgress,
+  MeetRoundPayload,
   MeetPlotState,
   MeetResponderPlan,
   MeetScene,
@@ -149,6 +150,173 @@ export function parseMeetTurnResponse(raw: string, characterId: string) {
     if (error instanceof MeetProtocolError) throw error;
     throw new MeetProtocolError("见面回复字段不完整或格式不符合要求");
   }
+}
+const meetRoundSegmentSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("narration"),
+    text: z.string().trim().min(1).max(16000),
+  }),
+  z.object({
+    type: z.literal("dialogue"),
+    characterId: z.string().trim().min(1),
+    text: z.string().trim().min(1).max(12000),
+    translation: z.string().trim().min(1).max(12000).optional(),
+  }),
+]);
+const meetRoundCoreSchema = z.object({
+  version: z.literal(1),
+  segments: z.array(meetRoundSegmentSchema).min(1).max(80),
+  thoughts: z.array(z.unknown()).optional(),
+  updates: z.array(z.unknown()).optional(),
+  suggestions: z.array(z.unknown()).optional(),
+});
+const meetRoundThoughtSchema = z.object({
+  characterId: z.string().trim().min(1),
+  text: z.string().trim().min(1).max(6000),
+  translation: z.string().trim().min(1).max(6000).optional(),
+});
+const meetRoundUpdateSchema = z.object({
+  characterId: z.string().trim().min(1),
+  scenePatch: meetTurnSchema.shape.scenePatch.optional(),
+  plotProgress: meetTurnSchema.shape.plotProgress.optional(),
+});
+
+export function parseMeetRoundResponse(
+  raw: string,
+  participantIds: string[],
+  options: { thoughtsEnabled?: boolean; bilingualCharacterIds?: string[] } = {},
+): MeetRoundPayload {
+  let value: unknown;
+  try {
+    value = parseStructuredJsonWithMeta(raw).value;
+  } catch (error) {
+    throw new MeetProtocolError(
+      error instanceof Error ? error.message : "见面整轮 JSON 无法解析",
+    );
+  }
+  const root = meetRecord(value);
+  if (root && replyProtocolPresenceOf(root).wireFormat)
+    throw new MeetProtocolError("收到普通聊天回复协议，未收到见面整轮协议");
+  if (!root)
+    throw new MeetProtocolError("见面整轮回复必须是 JSON 对象");
+  let parsed: z.infer<typeof meetRoundCoreSchema>;
+  try {
+    parsed = meetRoundCoreSchema.parse(root);
+  } catch {
+    throw new MeetProtocolError("见面整轮字段不完整或格式不符合要求");
+  }
+  const allowed = new Set(participantIds);
+  const dialogueSegments = parsed.segments.filter(
+    (segment): segment is Extract<z.infer<typeof meetRoundSegmentSchema>, { type: "dialogue" }> =>
+      segment.type === "dialogue",
+  );
+  if (!dialogueSegments.length)
+    throw new MeetProtocolError("见面整轮至少需要一条角色台词");
+  const unknownDialogue = dialogueSegments.find(
+    (segment) => !allowed.has(segment.characterId),
+  );
+  if (unknownDialogue)
+    throw new MeetProtocolError("见面整轮包含不在当前场景中的角色 ID");
+
+  const warnings: string[] = [];
+  const thoughts: NonNullable<MeetRoundPayload["thoughts"]> = [];
+  const seenThoughts = new Set<string>();
+  if (options.thoughtsEnabled) {
+    for (const candidate of parsed.thoughts ?? []) {
+      const result = meetRoundThoughtSchema.safeParse(candidate);
+      if (
+        !result.success ||
+        !allowed.has(result.data.characterId) ||
+        seenThoughts.has(result.data.characterId) ||
+        !dialogueSegments.some(
+          (segment) => segment.characterId === result.data.characterId,
+        )
+      ) {
+        warnings.push("已忽略无效或重复的角色思想");
+        continue;
+      }
+      seenThoughts.add(result.data.characterId);
+      thoughts.push(result.data);
+    }
+  }
+
+  if (options.thoughtsEnabled) {
+    for (const characterId of new Set(
+      dialogueSegments.map((segment) => segment.characterId),
+    ))
+      if (!seenThoughts.has(characterId))
+        warnings.push(`角色 ${characterId} 未返回可展示思想`);
+  }
+  const updates: NonNullable<MeetRoundPayload["updates"]> = [];
+  const seenUpdates = new Set<string>();
+  for (const candidate of parsed.updates ?? []) {
+    const result = meetRoundUpdateSchema.safeParse(candidate);
+    if (
+      !result.success ||
+      !allowed.has(result.data.characterId) ||
+      seenUpdates.has(result.data.characterId) ||
+      !dialogueSegments.some(
+        (segment) => segment.characterId === result.data.characterId,
+      )
+    ) {
+      warnings.push("已忽略无效或重复的场景状态更新");
+      continue;
+    }
+    seenUpdates.add(result.data.characterId);
+    updates.push(result.data);
+  }
+
+  const bilingual = new Set(options.bilingualCharacterIds ?? []);
+  for (const segment of dialogueSegments)
+    if (bilingual.has(segment.characterId) && !segment.translation)
+      warnings.push(`角色 ${segment.characterId} 的台词缺少译文`);
+  for (const thought of thoughts)
+    if (bilingual.has(thought.characterId) && !thought.translation)
+      warnings.push(`角色 ${thought.characterId} 的思想缺少译文`);
+
+  const suggestions = (parsed.suggestions ?? [])
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  return {
+    version: 1,
+    segments: parsed.segments,
+    thoughts: thoughts.length ? thoughts : undefined,
+    updates: updates.length ? updates : undefined,
+    suggestions: suggestions.length ? suggestions : undefined,
+    warnings: [...new Set(warnings)],
+  };
+}
+
+export function meetRoundVisibleCharacterCount(payload: Pick<MeetRoundPayload, "segments">) {
+  return meetVisibleCharacterCount({
+    prose: payload.segments
+      .map((segment) => segment.text)
+      .join("\n"),
+  });
+}
+
+export function meetRoundStyleViolation(
+  payload: Pick<MeetRoundPayload, "segments">,
+  settings: MeetNarrativeSettings,
+) {
+  const visible = payload.segments.map((segment) => segment.text).join("\n");
+  const labels = /(^|\n)\s*(?:动作|表情|现场|分析|镜头|内心分析)\s*[:：]/u;
+  const count = meetRoundVisibleCharacterCount(payload);
+  const compiled = validMeetCompiledStyle(settings);
+  return {
+    count,
+    belowMinimum: count < settings.minChars,
+    aboveMaximum: count > settings.maxChars,
+    styleInvalid:
+      labels.test(visible) ||
+      Boolean(
+        compiled?.forbiddenTraits.some(
+          (value) => value.length > 1 && visible.includes(value),
+        ),
+      ),
+  };
 }
 const strip = (v: string) =>
   v
@@ -522,4 +690,3 @@ export function applyMeetPlotProgress(
     updatedAt: Date.now(),
   };
 }
-

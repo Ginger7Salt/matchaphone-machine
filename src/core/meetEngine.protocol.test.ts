@@ -23,3 +23,118 @@ describe("meet provider protocol", () => {
     expect(() => parseMeetTurnResponse("{}", id)).toThrow(MeetProtocolError);
   });
 });
+import {
+  meetRoundStyleViolation,
+  parseMeetRoundResponse,
+} from "./meetEngine";
+
+describe("unified meet round protocol", () => {
+  it("preserves shared narration and interleaved repeated dialogue", () => {
+    const parsed = parseMeetRoundResponse(
+      JSON.stringify({
+        version: 1,
+        segments: [
+          { type: "narration", text: "雨声落在窗边。" },
+          { type: "dialogue", characterId: "one", text: "先坐吧。" },
+          { type: "narration", text: "门口传来脚步声。" },
+          { type: "dialogue", characterId: "two", text: "我来晚了。" },
+          { type: "dialogue", characterId: "one", text: "没关系。" },
+        ],
+      }),
+      ["one", "two", "silent"],
+    );
+    expect(parsed.segments.map((segment) => segment.type)).toEqual([
+      "narration",
+      "dialogue",
+      "narration",
+      "dialogue",
+      "dialogue",
+    ]);
+    expect(
+      parsed.segments.filter((segment) => segment.type === "dialogue"),
+    ).toHaveLength(3);
+  });
+
+  it("allows silent participants and ignores invalid optional payloads", () => {
+    const parsed = parseMeetRoundResponse(
+      JSON.stringify({
+        version: 1,
+        segments: [
+          { type: "narration", text: "灯光暗下来。" },
+          { type: "dialogue", characterId: "one", text: "我知道。" },
+        ],
+        thoughts: [
+          { characterId: "one", text: "要慢一点说。" },
+          { characterId: "ghost", text: "不应保存。" },
+        ],
+        updates: [{ characterId: "ghost", scenePatch: {} }],
+        suggestions: ["继续", 123],
+      }),
+      ["one", "silent"],
+      { thoughtsEnabled: true, bilingualCharacterIds: ["one"] },
+    );
+    expect(parsed.thoughts).toEqual([
+      { characterId: "one", text: "要慢一点说。" },
+    ]);
+    expect(parsed.updates).toBeUndefined();
+    expect(parsed.suggestions).toEqual(["继续"]);
+    expect(parsed.warnings?.join("；")).toContain("缺少译文");
+  });
+
+  it("rejects ordinary chat, plain text, unknown speakers and narration-only rounds", () => {
+    expect(() =>
+      parseMeetRoundResponse(
+        JSON.stringify({ m: [{ c: "聊天" }], v: { s: {} } }),
+        ["one"],
+      ),
+    ).toThrow(MeetProtocolError);
+    expect(() => parseMeetRoundResponse("普通文本", ["one"])).toThrow(
+      MeetProtocolError,
+    );
+    expect(() =>
+      parseMeetRoundResponse(
+        JSON.stringify({
+          version: 1,
+          segments: [
+            { type: "dialogue", characterId: "ghost", text: "错误" },
+          ],
+        }),
+        ["one"],
+      ),
+    ).toThrow("角色 ID");
+    expect(() =>
+      parseMeetRoundResponse(
+        JSON.stringify({
+          version: 1,
+          segments: [{ type: "narration", text: "只有描写。" }],
+        }),
+        ["one"],
+      ),
+    ).toThrow("至少需要一条角色台词");
+  });
+
+  it("counts only visible narration and dialogue for the round range", () => {
+    const payload = parseMeetRoundResponse(
+      JSON.stringify({
+        version: 1,
+        segments: [
+          { type: "narration", text: "一二三" },
+          { type: "dialogue", characterId: "one", text: "四五" },
+        ],
+        thoughts: [{ characterId: "one", text: "这段隐藏思想不计数" }],
+      }),
+      ["one"],
+      { thoughtsEnabled: true },
+    );
+    expect(
+      meetRoundStyleViolation(payload, {
+        minChars: 5,
+        maxChars: 5,
+        thoughtsEnabled: true,
+        perspective: "third",
+        styleMode: "plain",
+        customStyle: "",
+      }),
+    ).toMatchObject({ count: 5, belowMinimum: false, aboveMaximum: false });
+  });
+});

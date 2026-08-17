@@ -61,3 +61,72 @@ html[data-chacha-home-recovery=true],html[data-chacha-home-recovery=true] body,h
 @media (prefers-reduced-motion:reduce){.phone *{scroll-behavior:auto!important}}
 .message-row.standalone-invitation-card .bubble-shell,.message-row.standalone-invitation-card .bubble{background:transparent!important;border:0!important;box-shadow:none!important;padding:0!important;overflow:visible!important}.message-row.standalone-invitation-card .bubble-shell{display:contents}.message-row.standalone-invitation-card .bubble{display:contents}.message-row.standalone-invitation-card .message-bubble-line{padding:0!important;background:transparent!important;box-shadow:none!important}
 .chat-history-loader{text-align:center;padding:8px 0 12px}.chat-history-loader button,.chat-history-state button{color:#6f63cf;background:#fff;border:1px solid #ded9f8;border-radius:999px;padding:8px 14px;font-size:12px;font-weight:700}.chat-history-loader button:disabled{opacity:.65}.chat-history-state{color:#777;text-align:center;place-items:center;gap:8px;min-height:160px;padding:28px;display:grid}.chat-history-state svg{width:24px}.chat-history-state p{margin:0;font-size:12px}.chat-history-state .is-spinning{animation:spin 1s linear infinite}
+
+/* Unified meet rounds: one continuous scene with shared narration and ordered dialogue. */
+.threads-meet .meet-round-narration {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+  max-width: none;
+}
+.threads-meet .meet-round-narration-line {
+  position: relative;
+  min-height: 28px;
+}
+.threads-meet .meet-round-narration-line::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: #ddd9d7;
+  transform: translateX(-50%);
+}
+.threads-meet .meet-round-narration-copy {
+  color: #777170;
+  padding: 2px 3px 15px;
+  font-size: 13px;
+  font-style: italic;
+  line-height: 1.85;
+}
+.threads-meet .meet-round-narration-copy p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 8px;
+}
+.threads-meet .unified-round-dialogue .thread-body {
+  padding-bottom: 12px;
+}
+.threads-meet .unified-round-dialogue .thread-prose:empty {
+  display: none;
+}
+.threads-meet .unified-round-dialogue .strong-dialogue {
+  background: #f0efee;
+  border-radius: 4px 18px 18px 18px;
+  margin-top: 4px !important;
+  padding: 11px 14px 7px;
+}
+.threads-meet .unified-round-dialogue .strong-dialogue p {
+  font-weight: 550 !important;
+}
+html[data-chacha-theme="dark"] .threads-meet .meet-round-narration-line::before {
+  background: #4c494d;
+}
+html[data-chacha-theme="dark"] .threads-meet .meet-round-narration-copy {
+  color: #aaa4a8;
+}
+html[data-chacha-theme="dark"] .threads-meet .unified-round-dialogue .strong-dialogue {
+  background: #2c2a2d;
+}
+@media (max-width: 600px) {
+  .threads-meet .meet-round-narration {
+    grid-template-columns: 38px minmax(0, 1fr);
+    gap: 6px;
+  }
+  .threads-meet .meet-round-narration-copy {
+    padding-right: 1px;
+    font-size: 12.5px;
+  }
+}

@@ -7,9 +7,7 @@ import { OpenAIProvider, ProviderError, isContextOverflowError } from "./provide
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
-  fitChatItemsToInternalBudget,
   fitPrioritizedPromptSections,
-  INTERNAL_INPUT_BUDGET_TOKENS,
   INTERNAL_LORE_BUDGET_TOKENS,
   type PrioritizedPromptSection,
 } from "./tokenBudget";
@@ -46,8 +44,10 @@ import {
   uid,
   type AppSettings,
   type Character,
+  type Conversation,
   type MeetEntry,
   type MeetNarrativeSettings,
+  type MeetRoundPayload,
   type MeetScene,
   type MeetSession,
   type Message,
@@ -69,8 +69,8 @@ import {
   ensureMeetCompiledStyle,
   meetStyleContract,
   meetStyleViolation,
-  parseMeetTurnResponse,
-  selectMeetResponders,
+  meetRoundStyleViolation,
+  parseMeetRoundResponse,
 } from "./meetEngine";
 import { resolveSecondaryProvider } from "./modelServices";
 import { buildMeetCrossModeContinuity, closeMeetOnlineWindow, resumeMeetSessionForOfflineActivity } from "./crossModeContinuity";
@@ -238,18 +238,171 @@ export async function retryFailedMeetTurn(
   return generateMeetTurnInternal(sessionId, entry.content ?? "", signal, entryId);
 }
 
+export async function regenerateMeetRound(
+  sessionId: string,
+  roundId: string,
+  signal?: AbortSignal,
+): Promise<MeetTurnResult> {
+  const session = await db.meetSessions.get(sessionId),
+    entry = session?.entries.find(
+      (item) => item.roundId === roundId && item.senderType === "user",
+    );
+  if (!session || session.status !== "active")
+    throw new Error("这次见面已经结束");
+  if (!entry) throw new Error("没有找到可以重新生成的见面轮次");
+  return generateMeetTurnInternal(
+    sessionId,
+    entry.content ?? "",
+    signal,
+    entry.id,
+  );
+}
 async function updateMeetGeneration(
   sessionId: string,
   entryId: string,
   generation: NonNullable<MeetEntry["generation"]>,
+  expectedRunId?: string,
 ) {
   const latest = await db.meetSessions.get(sessionId);
-  if (!latest) return;
+  if (!latest) return false;
+  const current = latest.entries.find((entry) => entry.id === entryId);
+  if (expectedRunId && current?.generation?.runId !== expectedRunId)
+    return false;
   await db.meetSessions.update(sessionId, {
     entries: latest.entries.map((entry) =>
       entry.id === entryId ? { ...entry, generation } : entry,
     ),
     updatedAt: now(),
+  });
+  return true;
+}
+class MeetRoundValidationError extends Error {
+  readonly code = "invalid_meet_round";
+  constructor(message: string) {
+    super(message);
+    this.name = "MeetRoundValidationError";
+  }
+}
+
+class StaleMeetRoundError extends Error {
+  constructor() {
+    super("本轮结果已被新的重新生成替代");
+    this.name = "StaleMeetRoundError";
+  }
+}
+
+const MEET_ROUND_INPUT_BUDGET = [48_000, 32_000] as const;
+
+function meetRoundOutputBudget(
+  provider: Awaited<ReturnType<typeof getProvider>>,
+  settings: MeetNarrativeSettings,
+  participantCount: number,
+) {
+  const thoughtReserve = settings.thoughtsEnabled ? participantCount * 700 : 0;
+  return Math.min(
+    16_000,
+    Math.max(
+      provider.maxTokens,
+      Math.ceil(settings.maxChars * 2.2) + thoughtReserve + 1_000,
+    ),
+  );
+}
+
+function meetAttemptErrorKind(error: unknown) {
+  if (error instanceof ProviderError) return error.kind;
+  if (error instanceof MeetRoundValidationError) return error.code;
+  if (
+    error &&
+    typeof error === "object" &&
+    "code" in error &&
+    typeof error.code === "string"
+  )
+    return error.code;
+  return error instanceof Error ? error.name : "unknown";
+}
+
+function unifiedRoundEntries(input: {
+  payload: MeetRoundPayload;
+  roundId: string;
+  createdAt: number;
+  model: string;
+  settings: MeetNarrativeSettings;
+  characters: Character[];
+  conversation: Conversation;
+  suggestionsEnabled: boolean;
+}) {
+  const characterMap = new Map(
+      input.characters.map((character) => [character.id, character]),
+    ),
+    thoughts = new Map(
+      (input.payload.thoughts ?? []).map((thought) => [thought.characterId, thought]),
+    ),
+    updates = new Map(
+      (input.payload.updates ?? []).map((update) => [update.characterId, update]),
+    ),
+    lastDialogueIndex = new Map<string, number>();
+  input.payload.segments.forEach((segment, index) => {
+    if (segment.type === "dialogue")
+      lastDialogueIndex.set(segment.characterId, index);
+  });
+  const lastDialogue = Math.max(
+    -1,
+    ...input.payload.segments.map((segment, index) =>
+      segment.type === "dialogue" ? index : -1,
+    ),
+  );
+  return input.payload.segments.map((segment, index): MeetEntry => {
+    const base = {
+      id: `meet-round:${input.roundId}:${String(index).padStart(3, "0")}`,
+      roundId: input.roundId,
+      format: "unified-round-v1" as const,
+      createdAt: input.createdAt + index + 1,
+    };
+    if (segment.type === "narration")
+      return {
+        ...base,
+        senderType: "system",
+        narration: segment.text,
+      };
+    const character = characterMap.get(segment.characterId),
+      bilingual = Boolean(
+        character && autoTranslateCharacter(character, input.conversation),
+      ),
+      isLastForCharacter = lastDialogueIndex.get(segment.characterId) === index,
+      thought = isLastForCharacter ? thoughts.get(segment.characterId) : undefined,
+      update = isLastForCharacter ? updates.get(segment.characterId) : undefined;
+    return {
+      ...base,
+      senderType: "character",
+      senderId: segment.characterId,
+      dialogue: segment.text,
+      thought: input.settings.thoughtsEnabled ? thought?.text ?? "" : "",
+      translations: bilingual
+        ? {
+            dialogue: segment.translation
+              ? completedTranslation(
+                  segment.text,
+                  segment.translation,
+                  input.model,
+                )
+              : undefined,
+            thought:
+              thought?.text && thought.translation
+                ? completedTranslation(
+                    thought.text,
+                    thought.translation,
+                    input.model,
+                  )
+                : undefined,
+          }
+        : undefined,
+      suggestions:
+        input.suggestionsEnabled && index === lastDialogue
+          ? input.payload.suggestions ?? []
+          : [],
+      scenePatch: update?.scenePatch,
+      plotProgress: update?.plotProgress,
+    };
   });
 }
 
@@ -268,45 +421,61 @@ async function generateMeetTurnInternal(
     await db.characters.bulkGet(session.participantIds)
   ).filter(Boolean) as Character[];
   if (!characters.length) throw new Error("参与角色已不存在");
+
   const t = now(),
+    runId = uid(),
     existingUserEntry = retryEntryId
       ? session.entries.find(
           (entry) => entry.id === retryEntryId && entry.senderType === "user",
         )
       : undefined,
     roundId = existingUserEntry?.roundId ?? uid(),
+    existingRoundOutputs = existingUserEntry
+      ? session.entries.filter(
+          (entry) => entry.roundId === roundId && entry.senderType !== "user",
+        )
+      : [],
+    initialGeneration: NonNullable<MeetEntry["generation"]> = {
+      protocol: "unified-round-v1",
+      runId,
+      status: "generating",
+      stage: "requesting",
+      saveResult: "not-attempted",
+      attempts: [],
+    },
     userEntry: MeetEntry = existingUserEntry
       ? {
           ...existingUserEntry,
           content: text,
-          generation: { status: "generating", stage: "requesting" },
+          generation: initialGeneration,
         }
       : {
           id: uid(),
           roundId,
           senderType: "user",
           content: text,
-          generation: { status: "generating", stage: "requesting" },
+          generation: initialGeneration,
           createdAt: t,
         },
     resumedSession = resumeMeetSessionForOfflineActivity(session, t),
-    historyEntries = existingUserEntry
-      ? resumedSession.entries
-          .filter(
-            (entry) =>
-              entry.id === existingUserEntry.id || entry.roundId !== roundId,
-          )
-          .map((entry) => (entry.id === existingUserEntry.id ? userEntry : entry))
+    persistedEntries = existingUserEntry
+      ? resumedSession.entries.map((entry) =>
+          entry.id === existingUserEntry.id ? userEntry : entry,
+        )
       : [...resumedSession.entries, userEntry],
+    promptHistoryEntries = persistedEntries.filter(
+      (entry) => entry.id !== userEntry.id && entry.roundId !== roundId,
+    ),
     sessionForTurn: MeetSession = {
       ...resumedSession,
-      entries: historyEntries,
+      entries: persistedEntries,
       lastActivityAt: t,
       updatedAt: t,
     };
   await db.transaction("rw", db.meetSessions, async () => {
     await db.meetSessions.put(sessionForTurn);
   });
+
   const [provider, memories, loreBooks, conversation, appSettings, onlineMessages] =
       await Promise.all([
         getProvider(),
@@ -323,19 +492,37 @@ async function generateMeetTurnInternal(
               .sortBy("createdAt")
           : Promise.resolve([] as Message[]),
       ]),
-    baseSettings = normalizeNarrativeSettings(sessionForTurn.narrativeSettings),
-    settings = await ensureMeetCompiledStyle(baseSettings, provider, signal),
+    settings = normalizeNarrativeSettings(sessionForTurn.narrativeSettings),
     names = Object.fromEntries(
       characters.map((character) => [character.id, character.name]),
     ),
-    history = historyEntries
+    history = promptHistoryEntries
       .slice(-60)
       .map((entry) => entryText(entry, names))
       .join("\n\n"),
     state =
-      sessionForTurn.sceneState ?? defaultMeetSceneState(sessionForTurn.scene, characters),
+      sessionForTurn.sceneState ??
+      defaultMeetSceneState(sessionForTurn.scene, characters),
     plotState =
-      sessionForTurn.plotState ?? defaultMeetPlotState(sessionForTurn.scene, characters),
+      sessionForTurn.plotState ??
+      defaultMeetPlotState(sessionForTurn.scene, characters),
+    cv =
+      conversation ??
+      ({
+        id: session.id,
+        schemaVersion: SCHEMA_VERSION,
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+        title: "线下见面",
+        type: "private" as const,
+        memberIds: session.participantIds,
+        presetIds: [],
+        loreBookIds: [],
+        lastActivityAt: session.lastActivityAt,
+      } satisfies Conversation),
+    bilingualCharacterIds = characters
+      .filter((character) => autoTranslateCharacter(character, cv))
+      .map((character) => character.id),
     planningContinuity = buildMeetCrossModeContinuity({
       session: sessionForTurn,
       conversation,
@@ -343,6 +530,7 @@ async function generateMeetTurnInternal(
       actorId: characters[0].id,
       names,
     });
+
   await db.meetSessions.update(session.id, {
     narrativeSettings: settings,
     sceneState: state,
@@ -350,335 +538,499 @@ async function generateMeetTurnInternal(
     lastActivityAt: t,
     updatedAt: t,
   });
+
+  const loreById = new Map<
+    string,
+    ReturnType<typeof evaluateLore>[number]
+  >();
+  let evaluatedLoreCount = 0;
+  for (const character of characters) {
+    const mounted = loreBooks.filter((book) =>
+        conversation
+          ? isLoreBookMounted(
+              book,
+              character.id,
+              conversation.id,
+              character,
+              conversation,
+            )
+          : book.enabled,
+      ),
+      decisions = evaluateLore({
+        books: mounted,
+        texts: [history, planningContinuity, text],
+        characterId: character.id,
+        conversationId: session.conversationId ?? session.id,
+        character,
+        conversation,
+        seed: `meet:${session.id}:${roundId}`,
+        budget: Math.floor(INTERNAL_LORE_BUDGET_TOKENS * 3.2),
+      });
+    evaluatedLoreCount += decisions.length;
+    for (const decision of decisions) {
+      const key = `${decision.bookId}:${decision.id}`,
+        previous = loreById.get(key);
+      if (!previous || (!previous.injected && decision.injected))
+        loreById.set(key, decision);
+    }
+  }
+  const uniqueLore = [...loreById.values()],
+    injectedLore = uniqueLore.filter((item) => item.injected),
+    loreGroups = groupLoreByInsertion(injectedLore),
+    characterIdentity = characters
+      .map(
+        (character) =>
+          `[${character.id}] ${character.name}\n身份简介：${character.bio || "无"}\n性格：${character.personality || "无"}\n说话方式：${character.speakingStyle || "无"}\n语言：${chatSettingsOf(character).language}\n现场关系：亲密 ${character.relationship.intimacy}，信任 ${character.relationship.trust}，情绪 ${character.relationship.mood}`,
+      )
+      .join("\n\n"),
+    characterDetails = characters.map((character) => ({
+      id: `character-detail:${character.id}`,
+      content: `角色 ${character.id}（${character.name}）完整设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${performanceProfileContext(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}`,
+      priority: 96,
+    })),
+    memorySections = characters.map((character) => {
+      const selected = selectMemories(
+        memories,
+        character.id,
+        session.conversationId ?? "",
+        10,
+        text,
+        true,
+      );
+      return {
+        id: `memories:${character.id}`,
+        content: selected.length
+          ? `${character.name} 的相关记忆：${selected.map((item) => item.content).join("；")}`
+          : false,
+        priority: 68,
+      } satisfies PrioritizedPromptSection;
+    }),
+    translationContract = bilingualCharacterIds.length
+      ? `以下角色开启自动翻译：${bilingualCharacterIds.join("、")}。这些角色的每条 dialogue 必须同时返回 translation；如果返回 thought，也必须返回对应 translation。translation 是忠实简体中文译文，不得改变剧情。`
+      : "所有 translation 字段均可省略。",
+    outputContract = `只返回严格 JSON，不要 Markdown、解释或普通聊天协议。格式：{"version":1,"segments":[{"type":"narration","text":"共享环境、动作或背景描写"},{"type":"dialogue","characterId":"当前参与角色 ID","text":"角色说出口的话","translation":"必要译文"}],"thoughts":[{"characterId":"实际发言角色 ID","text":"角色可展示的内心独白","translation":"必要译文"}],"updates":[{"characterId":"实际发言角色 ID","scenePatch":{},"plotProgress":{"advanced":false,"requiresUserResponse":false}}],"suggestions":[]}。segments 必须保持故事发生顺序；可在描写之间交错不同角色台词；同一角色可多次发言；角色可以沉默；共享描写只写一次；至少一条 dialogue；不得使用未知角色 ID。可见共享描写与台词合计目标为 ${settings.minChars}–${settings.maxChars} 字，不计算 thought、translation 或 JSON 字段。`;
+
+  let payload: MeetRoundPayload | undefined,
+    successfulAttempt = 0,
+    lastError: unknown,
+    lengthWarning: string | undefined;
+  const generationMeta: NonNullable<MeetEntry["generation"]> = {
+    ...initialGeneration,
+    model: provider.model,
+    injectedLoreEntries: injectedLore.length,
+    skippedLoreEntries: uniqueLore.filter((item) => !item.injected).length,
+  };
+  const safeUpdateGeneration = async () => {
+    try {
+      await updateMeetGeneration(session.id, userEntry.id, {
+        ...generationMeta,
+        attempts: generationMeta.attempts?.map((attempt) => ({ ...attempt })),
+      }, runId);
+    } catch {}
+  };
+
   if (!provider.apiKey) {
     const fallback = fallbackReply(
         characters[0],
         text,
         settings.thoughtsEnabled,
-      ),
-      reply = fallback.replies[0],
-      entry: MeetEntry = {
-        id: uid(),
-        roundId,
-        senderType: "character",
-        senderId: reply.characterId,
-        prose: reply.prose,
-        thought: reply.thought,
-        dialogue: reply.dialogue,
-        suggestions: [],
-        createdAt: t + 1,
-      };
-    await db.meetSessions.update(session.id, {
-      entries: [...historyEntries.map((item) =>
-        item.id === userEntry.id
-          ? { ...item, generation: { status: "complete" as const, model: provider.model, saveResult: "saved" as const } }
-          : item,
-      ), entry],
-      lastActivityAt: t + 1,
-      updatedAt: t + 1,
-    });
-    return { entries: [entry] };
-  }
-  const plan = await selectMeetResponders({
-      characters,
-      state,
-      plotState,
-      outline: session.scene.outline,
-      userText: text,
-      history: [planningContinuity, history].filter(Boolean).join("\n\n"),
-      provider,
-      signal,
-    }),
-    entries: MeetEntry[] = [],
-    failures: string[] = [],
-    style = meetStyleContract(settings),
-    generationMeta: NonNullable<MeetEntry["generation"]> = {
-      status: "generating",
-      stage: "requesting",
-      model: provider.model,
-      saveResult: "pending",
-    };
-  let nextState = state,
-    nextPlotState = plotState,
-    injectedLoreEntries = 0,
-    skippedLoreEntries = 0;
-  const characterResults: NonNullable<NonNullable<MeetEntry["generation"]>["characterResults"]> = [...new Map(plan.responders.map((item) => [item.characterId, { characterId: item.characterId, status: "generating" as const, attempts: 0 }])).values()];
-  generationMeta.characterResults = characterResults;
-  for (const selected of plan.responders) {
-    const character = characters.find(
-      (item) => item.id === selected.characterId,
-    );
-    if (!character) continue;
-    const characterResult = characterResults.find((item) => item.characterId === character.id);
-    if (!characterResult) continue;
-    try {
-      const cv = conversation ?? {
-          id: session.id,
-          schemaVersion: SCHEMA_VERSION,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt,
-          title: "线下见面",
-          type: "private" as const,
-          memberIds: session.participantIds,
-          presetIds: [],
-          loreBookIds: [],
-          lastActivityAt: session.lastActivityAt,
+      ).replies[0],
+      segments: MeetRoundPayload["segments"] = [
+        { type: "narration", text: fallback.prose },
+        {
+          type: "dialogue",
+          characterId: fallback.characterId,
+          text: fallback.dialogue,
         },
-        prepared = await prepareRoleplayResources({
-          character,
-          conversation: cv,
-          loreBooks,
-          provider,
-          signal,
-        }),
-        ownMemories = selectMemories(
-          memories,
-          character.id,
-          session.conversationId ?? "",
-          10,
-          text,
-          true,
-        ),
-        mounted = prepared.loreBooks.filter((book) =>
-          conversation
-            ? isLoreBookMounted(
-                book,
-                character.id,
-                conversation.id,
-                character,
-                conversation,
-              )
-            : book.enabled,
-        ),
-        loreDecisions = evaluateLore({
-          books: mounted,
-          texts: [history, planningContinuity, text],
-          characterId: character.id,
-          conversationId: session.conversationId ?? session.id,
-          character,
-          conversation,
-          seed: `meet:${session.id}:${roundId}:${character.id}`,
-          budget: Math.floor(INTERNAL_LORE_BUDGET_TOKENS * 3.2),
-        }),
-        lore = loreDecisions.filter((item) => item.injected),
-        loreGroups = groupLoreByInsertion(lore),
-        earlier = entries.map((entry) => entryText(entry, names)).join("\n\n"),
-        bilingual = autoTranslateCharacter(character, cv),
-        crossModeContinuity = buildMeetCrossModeContinuity({
-          session: sessionForTurn,
-          conversation,
-          messages: onlineMessages,
-          actorId: character.id,
-          names,
-        }),
-        promptSections: PrioritizedPromptSection[] = [
-          { id: "roleplay-protocol", content: strongRoleplayInstruction("private-chat"), required: true },
-          { id: "base-lore", content: loreEntriesBlock(loreGroups["base-rules"]), priority: 98 },
-          { id: "meet-boundary", content: "这是线下见面，不是手机聊天。角色可以主动靠近、递物或发起接触，但动作必须停在用户回应点，不得替用户写接受、拒绝、动作、心理、身体反应或台词。小范围移动和自然环境变化可以推进；换地点、时间跳跃、新事件和新人物只能提议。", required: true },
-          { id: "character-core", content: `当前角色：${character.name}\n核心设定：${coreSettingOf(character)}\n完整人设：${personaOf(character)}\n${performanceProfileContext(prepared.character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}`, required: true },
-          { id: "character-lore", content: loreEntriesBlock(loreGroups["after-character"]), priority: 94 },
-          { id: "user-persona", content: userPersonaContext(appSettings), required: true },
-          { id: "time-awareness", content: meetTimeContext(sessionForTurn, new Date(t)), required: Boolean(sessionForTurn.timeAware) },
-          { id: "scene-outline", content: `剧情大纲（软方向）：${session.scene.outline ?? "无"}`, priority: 92 },
-          { id: "scene-state", content: `场景状态：${JSON.stringify(nextState)}`, priority: 94 },
-          { id: "plot-state", content: `剧情状态：${JSON.stringify(nextPlotState)}`, priority: 92 },
-          { id: "plot-rule", content: "角色有责任主动推进剧情，不能完全迎合、依附用户或把所有决定退还给用户。合适时必须作出决定、揭露信息、制造或缓解冲突、提出具体行动、产生后果或推进关系；重大结果必须停在用户回应点。推进必须来自人设、记忆、世界书、大纲或已有因果，不得凭空制造灾难和陌生人物。", priority: 96 },
-          { id: "memories", content: ownMemories.length ? `角色自己的记忆：${ownMemories.map((item) => item.content).join("；")}` : false, priority: 60 },
-          { id: "memory-lore", content: loreEntriesBlock(loreGroups["after-memory"]), priority: 82 },
-          { id: "style", content: `严格文风契约：\n${style}`, required: true },
-          { id: "history-lore", content: loreEntriesBlock(loreGroups["before-history"]), priority: 74 },
-          { id: "history", content: `完整线下记录：\n${history}`, priority: 25 },
-          { id: "continuity", content: crossModeContinuity, priority: 55 },
-          { id: "round-earlier", content: earlier ? `本轮前面角色已经公开的帖子：\n${earlier}` : false, priority: 78 },
-          { id: "user-lore", content: loreEntriesBlock(loreGroups["before-user"]), priority: 90 },
-          { id: "latest-user", content: `用户本轮明确输入：${text}`, required: true },
-          { id: "thought-contract", content: visibleCharacterThoughtPrompt(settings.thoughtsEnabled), required: true },
-          { id: "output-contract", content: `只生成 ${character.name} 的一个帖子。prose 与 thought 严格执行文风；dialogue 只按角色自己的说话习惯。目标篇幅 ${settings.minChars}–${settings.maxChars} 字。只返回严格 JSON：{"characterId":"${character.id}","prose":"正文","thought":"角色内心或空字符串","dialogue":"说出口的话","suggestions":[],"plotProgress":{"advanced":true或false,"actionType":"decision|reveal|conflict|proposal|consequence|relationship|environment","summary":"推进摘要","requiresUserResponse":true或false},"scenePatch":{}}`, required: true },
-          { id: "translation-contract", content: bilingual ? "For prose, thought and dialogue, also return translations with faithful Simplified Chinese versions. Do not alter plot content." : false, required: Boolean(bilingual) },
-        ];
-      injectedLoreEntries += lore.length;
-      skippedLoreEntries += loreDecisions.length - lore.length;
-      generationMeta.injectedLoreEntries = injectedLoreEntries;
-      generationMeta.skippedLoreEntries = skippedLoreEntries;
-      let turn: ReturnType<typeof parseMeetTurnResponse> | undefined;
-      let lastTurnError: unknown;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        characterResult.attempts = attempt + 1;
-        try {
-          const fittedPrompt = fitPrioritizedPromptSections(
-            [
-              ...promptSections,
-              ...(attempt
-                ? [{
-                    id: "retry-contract",
-                    content: "上一次回复格式不正确或上下文过长。只返回一个完整 JSON 对象；角色 ID 必须一致；不要代码块或解释。",
-                    required: true,
-                  }]
-                : []),
-            ],
-            attempt === 0
-              ? INTERNAL_INPUT_BUDGET_TOKENS
-              : Math.floor(INTERNAL_INPUT_BUDGET_TOKENS * 0.72),
-          );
-          const compactStreamingRetry = attempt === 1 && shouldUseCompactStreamingRetry(lastTurnError);
-          const baseMessages = [
-            {
-              role: "system" as const,
-              content:
-                "\u4f60\u6b63\u5728\u751f\u6210\u7ebf\u4e0b\u89c1\u9762\u89d2\u8272\u56de\u590d\u3002\u5fc5\u987b\u9075\u5b88\u7528\u6237\u63d0\u4f9b\u7684\u7ed3\u6784\uff0c\u53ea\u8f93\u51fa\u6709\u6548 JSON\u3002",
-            },
-            {
-              role: "user" as const,
-              content: compactStreamingRetry
-                ? `${fittedPrompt.text}\n\n这是一次完整紧凑重生成：只输出单行、无 Markdown、无解释的完整 JSON；不得续写或拼接上一次响应；保留所有必需字段、角色 ID 和必要译文。`
-                : fittedPrompt.text,
-            },
-          ];
-          const fitted = fitChatItemsToInternalBudget(baseMessages);
-          generationMeta.stage = "requesting";
-          generationMeta.estimatedInputTokens = Math.max(
-            generationMeta.estimatedInputTokens ?? 0,
-            estimateChatTokens(fitted.items),
-          );
-          await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-          const response = await new OpenAIProvider({ ...provider, stream: compactStreamingRetry }).chatWithMeta(
-            fitted.items,
-            {
-              stream: compactStreamingRetry,
-              signal,
-              timeoutMs: null,
-              temperature: attempt === 0 ? provider.temperature : 0.1,
-            },
-          );
-          Object.assign(generationMeta, {
-            stage: "parsing" as const,
-            responseShape: response.responseShape,
-            rawLength: response.rawLength,
-            outputTokens: response.outputTokens,
-            finishReason: response.finishReason,
-            truncated: response.truncated,
-          });
-          await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-          const raw = response.text;
+      ];
+    payload = {
+      version: 1,
+      segments,
+      thoughts:
+        settings.thoughtsEnabled && fallback.thought
+          ? [{ characterId: fallback.characterId, text: fallback.thought }]
+          : undefined,
+      suggestions: [],
+    };
+  } else {
+    const promptSections: PrioritizedPromptSection[] = [
+      {
+        id: "meet-boundary",
+        content:
+          "这是线下见面连续场景，不是手机聊天。不得替用户补写未明确表达的动作、心理、身体反应或台词。角色可以主动行动和推进剧情，但重大结果必须停在用户回应点。不得泄露系统、模型、提示词或数值。",
+        required: true,
+      },
+      {
+        id: "participant-identities",
+        content: `当前参与角色及稳定 ID：\n${characterIdentity}`,
+        required: true,
+      },
+      ...characterDetails,
+      {
+        id: "user-persona",
+        content: userPersonaContext(appSettings),
+        priority: 92,
+      },
+      {
+        id: "scene",
+        content: `场景设定：\n${sceneText(session.scene)}\n\n场景状态：${JSON.stringify(state)}\n\n剧情状态：${JSON.stringify(plotState)}`,
+        required: true,
+      },
+      {
+        id: "time-awareness",
+        content: meetTimeContext(sessionForTurn, new Date(t)),
+        priority: 90,
+      },
+      {
+        id: "plot-rule",
+        content:
+          "角色应依据人设、记忆、世界书和已有因果自然推进；不能完全迎合或把所有决定退还给用户；不得凭空制造灾难、新人物或无依据的重大转折。",
+        priority: 94,
+      },
+      {
+        id: "style",
+        content: `叙事规则：\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}`,
+        required: true,
+      },
+      {
+        id: "base-lore",
+        content: loreEntriesBlock(loreGroups["base-rules"]),
+        priority: 91,
+      },
+      {
+        id: "character-lore",
+        content: loreEntriesBlock(loreGroups["after-character"]),
+        priority: 88,
+      },
+      ...memorySections,
+      {
+        id: "memory-lore",
+        content: loreEntriesBlock(loreGroups["after-memory"]),
+        priority: 78,
+      },
+      {
+        id: "history-lore",
+        content: loreEntriesBlock(loreGroups["before-history"]),
+        priority: 72,
+      },
+      {
+        id: "history",
+        content: history ? `最近线下记录：\n${history}` : false,
+        priority: 35,
+      },
+      {
+        id: "continuity",
+        content: planningContinuity,
+        priority: 58,
+      },
+      {
+        id: "user-lore",
+        content: loreEntriesBlock(loreGroups["before-user"]),
+        priority: 89,
+      },
+      {
+        id: "latest-user",
+        content: `用户本轮明确输入：${text}`,
+        required: true,
+      },
+      {
+        id: "thought-contract",
+        content: visibleCharacterThoughtPrompt(settings.thoughtsEnabled),
+        required: true,
+      },
+      {
+        id: "translation-contract",
+        content: translationContract,
+        required: true,
+      },
+      { id: "output-contract", content: outputContract, required: true },
+    ];
 
-          generationMeta.stage = "validating";
-          await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-          const parsed = parseMeetTurnResponse(raw, character.id);
-          if (bilingual && ((!parsed.translations?.prose && parsed.prose) || (!parsed.translations?.dialogue && parsed.dialogue) || (settings.thoughtsEnabled && parsed.thought && !parsed.translations?.thought))) throw new Error("双语回复缺少必要译文");
-          if (meetStyleViolation(parsed, settings)) throw new ProviderError("format", `见面回复篇幅未达到设置范围（需要 ${settings.minChars}-${settings.maxChars} 字）`);
-          turn = parsed;
-          lastTurnError = undefined;
-          break;
-        } catch (error) {
-          if (error instanceof ProviderError && error.kind === "aborted") {
-            throw error;
-          }
-          lastTurnError = error;
-        }
-      }
-      if (!turn) {
-        characterResult.status = "silent";
-        characterResult.providerCode = lastTurnError instanceof ProviderError ? lastTurnError.apiError?.providerCode : undefined;
-        failures.push(character.name);
-        continue;
-      }
-      const createdAt = t + entries.length + 1,
-        entry: MeetEntry = {
-          id: uid(),
-          roundId,
-          senderType: "character",
-          senderId: character.id,
-          prose:
-            (entries.length === 0 && plan.sharedEnvironmentChange
-              ? plan.sharedEnvironmentChange + "\n\n"
-              : "") + turn.prose,
-          thought: settings.thoughtsEnabled ? turn.thought : "",
-          dialogue: turn.dialogue,
-          translations: bilingual
-            ? {
-                prose: turn.translations?.prose
-                  ? completedTranslation(
-                      turn.prose,
-                      turn.translations.prose,
-                      provider.model,
-                    )
-                  : undefined,
-                thought:
-                  turn.thought && turn.translations?.thought
-                    ? completedTranslation(
-                        turn.thought,
-                        turn.translations.thought,
-                        provider.model,
-                      )
-                    : undefined,
-                dialogue: turn.translations?.dialogue
-                  ? completedTranslation(
-                      turn.dialogue,
-                      turn.translations.dialogue,
-                      provider.model,
-                    )
-                  : undefined,
-              }
-            : undefined,
-          suggestions: session.suggestionsEnabled ? turn.suggestions : [],
-          scenePatch: turn.scenePatch,
-          plotProgress: turn.plotProgress,
-          createdAt,
+    for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+      const ordinal = (attemptIndex + 1) as 1 | 2,
+        fittedPrompt = fitPrioritizedPromptSections(
+          [
+            ...promptSections,
+            ...(attemptIndex
+              ? [
+                  {
+                    id: "retry-contract",
+                    content:
+                      "上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成：只输出一个完整单行 JSON；必须包含 version=1、按顺序的 segments 和至少一条有效角色台词；不要续写、解释、代码块或普通聊天 {m,v}。",
+                    required: true,
+                  } satisfies PrioritizedPromptSection,
+                ]
+              : []),
+          ],
+          MEET_ROUND_INPUT_BUDGET[attemptIndex],
+        ),
+        compactStreamingRetry =
+          attemptIndex === 1 && shouldUseCompactStreamingRetry(lastError),
+        messages = [
+          {
+            role: "system" as const,
+            content:
+              "你是茶茶机的线下连续场景引擎。一次生成整轮共享场景，严格遵守见面整轮 JSON 协议；不要使用普通聊天协议。",
+          },
+          {
+            role: "user" as const,
+            content: compactStreamingRetry
+              ? `${fittedPrompt.text}\n\n完整紧凑重生成：只输出单行 JSON，不得拼接上一次响应。`
+              : fittedPrompt.text,
+          },
+        ],
+        inputTokens = estimateChatTokens(messages),
+        attemptMeta: NonNullable<
+          NonNullable<MeetEntry["generation"]>["attempts"]
+        >[number] = {
+          ordinal,
+          stage: "requesting",
+          inputTokens,
         };
-      entries.push(entry);
-      characterResult.status = "complete";
-      nextState = applyMeetScenePatch(
-        nextState,
-        character.id,
-        turn.scenePatch,
-        text,
+      generationMeta.attempts = [
+        ...(generationMeta.attempts ?? []),
+        attemptMeta,
+      ];
+      generationMeta.stage = "requesting";
+      generationMeta.estimatedInputTokens = Math.max(
+        generationMeta.estimatedInputTokens ?? 0,
+        inputTokens,
       );
-      nextPlotState = applyMeetPlotProgress(
-        nextPlotState,
-        character.id,
-        turn.plotProgress,
-        entry.id,
-      );
-    } catch (error) {
-      if (error instanceof ProviderError && error.kind === "aborted" && !entries.length) throw error;
-      characterResult.status = "silent";
-      characterResult.providerCode = error instanceof ProviderError ? error.apiError?.providerCode : undefined;
-      failures.push(character.name);
+      await safeUpdateGeneration();
+      try {
+        const response = await new OpenAIProvider({
+          ...provider,
+          stream: compactStreamingRetry,
+          maxTokens: meetRoundOutputBudget(
+            provider,
+            settings,
+            characters.length,
+          ),
+        }).chatWithMeta(messages, {
+          stream: compactStreamingRetry,
+          signal,
+          timeoutMs: null,
+          temperature: attemptIndex === 0 ? provider.temperature : 0.1,
+        });
+        Object.assign(attemptMeta, {
+          stage: "parsing" as const,
+          responseShape: response.responseShape,
+          rawLength: response.rawLength,
+          outputTokens: response.outputTokens,
+          finishReason: response.finishReason,
+          truncated: response.truncated,
+        });
+        Object.assign(generationMeta, {
+          stage: "parsing" as const,
+          responseShape: response.responseShape,
+          rawLength: response.rawLength,
+          outputTokens: response.outputTokens,
+          finishReason: response.finishReason,
+          truncated: response.truncated,
+        });
+        await safeUpdateGeneration();
+
+        const parsed = parseMeetRoundResponse(
+          response.text,
+          characters.map((character) => character.id),
+          {
+            thoughtsEnabled: settings.thoughtsEnabled,
+            bilingualCharacterIds,
+          },
+        );
+        attemptMeta.stage = "validating";
+        generationMeta.stage = "validating";
+        await safeUpdateGeneration();
+        const violation = meetRoundStyleViolation(parsed, settings);
+        if (violation.styleInvalid)
+          throw new MeetRoundValidationError("见面整轮文风或结构不符合要求");
+        if (violation.belowMinimum || violation.aboveMaximum) {
+          const slightDeviation =
+            violation.count >= Math.floor(settings.minChars * 0.75) &&
+            violation.count <= Math.ceil(settings.maxChars * 1.25);
+          if (attemptIndex === 0 || !slightDeviation)
+            throw new MeetRoundValidationError(
+              `见面整轮正文篇幅未达到设置范围（需要 ${settings.minChars}-${settings.maxChars} 字，实际 ${violation.count} 字）`,
+            );
+          lengthWarning = `本轮正文为 ${violation.count} 字，略偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
+        }
+        payload = parsed;
+        successfulAttempt = ordinal;
+        lastError = undefined;
+        break;
+      } catch (error) {
+        if (error instanceof ProviderError && error.kind === "aborted") {
+          attemptMeta.errorKind = error.kind;
+          await safeUpdateGeneration();
+          throw error;
+        }
+        lastError = error;
+        if (
+          error instanceof ProviderError &&
+          (error.apiError?.failureStage === "provider-parse" ||
+            error.apiError?.responseShape ||
+            error.apiError?.rawLength !== undefined)
+        )
+          attemptMeta.stage = "parsing";
+        attemptMeta.errorKind = meetAttemptErrorKind(error);
+        if (error instanceof ProviderError) {
+          attemptMeta.providerCode = error.apiError?.providerCode;
+          attemptMeta.responseShape ??= error.apiError?.responseShape;
+          attemptMeta.rawLength ??= error.apiError?.rawLength;
+          attemptMeta.finishReason ??= error.apiError?.finishReason;
+          attemptMeta.truncated ??= Boolean(
+            error.apiError?.transportMarkedIncomplete,
+          );
+          generationMeta.responseShape ??= error.apiError?.responseShape;
+          generationMeta.rawLength ??= error.apiError?.rawLength;
+          generationMeta.finishReason ??= error.apiError?.finishReason;
+          generationMeta.truncated ??= Boolean(
+            error.apiError?.transportMarkedIncomplete,
+          );
+        }
+        generationMeta.stage = attemptMeta.stage;
+        await safeUpdateGeneration();
+      }
     }
   }
-  const finalStatus: NonNullable<MeetEntry["generation"]>["status"] = entries.length === 0 ? "failed" : failures.length ? "partial" : "complete";
-  generationMeta.stage = "saving";
-  await updateMeetGeneration(session.id, userEntry.id, { ...generationMeta });
-  const current = await db.meetSessions.get(session.id);
-  if (!current || current.status !== "active")
-    throw new Error("见面状态已经变化");
-  await db.meetSessions.update(session.id, {
-    entries: [...current.entries.map(entry => entry.id === userEntry.id ? { ...entry, generation: { ...generationMeta, status: finalStatus, model: provider.model, saveResult: entries.length ? "saved" as const : "failed" as const, characterResults } } : entry), ...entries],
-    narrativeSettings: settings,
-    sceneState: nextState,
-    plotState: nextPlotState,
-    lastActivityAt: entries.length ? entries[entries.length - 1]!.createdAt : current.lastActivityAt,
-    updatedAt: now(),
-  });
-  if (!entries.length) throw new Error("本轮没有角色完成回应，请重新生成");
-  for (const entry of entries) {
-    const character = characters.find((item) => item.id === entry.senderId);
-    if (character?.chatSettings?.strategyMode?.enabled)
-      try {
-        await evaluateStrategyInteraction({
-          character,
-          sourceId: `meet:${sessionId}:${userEntry.id}:${character.id}`,
-          userText: text,
-          messages: [],
-          characters,
-          provider,
-          signal,
-        });
-      } catch {}
+
+  if (!payload) {
+    generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
+    generationMeta.saveResult = "not-attempted";
+    generationMeta.error = existingRoundOutputs.length
+      ? "重新生成未完成，已保留原场景"
+      : "本轮场景生成未完成，请重新生成";
+    await safeUpdateGeneration();
+    throw lastError instanceof ProviderError && lastError.kind === "aborted"
+      ? lastError
+      : new Error(generationMeta.error);
   }
+
+  const warnings = [
+      ...(payload.warnings ?? []),
+      ...(lengthWarning ? [lengthWarning] : []),
+    ],
+    generatedEntries = unifiedRoundEntries({
+      payload,
+      roundId,
+      createdAt: t,
+      model: provider.model,
+      settings,
+      characters,
+      conversation: cv,
+      suggestionsEnabled: session.suggestionsEnabled,
+    }),
+    speakingIds = new Set(
+      payload.segments.flatMap((segment) =>
+        segment.type === "dialogue" ? [segment.characterId] : [],
+      ),
+    ),
+    characterResults: NonNullable<
+      NonNullable<MeetEntry["generation"]>["characterResults"]
+    > = characters.map((character) => ({
+      characterId: character.id,
+      status: speakingIds.has(character.id) ? "complete" : "silent",
+      attempts: successfulAttempt,
+    }));
+  let nextState = state,
+    nextPlotState = plotState;
+  for (const update of payload.updates ?? []) {
+    const sourceEntry = [...generatedEntries]
+      .reverse()
+      .find(
+        (entry) =>
+          entry.senderType === "character" &&
+          entry.senderId === update.characterId,
+      );
+    if (!sourceEntry) continue;
+    if (update.scenePatch)
+      nextState = applyMeetScenePatch(
+        nextState,
+        update.characterId,
+        update.scenePatch,
+        text,
+      );
+    if (update.plotProgress)
+      nextPlotState = applyMeetPlotProgress(
+        nextPlotState,
+        update.characterId,
+        update.plotProgress,
+        sourceEntry.id,
+      );
+  }
+
+  generationMeta.status = "generating";
+  generationMeta.stage = "saving";
+  generationMeta.saveResult = "pending";
+  generationMeta.warnings = warnings.length ? [...new Set(warnings)] : undefined;
+  generationMeta.characterResults = characterResults;
+  await safeUpdateGeneration();
+
+  let saveError: unknown;
+  for (let saveAttempt = 0; saveAttempt < 2; saveAttempt += 1) {
+    try {
+      await db.transaction("rw", db.meetSessions, async () => {
+        const current = await db.meetSessions.get(session.id);
+        if (!current || current.status !== "active")
+          throw new Error("见面状态已经变化");
+        const currentUser = current.entries.find(
+          (entry) => entry.id === userEntry.id,
+        );
+        if (currentUser?.generation?.runId !== runId)
+          throw new StaleMeetRoundError();
+        const completedGeneration: NonNullable<MeetEntry["generation"]> = {
+            ...generationMeta,
+            status: "complete",
+            stage: "saving",
+            saveResult: "saved",
+            error: undefined,
+          },
+          withoutOldRoundOutputs = current.entries.filter(
+            (entry) =>
+              entry.roundId !== roundId || entry.senderType === "user",
+          ),
+          completedEntries = withoutOldRoundOutputs.map((entry) =>
+            entry.id === userEntry.id
+              ? { ...entry, generation: completedGeneration }
+              : entry,
+          ),
+          userIndex = completedEntries.findIndex(
+            (entry) => entry.id === userEntry.id,
+          );
+        completedEntries.splice(userIndex + 1, 0, ...generatedEntries);
+        await db.meetSessions.put({
+          ...current,
+          entries: completedEntries,
+          narrativeSettings: settings,
+          sceneState: nextState,
+          plotState: nextPlotState,
+          lastActivityAt:
+            generatedEntries.at(-1)?.createdAt ?? current.lastActivityAt,
+          updatedAt: now(),
+        });
+      });
+      saveError = undefined;
+      break;
+    } catch (error) {
+      if (error instanceof StaleMeetRoundError) throw error;
+      saveError = error;
+    }
+  }
+
+  if (saveError) {
+    generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
+    generationMeta.stage = "saving";
+    generationMeta.saveResult = "failed";
+    generationMeta.error = existingRoundOutputs.length
+      ? "新场景保存失败，已保留原场景"
+      : "场景已经生成，但本地保存失败，请重试";
+    await safeUpdateGeneration();
+    throw new Error(generationMeta.error);
+  }
+
   return {
-    entries,
-    warning: failures.length ? "部分角色本轮保持安静" : undefined,
+    entries: generatedEntries,
+    warning: warnings.length ? [...new Set(warnings)].join("；") : undefined,
   } satisfies MeetTurnResult;
 }
 async function enqueueMeetMemoryTasks(session: MeetSession, at: number) {
@@ -1358,5 +1710,3 @@ export async function generateMeetOpeningDraft(
     return draft;
   }
 }
-
-
