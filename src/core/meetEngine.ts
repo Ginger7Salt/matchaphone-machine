@@ -181,11 +181,41 @@ const meetRoundUpdateSchema = z.object({
   plotProgress: meetTurnSchema.shape.plotProgress.optional(),
 });
 
-export function parseMeetRoundResponse(
+function unwrapMeetRoundRoot(value: unknown): { root: Record<string, unknown>; repairApplied: boolean } | undefined {
+  let current = value;
+  let repairApplied = false;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (Array.isArray(current)) {
+      const candidate = current.find((item) => meetRecord(item)?.version === 1 && Array.isArray(meetRecord(item)?.segments));
+      if (candidate) { current = candidate; repairApplied = true; continue; }
+      return undefined;
+    }
+    const record = meetRecord(current);
+    if (!record) return undefined;
+    if (record.version === 1 && Array.isArray(record.segments))
+      return { root: record, repairApplied };
+    const key = ["data", "result", "response", "body", "payload", "output"].find((name) => record[name] !== undefined);
+    if (!key) return undefined;
+    const nested = record[key];
+    if (typeof nested === "string") {
+      try { current = parseStructuredJsonWithMeta(nested).value; }
+      catch { return undefined; }
+    } else current = nested;
+    repairApplied = true;
+  }
+  return undefined;
+}
+
+export interface MeetRoundParseResult {
+  payload: MeetRoundPayload;
+  repairApplied: boolean;
+}
+
+export function parseMeetRoundResponseWithMeta(
   raw: string,
   participantIds: string[],
   options: { thoughtsEnabled?: boolean; bilingualCharacterIds?: string[] } = {},
-): MeetRoundPayload {
+ ): MeetRoundParseResult {
   let value: unknown;
   try {
     value = parseStructuredJsonWithMeta(raw).value;
@@ -194,11 +224,13 @@ export function parseMeetRoundResponse(
       error instanceof Error ? error.message : "见面整轮 JSON 无法解析",
     );
   }
-  const root = meetRecord(value);
-  if (root && replyProtocolPresenceOf(root).wireFormat)
-    throw new MeetProtocolError("收到普通聊天回复协议，未收到见面整轮协议");
+  const originalRoot = meetRecord(value);
+  if (originalRoot && replyProtocolPresenceOf(originalRoot).wireFormat)
+    throw new MeetProtocolError("\u6536\u5230\u666e\u901a\u804a\u5929\u56de\u590d\u534f\u8bae\uff0c\u672a\u6536\u5230\u89c1\u9762\u6574\u8f6e\u534f\u8bae");
+  const unwrapped = unwrapMeetRoundRoot(value);
+  const root = unwrapped?.root;
   if (!root)
-    throw new MeetProtocolError("见面整轮回复必须是 JSON 对象");
+    throw new MeetProtocolError("\u89c1\u9762\u6574\u8f6e\u56de\u590d\u5fc5\u987b\u662f JSON \u5bf9\u8c61");
   let parsed: z.infer<typeof meetRoundCoreSchema>;
   try {
     parsed = meetRoundCoreSchema.parse(root);
@@ -280,13 +312,24 @@ export function parseMeetRoundResponse(
     .filter(Boolean)
     .slice(0, 3);
   return {
-    version: 1,
-    segments: parsed.segments,
-    thoughts: thoughts.length ? thoughts : undefined,
-    updates: updates.length ? updates : undefined,
-    suggestions: suggestions.length ? suggestions : undefined,
-    warnings: [...new Set(warnings)],
+    payload: {
+      version: 1,
+      segments: parsed.segments,
+      thoughts: thoughts.length ? thoughts : undefined,
+      updates: updates.length ? updates : undefined,
+      suggestions: suggestions.length ? suggestions : undefined,
+      warnings: [...new Set(warnings)],
+    },
+    repairApplied: Boolean(unwrapped?.repairApplied),
   };
+}
+
+export function parseMeetRoundResponse(
+  raw: string,
+  participantIds: string[],
+  options: { thoughtsEnabled?: boolean; bilingualCharacterIds?: string[] } = {},
+): MeetRoundPayload {
+  return parseMeetRoundResponseWithMeta(raw, participantIds, options).payload;
 }
 
 export function meetRoundVisibleCharacterCount(payload: Pick<MeetRoundPayload, "segments">) {

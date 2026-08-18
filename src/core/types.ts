@@ -716,6 +716,17 @@ export interface ContextSectionDiagnostics {
   providerWindow: number;
   memoryCount: number;
   loreCount: number;
+  /** True when optional context sections were omitted to fit the request budget. */
+  contextPruned?: boolean;
+  /** The per-attempt input budget used by the context compiler. */
+  contextBudgetTokens?: number;
+}
+export interface ProviderConnectivityResult {
+  ok: boolean;
+  kind?: "auth" | "cors" | "network" | "rate" | "server" | "format";
+  httpStatus?: number;
+  providerCode?: string;
+  model?: string;
 }
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
@@ -1643,6 +1654,11 @@ export interface MeetEntry {
     model?: string;
     fallbackUsed?: boolean;
     normalizedResponse?: boolean;
+    contextPruned?: boolean;
+    contextBudgetTokens?: number;
+    responseNormalized?: boolean;
+    repairApplied?: boolean;
+    repairRejected?: boolean;
     postProcessingStatus?: "pending" | "complete" | "failed";
     responseShape?: string;
     rawLength?: number;

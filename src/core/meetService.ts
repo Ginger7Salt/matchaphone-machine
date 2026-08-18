@@ -75,9 +75,16 @@ import {
   meetStyleViolation,
   meetRoundStyleViolation,
   parseMeetRoundResponse,
+  parseMeetRoundResponseWithMeta,
+  MeetProtocolError,
 } from "./meetEngine";
 import { resolveSecondaryProvider } from "./modelServices";
 import { buildMeetCrossModeContinuity, closeMeetOnlineWindow, resumeMeetSessionForOfflineActivity } from "./crossModeContinuity";
+
+function referenceBlock(label:string, content:string|false|null|undefined){
+  if(typeof content!=="string"||!content.trim())return content;
+  return "[BEGIN "+label+" REFERENCE]\n"+content.trim()+"\n[END "+label+" REFERENCE]";
+}
 
 function configuredMeetLoreBudget(books:Array<{triggerSettings?:{maxContextChars?:number}}>){
   const configured=books.map((book)=>book.triggerSettings?.maxContextChars).filter((value):value is number=>Number.isFinite(value)&&Number(value)>0);
@@ -136,7 +143,7 @@ function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]
     if (error.apiError?.transportMarkedIncomplete || error.apiError?.providerCode === "transport_truncated" || error.apiError?.providerCode === "truncated_json") return "response-truncated";
     return "response-invalid";
   }
-  if (error instanceof MeetRoundValidationError) return "invalid-meet-round";
+  if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError) return "invalid-meet-round";
   return undefined;
 }
 
@@ -377,7 +384,7 @@ class StaleMeetRoundError extends Error {
   }
 }
 
-const MEET_ROUND_INPUT_BUDGET = [48_000, 32_000] as const;
+export const MEET_ROUND_INPUT_BUDGET = [24_000, 16_000] as const;
 
 function meetRoundOutputBudget(
   provider: Awaited<ReturnType<typeof getProvider>>,
@@ -675,7 +682,7 @@ async function generateMeetTurnInternal(
       priority: 96,
     })),
     meetMemory = buildMeetMemorySections(memories, characters, session.conversationId ?? "", text),
-    memorySections = meetMemory.sections,
+    memorySections = meetMemory.sections.map((section) => ({ ...section, content: referenceBlock("LONG_TERM_MEMORY", section.content) })),
     translationContract = bilingualCharacterIds.length
       ? `以下角色开启自动翻译：${bilingualCharacterIds.join("、")}。这些角色的每条 dialogue 必须同时返回 translation；如果返回 thought，也必须返回对应 translation。translation 是忠实简体中文译文，不得改变剧情。`
       : "所有 translation 字段均可省略。",
@@ -689,6 +696,11 @@ async function generateMeetTurnInternal(
     lengthWarning: string | undefined;
   const generationMeta: NonNullable<MeetEntry["generation"]> = {
     ...initialGeneration,
+    contextPruned: false,
+    contextBudgetTokens: MEET_ROUND_INPUT_BUDGET[0],
+    responseNormalized: false,
+    repairApplied: false,
+    repairRejected: false,
     model: provider.model,
     injectedLoreEntries: injectedLore.length,
     skippedLoreEntries: uniqueLore.filter((item) => !item.injected).length,
@@ -704,6 +716,8 @@ async function generateMeetTurnInternal(
       providerWindow: INTERNAL_CONTEXT_WINDOW_TOKENS,
       memoryCount: meetMemory.count,
       loreCount: injectedLore.length,
+      contextPruned: false,
+      contextBudgetTokens: MEET_ROUND_INPUT_BUDGET[0],
     },
   };
   const safeUpdateGeneration = async () => {
@@ -782,43 +796,43 @@ async function generateMeetTurnInternal(
       },
       {
         id: "base-lore",
-        content: loreEntriesBlock(loreGroups["base-rules"]),
+        content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["base-rules"])),
         priority: 91,
       },
       {
         id: "character-lore",
-        content: loreEntriesBlock(loreGroups["after-character"]),
+        content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["after-character"])),
         priority: 88,
       },
       ...memorySections,
       {
         id: "memory-lore",
-        content: loreEntriesBlock(loreGroups["after-memory"]),
+        content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["after-memory"])),
         priority: 78,
       },
       {
         id: "history-lore",
-        content: loreEntriesBlock(loreGroups["before-history"]),
+        content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["before-history"])),
         priority: 72,
       },
       {
         id: "history",
-        content: history ? `最近线下记录：\n${history}` : false,
+        content: history ? referenceBlock("RECENT_HISTORY", history) : false,
         priority: 35,
       },
       {
         id: "continuity",
-        content: planningContinuity,
+        content: referenceBlock("CONTINUITY_REFERENCE", planningContinuity),
         priority: 58,
       },
       {
         id: "user-lore",
-        content: loreEntriesBlock(loreGroups["before-user"]),
+        content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["before-user"])),
         priority: 89,
       },
       {
         id: "latest-user",
-        content: `用户本轮明确输入：${text}`,
+        content: referenceBlock("LATEST_USER_INPUT", text),
         required: true,
       },
       {
@@ -872,6 +886,7 @@ async function generateMeetTurnInternal(
           },
         ],
         inputTokens = estimateChatTokens(messages),
+        promptWasPruned = fittedPrompt.removedSections.length > 0,
         attemptMeta: NonNullable<
           NonNullable<MeetEntry["generation"]>["attempts"]
         >[number] = {
@@ -881,6 +896,12 @@ async function generateMeetTurnInternal(
           providerRole,
           inputTokens,
         };
+      generationMeta.contextPruned = Boolean(generationMeta.contextPruned || promptWasPruned);
+      generationMeta.contextBudgetTokens = MEET_ROUND_INPUT_BUDGET[attemptIndex];
+      if (generationMeta.contextDiagnostics) {
+        generationMeta.contextDiagnostics.contextPruned = generationMeta.contextPruned;
+        generationMeta.contextDiagnostics.contextBudgetTokens = MEET_ROUND_INPUT_BUDGET[attemptIndex];
+      }
       generationMeta.attempts = [
         ...(generationMeta.attempts ?? []),
         attemptMeta,
@@ -932,8 +953,9 @@ async function generateMeetTurnInternal(
 
         generationMeta.stage = "normalizing";
         generationMeta.normalizedResponse = true;
+        generationMeta.responseNormalized = true;
         await safeUpdateGeneration();
-        const parsed = parseMeetRoundResponse(
+        const parsedResult = parseMeetRoundResponseWithMeta(
           response.text,
           characters.map((character) => character.id),
           {
@@ -941,6 +963,9 @@ async function generateMeetTurnInternal(
             bilingualCharacterIds,
           },
         );
+        generationMeta.repairApplied = Boolean(parsedResult.repairApplied);
+        generationMeta.repairRejected = false;
+        const parsed = parsedResult.payload;
         attemptMeta.stage = "validating";
         generationMeta.stage = "validating";
         await safeUpdateGeneration();
@@ -970,6 +995,7 @@ async function generateMeetTurnInternal(
           throw error;
         }
         lastError = error;
+        if (!(error instanceof ProviderError)) generationMeta.repairRejected = true;
         if (
           error instanceof ProviderError &&
           (error.apiError?.failureStage === "provider-parse" ||

@@ -1,5 +1,5 @@
 import {getSetting,setSetting} from "./db";
-import {OpenAIProvider} from "./provider";
+import {OpenAIProvider,testProviderConnection as testProviderConnectionRaw} from "./provider";
 import {defaultModelServiceSettings,defaultProvider,type ModelServiceSettings,type ProviderSettings} from "./types";
 
 export const MODEL_SERVICES_KEY="model-services-v1";

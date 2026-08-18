@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { ProviderError } from "./provider";
-import { shouldUseSecondaryMeetProvider } from "./meetService";
+import { MEET_ROUND_INPUT_BUDGET, shouldUseSecondaryMeetProvider } from "./meetService";
+
+describe("meet context budget",()=>{
+ it("uses a smaller bounded retry budget",()=>{expect(MEET_ROUND_INPUT_BUDGET).toEqual([24000,16000]);expect(MEET_ROUND_INPUT_BUDGET[1]).toBeLessThan(MEET_ROUND_INPUT_BUDGET[0]);});
+});
 
 describe("meet provider retry classification", () => {
   it("switches providers for rate, CORS, and prompt blocking failures", () => {

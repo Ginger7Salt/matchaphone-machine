@@ -33,7 +33,7 @@ import {
  saveModelServiceSettings,
  testDedicatedProvider
 } from "../core/modelServices";
-import {OpenAIProvider,ProviderError} from "../core/provider";
+import {OpenAIProvider,ProviderError,testProviderConnection} from "../core/provider";
 import {backgroundActivitySettingsOf,notificationSettingsOf,saveBackgroundActivitySettings,saveNotificationSettings} from "../core/notificationSettings";
 import {notificationSupported,requestTeaNotificationPermission,sendTestNotification} from "../core/notifications";
 import {getEmbeddingSettings,saveEmbeddingSettings,testEmbeddingConnection} from "../core/embedding";
@@ -66,6 +66,13 @@ const emptyGitHub:GitHubBackupSettings={owner:"",repo:"",branch:"main",path:"mir
 const counts=(backup:any)=>({角色:backup.data.characters.length,会话:backup.data.conversations.length,消息:backup.data.messages.length,动态:backup.data.feedPosts.length,世界书:backup.data.loreBooks.length,记忆:backup.data.memories.length,待审核:backup.data.memoryExtractionBatches?.length??0,媒体:backup.data.mediaAssets?.length??0,表情分组:backup.data.stickerPacks?.length??0});
 type StatusValue={ok:boolean;text:string};
 type ServiceKind="secondary"|"vision";
+function connectivityErrorText(result:{kind?:string;httpStatus?:number;providerCode?:string}){
+ if(result.kind==="cors")return "\u5f53\u524d Provider \u4e0d\u652f\u6301\u6d4f\u89c8\u5668\u76f4\u8fde\u6216\u8de8\u57df\u8bbf\u95ee\uff0c\u8bf7\u66f4\u6362\u652f\u6301 CORS \u7684\u5730\u5740\u3002";
+ if(result.kind==="auth")return "Provider \u9274\u6743\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 API Key\u3001Base URL \u548c\u6a21\u578b\u6743\u9650\u3002";
+ if(result.kind==="rate")return "Provider \u5f53\u524d\u8fbe\u5230\u8c03\u7528\u9891\u7387\u6216\u989d\u5ea6\u9650\u5236\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002";
+ if(result.kind==="server")return `Provider \u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528${result.httpStatus?` (HTTP \${result.httpStatus})`:""}\u3002`;
+ return result.providerCode?`Provider \u8fde\u63a5\u5931\u8d25 (${result.providerCode})\u3002` : "Provider \u8fde\u63a5\u5931\u8d25\u3002";
+}
 
 export default function SettingsPage(){
  const nav=useNavigate();

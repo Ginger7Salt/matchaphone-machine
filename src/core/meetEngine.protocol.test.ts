@@ -26,7 +26,26 @@ describe("meet provider protocol", () => {
 import {
   meetRoundStyleViolation,
   parseMeetRoundResponse,
+  parseMeetRoundResponseWithMeta,
 } from "./meetEngine";
+
+describe("unified meet response normalization", () => {
+  it("unwraps a deterministic provider response wrapper without inventing content", () => {
+    const result = parseMeetRoundResponseWithMeta(
+      JSON.stringify({ data: { version: 1, segments: [{ type: "dialogue", characterId: "one", text: "Offline dialogue" }] } }),
+      ["one"],
+    );
+    expect(result.repairApplied).toBe(true);
+    expect(result.payload.segments).toEqual([{ type: "dialogue", characterId: "one", text: "Offline dialogue" }]);
+  });
+
+  it("rejects a wrapper that contains narration only", () => {
+    expect(() => parseMeetRoundResponseWithMeta(
+      JSON.stringify({ result: { version: 1, segments: [{ type: "narration", text: "Narration only" }] } }),
+      ["one"],
+    )).toThrow();
+  });
+});
 
 describe("unified meet round protocol", () => {
   it("preserves shared narration and interleaved repeated dialogue", () => {

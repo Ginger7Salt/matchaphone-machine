@@ -1,5 +1,5 @@
 import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderConnectivityResult, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
@@ -215,10 +215,6 @@ function replyRowLike(value: unknown) {
 }
 function directMeetRoundText(value: unknown) {
   if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.segments)) return undefined;
-  const hasDialogue = value.segments.some((segment) =>
-    isRecord(segment) && segment.type === "dialogue" && typeof segment.characterId === "string" && typeof segment.text === "string" && Boolean(segment.text.trim()),
-  );
-  if (!hasDialogue) return undefined;
   return safeJson(value);
 }
 function meetRoundValueOf(value: unknown): unknown {
@@ -1392,5 +1388,30 @@ export class OpenAIProvider {
   async test() { return this.chat([{ role: "user", content: "只回复 OK" }], { stream: false }); }
 }
 
+function connectivityKind(error: unknown): ProviderConnectivityResult["kind"] {
+  const info = apiErrorInfoOf(error);
+  if (!info) return "network";
+  if (info.kind === "auth") return "auth";
+  if (info.kind === "cors") return "cors";
+  if (info.kind === "rate") return "rate";
+  if (info.kind === "server" || info.kind === "timeout") return "server";
+  return "format";
+}
 
-
+/** Runs an explicit, user-initiated provider check without persisting prompts or responses. */
+export async function testProviderConnection(settings: ProviderSettings): Promise<ProviderConnectivityResult> {
+  const model = settings.model.trim();
+  try {
+    await new OpenAIProvider({ ...settings, stream: false }).test();
+    return { ok: true, model };
+  } catch (error) {
+    const info = apiErrorInfoOf(error);
+    return {
+      ok: false,
+      kind: connectivityKind(error),
+      httpStatus: info?.httpStatus,
+      providerCode: info?.providerCode,
+      model,
+    };
+  }
+}
