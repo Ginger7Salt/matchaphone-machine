@@ -295,6 +295,22 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
   expect(error.apiError?.detail).not.toContain(credential);
  });
 });
+describe("meet provider response normalization",()=>{
+ it("normalizes a direct unified meet round object",async()=>{
+  const round={version:1,segments:[{type:"narration",text:"Rain taps the window"},{type:"dialogue",characterId:"one",text:"I heard it"}],thoughts:[],updates:[],suggestions:[]};
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify(round),{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false});
+  expect(result).toMatchObject({responseShape:"meet-round-object",text:JSON.stringify(round)});
+ });
+ it("normalizes a wrapped unified meet round carried by SSE",async()=>{
+  const round={version:1,segments:[{type:"dialogue",characterId:"one",text:"I am here"}],updates:[],suggestions:[]};
+  const body="data: "+JSON.stringify({response:round})+"\n\ndata: [DONE]\n\n";
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(body,{status:200,headers:{"Content-Type":"text/event-stream"}})));
+  const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});
+  expect(result.text).toBe(JSON.stringify(round));
+  expect(result.responseShape).toBe("sse");
+ });
+});
 
 
 describe("chat timeout override",()=>{

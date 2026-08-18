@@ -172,6 +172,8 @@ describe("MeetSessionPage unified rounds", () => {
         protocol: "unified-round-v1",
         runId: "run-rate",
         stage: "requesting",
+        failureClass: "provider-rate-limit",
+        normalizedResponse: false,
         model: "secondary-model",
         fallbackUsed: true,
         saveResult: "not-attempted",
@@ -207,6 +209,8 @@ describe("MeetSessionPage unified rounds", () => {
 
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1));
     const diagnostic = vi.mocked(navigator.clipboard.writeText).mock.calls[0][0];
+    expect(diagnostic).toContain("failureClass=provider-rate-limit");
+    expect(diagnostic).toContain("normalizedResponse=false");
     expect(diagnostic).toContain("fallbackUsed=true");
     expect(diagnostic).toContain("attempt1.model=primary-model");
     expect(diagnostic).toContain("attempt1.providerRole=primary");

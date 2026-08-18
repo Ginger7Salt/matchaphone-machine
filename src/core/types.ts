@@ -1621,10 +1621,29 @@ export interface MeetEntry {
     status: "generating" | "complete" | "partial" | "failed";
     protocol?: "unified-round-v1";
     runId?: string;
-    stage?: "requesting" | "parsing" | "validating" | "saving";
+    stage?:
+      | "building-context"
+      | "requesting"
+      | "normalizing"
+      | "parsing"
+      | "validating"
+      | "saving"
+      | "post-processing";
+    failureClass?:
+      | "provider-rate-limit"
+      | "provider-cors"
+      | "provider-prompt-blocked"
+      | "provider-timeout"
+      | "response-truncated"
+      | "response-invalid"
+      | "invalid-meet-round"
+      | "storage-failed"
+      | "aborted";
     error?: string;
     model?: string;
     fallbackUsed?: boolean;
+    normalizedResponse?: boolean;
+    postProcessingStatus?: "pending" | "complete" | "failed";
     responseShape?: string;
     rawLength?: number;
     outputTokens?: number;

@@ -122,6 +122,23 @@ function isDistinctProvider(primary: ProviderSettings, candidate: ProviderSettin
 function rateLimitFailureOf(error: unknown) {
   return error instanceof ProviderError && error.kind === "rate";
 }
+export function shouldUseSecondaryMeetProvider(error: unknown) {
+  if (!(error instanceof ProviderError)) return false;
+  return error.kind === "rate" || error.kind === "cors" || error.apiError?.providerCode === "prompt_blocked";
+}
+function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]>["failureClass"] {
+  if (error instanceof ProviderError) {
+    if (error.kind === "aborted") return "aborted";
+    if (error.kind === "rate") return "provider-rate-limit";
+    if (error.kind === "cors") return "provider-cors";
+    if (error.kind === "timeout") return "provider-timeout";
+    if (error.apiError?.providerCode === "prompt_blocked") return "provider-prompt-blocked";
+    if (error.apiError?.transportMarkedIncomplete || error.apiError?.providerCode === "transport_truncated" || error.apiError?.providerCode === "truncated_json") return "response-truncated";
+    return "response-invalid";
+  }
+  if (error instanceof MeetRoundValidationError) return "invalid-meet-round";
+  return undefined;
+}
 
 function meetFailureMessage(
   error: unknown,
@@ -130,8 +147,12 @@ function meetFailureMessage(
 ) {
   const fallbackAttempted = attempts?.some((attempt) => attempt.providerRole === "secondary-fallback") ?? false;
   const rateAttempts = attempts?.filter((attempt) => attempt.errorKind === "rate").length ?? 0;
+  const corsAttempts = attempts?.filter((attempt) => attempt.errorKind === "cors").length ?? 0;
+  const blockedAttempts = attempts?.filter((attempt) => attempt.providerCode === "prompt_blocked").length ?? 0;
   if (preservedExistingRound) {
     if (rateAttempts) return fallbackAttempted ? "主 API 和副 API 均未完成重新生成，已保留原场景" : "当前模型暂时达到调用频率或额度限制，已保留原场景";
+    if (blockedAttempts) return fallbackAttempted ? "主 API 和副 API 均被模型安全策略拦截" : "当前内容被模型安全策略拦截，请尝试缩短上下文或更换模型";
+    if (corsAttempts) return fallbackAttempted ? "主 API 无法从浏览器访问，副 API 也未完成" : "当前模型无法被浏览器访问，请检查 CORS 或配置副 API";
     return "重新生成未完成，已保留原场景";
   }
   if (rateAttempts && fallbackAttempted) {
@@ -140,6 +161,8 @@ function meetFailureMessage(
       : "主 API 当前受限，副 API 也未完成本轮生成，请稍后重试";
   }
   if (rateAttempts) return "当前模型暂时达到调用频率或额度限制，请稍后重试，或在设置中配置副 API";
+  if (blockedAttempts) return fallbackAttempted ? "主 API 和副 API 均被模型安全策略拦截" : "当前内容被模型安全策略拦截，请尝试缩短上下文或更换模型";
+  if (corsAttempts) return fallbackAttempted ? "主 API 无法从浏览器访问，副 API 也未完成" : "当前模型无法被浏览器访问，请检查 CORS 或配置副 API";
   if (error instanceof ProviderError && error.message) return error.message;
   return "本轮场景生成未完成，请重新生成";
 }
@@ -812,7 +835,7 @@ async function generateMeetTurnInternal(
     ];
 
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
-      const fallbackRequested = attemptIndex === 1 && rateLimitFailureOf(lastError);
+      const fallbackRequested = attemptIndex === 1 && shouldUseSecondaryMeetProvider(lastError);
       if (fallbackRequested && !hasDistinctSecondary) break;
       const attemptProvider = fallbackRequested ? secondaryProvider : provider,
         providerRole = fallbackRequested ? "secondary-fallback" as const : "primary" as const,
@@ -887,11 +910,7 @@ async function generateMeetTurnInternal(
           stream: compactStreamingRetry,
           signal,
           timeoutMs: null,
-          temperature: fallbackRequested
-            ? attemptProvider.temperature
-            : attemptIndex === 0
-              ? provider.temperature
-              : 0.1,
+          temperature: attemptProvider.temperature,
         });
         Object.assign(attemptMeta, {
           stage: "parsing" as const,
@@ -911,6 +930,9 @@ async function generateMeetTurnInternal(
         });
         await safeUpdateGeneration();
 
+        generationMeta.stage = "normalizing";
+        generationMeta.normalizedResponse = true;
+        await safeUpdateGeneration();
         const parsed = parseMeetRoundResponse(
           response.text,
           characters.map((character) => character.id),
@@ -938,6 +960,7 @@ async function generateMeetTurnInternal(
         payload = parsed;
         successfulAttempt = ordinal;
         successfulProvider = attemptProvider;
+        generationMeta.failureClass = undefined;
         lastError = undefined;
         break;
       } catch (error) {
@@ -955,6 +978,7 @@ async function generateMeetTurnInternal(
         )
           attemptMeta.stage = "parsing";
         attemptMeta.errorKind = meetAttemptErrorKind(error);
+        generationMeta.failureClass = meetFailureClassOf(error);
         if (error instanceof ProviderError) {
           attemptMeta.httpStatus = error.apiError?.httpStatus;
           attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;
@@ -995,7 +1019,7 @@ async function generateMeetTurnInternal(
   const warnings = [
       ...(payload.warnings ?? []),
       ...(lengthWarning ? [lengthWarning] : []),
-      ...(fallbackUsed ? ["主 API 当前受限，已使用副 API 完成本轮场景"] : []),
+      ...(fallbackUsed ? ["主 API 未能完成，已使用副 API 完成本轮场景"] : []),
     ],
     generatedEntries = unifiedRoundEntries({
       payload,
@@ -1106,6 +1130,7 @@ async function generateMeetTurnInternal(
 
   if (saveError) {
     generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
+    generationMeta.failureClass = "storage-failed";
     generationMeta.stage = "saving";
     generationMeta.saveResult = "failed";
     generationMeta.error = existingRoundOutputs.length

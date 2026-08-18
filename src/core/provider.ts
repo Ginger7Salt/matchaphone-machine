@@ -213,6 +213,39 @@ function replyRowLike(value: unknown) {
   if (!isRecord(value)) return false;
   return ["content", "message", "reply"].some((key) => typeof value[key] === "string");
 }
+function directMeetRoundText(value: unknown) {
+  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.segments)) return undefined;
+  const hasDialogue = value.segments.some((segment) =>
+    isRecord(segment) && segment.type === "dialogue" && typeof segment.characterId === "string" && typeof segment.text === "string" && Boolean(segment.text.trim()),
+  );
+  if (!hasDialogue) return undefined;
+  return safeJson(value);
+}
+function meetRoundValueOf(value: unknown): unknown {
+  if (directMeetRoundText(value)) return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = meetRoundValueOf(item);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(value)) return undefined;
+  for (const key of ["data", "result", "response", "body", "payload", "output"]) {
+    const nested = value[key];
+    if (typeof nested === "string") {
+      const parsed = parseNestedString(nested);
+      if (parsed !== undefined) {
+        const found = meetRoundValueOf(parsed);
+        if (found !== undefined) return found;
+      }
+    } else {
+      const found = meetRoundValueOf(nested);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
 function directRoleProtocolText(value: unknown) {
   if (Array.isArray(value)) {
     if (!value.length || !value.every(replyRowLike)) return undefined;
@@ -326,6 +359,11 @@ function visibleTextOf(
       return value;
     }
     return undefined;
+  }
+  const meetRound = meetRoundValueOf(value);
+  if (meetRound) {
+    addCandidate(paths, (path || "$") + ".meetRound");
+    return safeJson(meetRound);
   }
   const protocol = directRoleProtocolText(value);
   if (protocol) {
@@ -453,6 +491,7 @@ function responseShapeOf(value: unknown): string {
   if (Array.isArray(value)) return directRoleProtocolText(value) ? "direct-role-array" : "array";
   if (!value || typeof value !== "object") return typeof value;
   const row = value as JsonRecord;
+  if (directMeetRoundText(row)) return "meet-round-object";
   const protocol = replyProtocolPresenceOf(row);
   if (protocol.wireFormat === "compact") return "direct-role-compact";
   if (protocol.hasMessages) return "direct-role-json";
