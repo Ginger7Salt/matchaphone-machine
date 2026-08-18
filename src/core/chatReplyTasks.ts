@@ -29,6 +29,7 @@ import {
 import { groupActors, type GroupActor } from "./groupNpcs";
 import {
   generateCharacterReplyTurn,
+  type ReplyRegenerationContext,
 } from "./groupChat";
 import { autoTranslateCharacter, completedTranslation } from "./bilingual";
 import { maybeAttachCharacterVoice } from "./speech";
@@ -740,6 +741,10 @@ export async function ensureRunnableChatReplyTask(
     bubbleCountPlan,
     bubbleCountPlans,
     groupProviderCallBudgets: input.mode === "group" ? {} : undefined,
+    regeneration: Boolean(input.targetMessageId),
+    variationApplied: false,
+    reviewerInvoked: false,
+    retryContextCompacted: false,
     originalMessage: target && !originalMessages ? { ...target } : undefined,
     originalMessages: originalMessages?.map((message) => ({ ...message })),
   };
@@ -922,6 +927,36 @@ async function updatePhase(
     }
   });
   emit();
+}
+async function updateGenerationStrategy(
+  task: BackgroundTask,
+  patch: Partial<Pick<ChatReplyTaskPayload, "regeneration" | "variationApplied" | "reviewerInvoked" | "retryContextCompacted">>,
+) {
+  await db.transaction("rw", db.backgroundTasks, async () => {
+    const stored = await db.backgroundTasks.get(task.id);
+    if (!taskOwnsLease(stored, task)) throw new ChatReplyLeaseLostError();
+    const payload = { ...taskPayload(stored!), ...patch };
+    await db.backgroundTasks.update(task.id, { payload, updatedAt: now() });
+    task.payload = payload;
+  });
+}
+function regenerationContextOf(
+  payload: ChatReplyTaskPayload,
+  senderId?: string,
+): ReplyRegenerationContext | undefined {
+  if (!payload.regenerationTargetId) return undefined;
+  const previousMessages = (payload.originalMessages ?? (payload.originalMessage ? [payload.originalMessage] : []))
+    .filter((message) => message.status === "complete" && message.content.trim())
+    .filter((message) => !senderId || message.senderId === senderId)
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .map((message) => message.content.trim());
+  return {
+    previousMessages,
+    variationNonce: `${payload.regenerationTargetId}:${now().toString(36)}`,
+  };
+}
+function hasExplicitReviewGuidance(payload: ChatReplyTaskPayload) {
+  return Boolean(payload.regenerationReasons?.length || payload.regenerationInstruction?.trim());
 }
 async function memoryRecall(
   memories: Memory[],
@@ -1414,6 +1449,14 @@ async function processPrivate(
     character.id,
     history,
   );
+  const regenerationContext = regenerationContextOf(taskPayload(task), character.id);
+  if (regenerationContext)
+    await updateGenerationStrategy(task, {
+      regeneration: true,
+      variationApplied: regenerationContext.previousMessages.length > 0,
+      reviewerInvoked: false,
+      retryContextCompacted: false,
+    });
   await updatePhase(task, "generating");
   const generatedTurn = await generateCharacterReplyTurn(
     provider,
@@ -1434,6 +1477,10 @@ async function processPrivate(
     providerInvokerForTask(task),
     bubbleCountPlan,
     (attempt, diagnostics) => recordBubbleCountValidation(task, attempt, diagnostics).catch(() => {}),
+    {
+      regeneration: regenerationContext,
+      onStrategy: (patch) => updateGenerationStrategy(task, patch).catch(() => {}),
+    },
   );
     let parts = generatedTurn.parts,
     innerVoice: GeneratedInnerVoice | undefined = generatedTurn.innerVoice;
@@ -1445,8 +1492,13 @@ async function processPrivate(
     presence,
   }), timeConflict = character.proactive.timeAware ? findCurrentTimeReplyContradiction(userText, parts.map((part) => part.content).join("\n"), generationTime) : null;
   const providerBudgetAvailable = (taskPayload(task).providerCallCount ?? 0) < (taskPayload(task).providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT);
-  const needsLocalReview = Boolean(payload.regenerationTargetId || localValidation.issues.length || timeConflict);
+  const needsLocalReview = Boolean(
+    localValidation.issues.length ||
+      timeConflict ||
+      (payload.regenerationTargetId && hasExplicitReviewGuidance(payload)),
+  );
   if (needsLocalReview && providerBudgetAvailable) {
+    await updateGenerationStrategy(task, { reviewerInvoked: true });
     await updatePhase(task, "reviewing");
     const review = await reviewCharacterReply({
         character,
@@ -1882,6 +1934,14 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
       speaker.id,
       history,
     );
+    const regenerationContext = regenerationContextOf(taskPayload(task), speaker.id);
+    if (regenerationContext)
+      await updateGenerationStrategy(task, {
+        regeneration: true,
+        variationApplied: regenerationContext.previousMessages.length > 0,
+        reviewerInvoked: false,
+        retryContextCompacted: false,
+      });
     await updatePhase(task, "generating");
     const bilingual = autoTranslateCharacter(speaker.character, conversation);
     const generatedTurn = await generateCharacterReplyTurn(
@@ -1903,6 +1963,10 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
       providerInvokerForTask(task, false, speaker.id),
       bubbleCountPlan,
       (attempt, diagnostics) => recordBubbleCountValidation(task, attempt, diagnostics, speaker.id).catch(() => {}),
+      {
+        regeneration: regenerationContext,
+        onStrategy: (patch) => updateGenerationStrategy(task, patch).catch(() => {}),
+      },
     );
     let parts: Array<{ content: string; translation?: string }> =
         generatedTurn.parts,
@@ -1917,8 +1981,12 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
       });
     const groupProviderBudget = groupBudgetOf(taskPayload(task), speaker.id);
     const groupReviewAvailable = groupProviderBudget.providerCallCount < groupProviderBudget.providerCallLimit;
-    const needsGroupReview = Boolean(payload.regenerationTargetId || localValidation.issues.length);
+    const needsGroupReview = Boolean(
+      localValidation.issues.length ||
+        (payload.regenerationTargetId && hasExplicitReviewGuidance(payload)),
+    );
     if (needsGroupReview && groupReviewAvailable) {
+      await updateGenerationStrategy(task, { reviewerInvoked: true });
       await updatePhase(task, "reviewing");
       const review = await reviewCharacterReply({
         character: speaker.character,
@@ -2380,6 +2448,10 @@ export async function chatReplyDiagnostic(eventId: string) {
       bubbleCountPlan: payload?.bubbleCountPlan,
       bubbleCountDiagnostics: payload?.bubbleCountDiagnostics,
       bubbleCountDiagnosticsByActor: payload?.bubbleCountDiagnosticsByActor,
+      regeneration: payload?.regeneration,
+      variationApplied: payload?.variationApplied,
+      reviewerInvoked: payload?.reviewerInvoked,
+      retryContextCompacted: payload?.retryContextCompacted,
       lastError: task.lastError,
     },
     null,

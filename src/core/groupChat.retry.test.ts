@@ -183,6 +183,73 @@ describe("generateCharacterReplyTurn strict retry", () => {
     );
     expect(streams).toEqual([false, false]);
   });
+  it("preserves the full persona context and temperature for a content retry", async () => {
+    const calls: Array<{ messages: string[]; temperature?: number }> = [];
+    const invoke: ProviderChatInvoker = async (settings, messages, options) => {
+      calls.push({
+        messages: messages.map((item) => item.content),
+        temperature: options.temperature,
+      });
+      if (calls.length === 1)
+        throw new ProviderError("format", "invalid", "", createApiErrorInfo("format", { providerCode: "invalid_role_protocol" }));
+      return result(JSON.stringify({ messages: [{ content: "换一种自然说法" }], innerVoice: voice }));
+    };
+    await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false, temperature: 0.2 },
+      [
+        { role: "system", content: "完整角色设定：说话尖锐但关心用户" },
+        { role: "user", content: "最新用户消息" },
+      ],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+    );
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.messages.join("\n")).toContain("完整角色设定：说话尖锐但关心用户");
+    expect(calls[1]?.temperature).toBe(0.2);
+  });
+  it("adds a non-repeating variation instruction for regeneration", async () => {
+    let prompt = "";
+    let temperature: number | undefined;
+    const invoke: ProviderChatInvoker = async (_settings, messages, options) => {
+      prompt = messages.at(-1)?.content ?? "";
+      temperature = options.temperature;
+      return result(JSON.stringify({ messages: [{ content: "换个角度回应你" }], innerVoice: voice }));
+    };
+    await generateCharacterReplyTurn(
+      { ...defaultProvider, apiKey: "test", stream: false, temperature: 0.1 },
+      [{ role: "user", content: "你还好吗" }],
+      character,
+      false,
+      "private",
+      true,
+      undefined,
+      false,
+      false,
+      [],
+      undefined,
+      invoke,
+      undefined,
+      undefined,
+      {
+        regeneration: {
+          previousMessages: ["上一版：我没事。"],
+          variationNonce: "test-nonce",
+        },
+      },
+    );
+    expect(prompt).toContain("不要复用上一版的关键短语");
+    expect(prompt).toContain("上一版：我没事。");
+    expect(prompt).toContain("test-nonce");
+    expect(temperature).toBe(0.55);
+  });
   it("uses the persisted local bubble target instead of selecting again", async () => {
     let prompt = "";
     const invoke: ProviderChatInvoker = async (_settings, messages) => {

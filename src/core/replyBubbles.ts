@@ -844,7 +844,7 @@ export function replyBubbleInstruction(
       : range.min === range.max
         ? "The client selected exactly " + range.min + " bubbles for this turn. Return exactly that many separate message bubbles."
         : "Return between " + range.min + " and " + range.max + " separate message bubbles. Prefer around " + resolvedPlan.targetCount + " when natural, but do not add filler merely to match the preference.",
-    "Each item is one complete message the character actually sends. Do not put multiple bubbles into one item with blank lines. Never default to five bubbles. Keep each bubble around 20 visible characters when natural and finish a semantically complete sentence or phrase.",
+    "Each item is one complete message bubble the character actually sends. Preserve natural spoken length: one bubble may contain several complete clauses or sentences when that is how this character would naturally speak. Do not split at punctuation merely to satisfy a preferred count, and do not combine unrelated thoughts. Never default to a fixed number of bubbles.",
     "Keep each visible bubble at or below 80 characters and each translation at or below 100 characters. Do not add filler, repetition, numbering or explanation.",
     innerVoiceRequired ? innerVoiceInstruction(bilingual) : "",
     musicActionEnabled ? "When listening context is present, use at most one musicAction and only when naturally relevant. Track actions may only use candidate IDs explicitly supplied by the listening context." : "",

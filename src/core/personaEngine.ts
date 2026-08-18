@@ -719,6 +719,7 @@ export async function reviewCharacterReply(input: {
         ? `只作用于本次重新生成的导演要求：${input.regenerationInstruction.trim()}。该要求低于角色核心设定和世界书硬规则。`
         : "",
       input.targetCount ? `\u672c\u8f6e\u6700\u7ec8\u5fc5\u987b\u4fdd\u7559\u6070\u597d ${input.targetCount} \u6761\u5b8c\u6574\u6d88\u606f\u6c14\u6ce1\uff0c\u4e0d\u80fd\u589e\u51cf\u6216\u5408\u5e76\u8bed\u4e49\u3002` : "",
+      "如果待审查回复已经符合角色设定、关系进度、当前语境和聊天格式，必须逐条原样保留；不得为了更顺滑、更礼貌、更完整或更像助手而改成中性客服语气。不得删除角色的冷淡、嘴硬、反驳、停顿、口头禅或不完美表达。只有存在明确问题时才修改对应内容，并保持原有说话节奏和信息密度。",
       "\u5ba1\u67e5\u56de\u590d\u662f\u5426\u6cb9\u817b\u3001\u6d6e\u5938\u3001\u5957\u8def\u5316\u64a9\u62e8\u3001\u6ee5\u7528\u4eb2\u6635\u79f0\u547c\u3001\u9738\u603b\u5f0f\u5360\u6709\u6216\u8fc7\u91cf\u751c\u8a00\u871c\u8bed\uff1b\u82e5\u4e0d\u7b26\u5408\u4eba\u8bbe\u3001\u5173\u7cfb\u8fdb\u5ea6\u548c\u8bed\u5883\uff0c\u5fc5\u987b\u4fee\u6b63\uff0c\u4e0d\u5f97\u628a\u89d2\u8272\u7edf\u4e00\u5199\u6210\u9ecf\u4eba\u5ba0\u6eba\u6a21\u677f\u3002",
       `待审查回复：\n${drafts.map((message, index) => `${index + 1}. ${message}`).join("\n")}`,
       input.innerVoiceRequired && input.draftInnerVoice

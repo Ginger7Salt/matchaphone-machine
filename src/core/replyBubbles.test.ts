@@ -84,7 +84,7 @@ describe("reply bubble normalization", () => {
     expect(normalPlan).toMatchObject({ preferredMin: 2, preferredMax: 4 });
     const complexPlan = replyBubblePlanOf(character, [{ role: "user", content: "今天发生了很多事。你觉得我应该先和同事解释吗？还是等明天冷静一点再说？我也有点担心自己说错话。" }], "private");
     expect(complexPlan).toMatchObject({ preferredMin: 3, preferredMax: 6 });
-    expect(replyBubbleInstruction(character, false, "private", false, false, false, shortPlan)).toContain("Never default to five bubbles");
+    expect(replyBubbleInstruction(character, false, "private", false, false, false, shortPlan)).toContain("Never default to a fixed number of bubbles");
   });
 
   it("enforces the locally selected exact bubble count for strict turns", () => {
@@ -260,10 +260,11 @@ describe("reply bubble normalization", () => {
     expect(visibleCharacterCount("好呀👩‍❤️‍👩！")).toBe(4);
   });
 
-  it("mentions the twenty-character semantic target in the model instruction", () => {
+  it("prioritizes natural spoken length in the model instruction", () => {
     const instruction = replyBubbleInstruction(character, false, "private");
-    expect(instruction).toContain("around 20 visible characters");
-    expect(instruction).toContain("semantically complete sentence or phrase");
+    expect(instruction).toContain("Preserve natural spoken length");
+    expect(instruction).toContain("one bubble may contain several complete clauses or sentences");
+    expect(instruction).not.toContain("around 20 visible characters");
   });
 
 });

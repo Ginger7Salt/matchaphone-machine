@@ -321,6 +321,8 @@ describe("fixed roleplay and strict reviewer", () => {
       .join("\n");
     expect(prompt).toContain("角色 OOC、与上下文不符");
     expect(prompt).toContain("只作用于本次重新生成的导演要求");
+    expect(prompt).toContain("如果待审查回复已经符合角色设定");
+    expect(prompt).toContain("不得为了更顺滑、更礼貌、更完整或更像助手而改成中性客服语气");
     expect(await db.messages.count()).toBe(0);
     expect(await db.characters.count()).toBe(0);
   });

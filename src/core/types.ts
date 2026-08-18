@@ -743,6 +743,11 @@ export interface ChatReplyTaskPayload {
   providerCallTrace?: ChatProviderCallTrace[];
   /** Per-speaker provider budgets for group chat; optional for legacy rows. */
   groupProviderCallBudgets?: Record<string, ChatGroupProviderCallBudget>;
+  /** Sanitized generation strategy diagnostics; never contains prompt or response text. */
+  regeneration?: boolean;
+  variationApplied?: boolean;
+  reviewerInvoked?: boolean;
+  retryContextCompacted?: boolean;
   /** Last deterministic failure stage, used only for status/diagnostics. */
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
   cancelled?: boolean;

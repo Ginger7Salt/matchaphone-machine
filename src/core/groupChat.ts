@@ -91,6 +91,38 @@ function shouldUseCompactStreamingRetry(error: unknown) {
   return code === "truncated_json" || code === "transport_truncated" || code === "malformed_envelope";
 }
 
+export interface ReplyRegenerationContext {
+  /** The previous visible turn is used only to avoid repeating it in a new generation. */
+  previousMessages: string[];
+  /** A task-scoped nonce prevents identical prompts from deterministically replaying the same turn. */
+  variationNonce: string;
+}
+
+export interface ReplyGenerationOptions {
+  regeneration?: ReplyRegenerationContext;
+  onStrategy?: (update: {
+    variationApplied?: boolean;
+    retryContextCompacted?: boolean;
+  }) => void | Promise<void>;
+}
+
+function regenerationInstructionOf(value?: ReplyRegenerationContext) {
+  if (!value?.previousMessages.length) return "";
+  const previous = value.previousMessages
+    .map((message) => message.trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .map((message, index) => `${index + 1}. ${message.slice(0, 400)}`)
+    .join("\n");
+  if (!previous) return "";
+  return [
+    "这是一次用户主动要求的重新生成。上一版回复仅用于去重参考，不是新的对话事实。",
+    "保留角色核心设定、关系状态、已知事实和说话习惯，但不要复用上一版的关键短语、句式顺序或相同情绪落点。至少改变回应角度、信息推进、情绪动作、语气节奏中的两项；不得为了不同而捏造事实或违背当前用户输入。",
+    `本次变化标记：${value.variationNonce}`,
+    `上一版可见回复（不要直接复述）：\n${previous}`,
+  ].join("\n");
+}
+
 export async function generateCharacterReplyTurn(
   settings: ProviderSettings,
   context: ChatItem[],
@@ -106,6 +138,7 @@ export async function generateCharacterReplyTurn(
   invokeProvider?: ProviderChatInvoker,
   countPlanOverride?: ReplyBubbleCountPlan | number,
   onCountValidation?: (attempt: 1 | 2, diagnostics: ReplyBubbleCountDiagnostics) => void | Promise<void>,
+  generationOptions?: ReplyGenerationOptions,
 ): Promise<GeneratedReplyTurn> {
   const basePlan = replyBubblePlanOf(character, context, scene),
     countPlan = typeof countPlanOverride === "object"
@@ -123,6 +156,11 @@ export async function generateCharacterReplyTurn(
   let lastFormatError: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     const compactStreamingRetry = attempt === 1 && shouldUseCompactStreamingRetry(lastFormatError);
+    const regenerationInstruction = regenerationInstructionOf(generationOptions?.regeneration);
+    await generationOptions?.onStrategy?.({
+      variationApplied: Boolean(regenerationInstruction),
+      retryContextCompacted: compactStreamingRetry,
+    });
     const request: ChatItem = {
       role: "user",
       content:
@@ -137,14 +175,18 @@ export async function generateCharacterReplyTurn(
           stickerCatalog,
           { compactComplete: compactStreamingRetry },
         ) +
-        (attempt
-          ? compactStreamingRetry
-            ? " The previous provider response was cut or its API envelope was damaged. Generate the entire turn again from the beginning as compact complete JSON. Do not continue, quote, or merge any previous partial output."
-            : " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field."
-          : ""),
+          (attempt
+            ? compactStreamingRetry
+              ? " The previous provider response was cut or its API envelope was damaged. Generate the entire turn again from the beginning as compact complete JSON. Do not continue, quote, or merge any previous partial output."
+              : " The previous response did not satisfy the complete JSON, message-count, translation, inner-voice, or conversational-rhythm requirements. Rewrite the entire turn and return every required field."
+            : "") +
+        (regenerationInstruction ? `\n\n${regenerationInstruction}` : ""),
     };
     try {
-      const sourceContext = attempt ? compactChatItemsForRetry(context) : context;
+      // Preserve the full persona/history for content or count retries. Compact only
+      // when the transport itself was incomplete, otherwise a retry can become a
+      // shorter and more generic answer simply because the protocol failed.
+      const sourceContext = compactStreamingRetry ? compactChatItemsForRetry(context) : context;
       const requestItems = [...sourceContext, request];
       let latestUserIndex = -1;
       for (let index = sourceContext.length - 1; index >= 0; index -= 1) {
@@ -160,7 +202,9 @@ export async function generateCharacterReplyTurn(
       const options = {
         stream: compactStreamingRetry,
         signal,
-        temperature: attempt ? 0.1 : settings.temperature,
+        temperature: generationOptions?.regeneration
+          ? Math.min(1.2, Math.max(settings.temperature, 0.55))
+          : settings.temperature,
         timeoutMs: null,
       } as const;
       const response = invokeProvider
@@ -282,6 +326,4 @@ export async function generateCharacterMessageGroupBilingual(
     signal,
   );
 }
-
-
 
