@@ -43,6 +43,7 @@ import {
   now,
   uid,
   type AppSettings,
+  type ProviderSettings,
   type Character,
   type Conversation,
   type MeetEntry,
@@ -79,6 +80,39 @@ function shouldUseCompactStreamingRetry(error: unknown) {
   if (!(error instanceof ProviderError)) return false;
   const code = error.apiError?.providerCode;
   return code === "truncated_json" || code === "transport_truncated" || code === "malformed_envelope";
+}
+
+function providerIdentity(provider: ProviderSettings) {
+  return [provider.baseUrl.trim().replace(/\/+$/, ""), provider.apiKey.trim(), provider.model.trim()].join("\u0000");
+}
+
+function isDistinctProvider(primary: ProviderSettings, candidate: ProviderSettings) {
+  return Boolean(candidate.apiKey.trim() && candidate.baseUrl.trim() && candidate.model.trim()) && providerIdentity(primary) !== providerIdentity(candidate);
+}
+
+function rateLimitFailureOf(error: unknown) {
+  return error instanceof ProviderError && error.kind === "rate";
+}
+
+function meetFailureMessage(
+  error: unknown,
+  attempts: NonNullable<MeetEntry["generation"]>["attempts"],
+  preservedExistingRound: boolean,
+) {
+  const fallbackAttempted = attempts?.some((attempt) => attempt.providerRole === "secondary-fallback") ?? false;
+  const rateAttempts = attempts?.filter((attempt) => attempt.errorKind === "rate").length ?? 0;
+  if (preservedExistingRound) {
+    if (rateAttempts) return fallbackAttempted ? "主 API 和副 API 均未完成重新生成，已保留原场景" : "当前模型暂时达到调用频率或额度限制，已保留原场景";
+    return "重新生成未完成，已保留原场景";
+  }
+  if (rateAttempts && fallbackAttempted) {
+    return rateLimitFailureOf(error)
+      ? "主 API 和副 API 均达到调用频率或额度限制，请稍后重试"
+      : "主 API 当前受限，副 API 也未完成本轮生成，请稍后重试";
+  }
+  if (rateAttempts) return "当前模型暂时达到调用频率或额度限制，请稍后重试，或在设置中配置副 API";
+  if (error instanceof ProviderError && error.message) return error.message;
+  return "本轮场景生成未完成，请重新生成";
 }
 
 export async function createMeetSession(input: {
@@ -612,6 +646,8 @@ async function generateMeetTurnInternal(
 
   let payload: MeetRoundPayload | undefined,
     successfulAttempt = 0,
+    successfulProvider = provider,
+    fallbackUsed = false,
     lastError: unknown,
     lengthWarning: string | undefined;
   const generationMeta: NonNullable<MeetEntry["generation"]> = {
@@ -653,7 +689,9 @@ async function generateMeetTurnInternal(
       suggestions: [],
     };
   } else {
-    const promptSections: PrioritizedPromptSection[] = [
+    const secondaryProvider = await resolveSecondaryProvider(provider).catch(() => provider),
+      hasDistinctSecondary = isDistinctProvider(provider, secondaryProvider),
+      promptSections: PrioritizedPromptSection[] = [
       {
         id: "meet-boundary",
         content:
@@ -747,7 +785,11 @@ async function generateMeetTurnInternal(
     ];
 
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
-      const ordinal = (attemptIndex + 1) as 1 | 2,
+      const fallbackRequested = attemptIndex === 1 && rateLimitFailureOf(lastError);
+      if (fallbackRequested && !hasDistinctSecondary) break;
+      const attemptProvider = fallbackRequested ? secondaryProvider : provider,
+        providerRole = fallbackRequested ? "secondary-fallback" as const : "primary" as const,
+        ordinal = (attemptIndex + 1) as 1 | 2,
         fittedPrompt = fitPrioritizedPromptSections(
           [
             ...promptSections,
@@ -785,6 +827,8 @@ async function generateMeetTurnInternal(
         >[number] = {
           ordinal,
           stage: "requesting",
+          model: attemptProvider.model,
+          providerRole,
           inputTokens,
         };
       generationMeta.attempts = [
@@ -792,6 +836,11 @@ async function generateMeetTurnInternal(
         attemptMeta,
       ];
       generationMeta.stage = "requesting";
+      generationMeta.model = attemptProvider.model;
+      if (providerRole === "secondary-fallback") {
+        fallbackUsed = true;
+        generationMeta.fallbackUsed = true;
+      }
       generationMeta.estimatedInputTokens = Math.max(
         generationMeta.estimatedInputTokens ?? 0,
         inputTokens,
@@ -799,10 +848,10 @@ async function generateMeetTurnInternal(
       await safeUpdateGeneration();
       try {
         const response = await new OpenAIProvider({
-          ...provider,
+          ...attemptProvider,
           stream: compactStreamingRetry,
           maxTokens: meetRoundOutputBudget(
-            provider,
+            attemptProvider,
             settings,
             characters.length,
           ),
@@ -810,7 +859,11 @@ async function generateMeetTurnInternal(
           stream: compactStreamingRetry,
           signal,
           timeoutMs: null,
-          temperature: attemptIndex === 0 ? provider.temperature : 0.1,
+          temperature: fallbackRequested
+            ? attemptProvider.temperature
+            : attemptIndex === 0
+              ? provider.temperature
+              : 0.1,
         });
         Object.assign(attemptMeta, {
           stage: "parsing" as const,
@@ -856,6 +909,7 @@ async function generateMeetTurnInternal(
         }
         payload = parsed;
         successfulAttempt = ordinal;
+        successfulProvider = attemptProvider;
         lastError = undefined;
         break;
       } catch (error) {
@@ -874,6 +928,8 @@ async function generateMeetTurnInternal(
           attemptMeta.stage = "parsing";
         attemptMeta.errorKind = meetAttemptErrorKind(error);
         if (error instanceof ProviderError) {
+          attemptMeta.httpStatus = error.apiError?.httpStatus;
+          attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;
           attemptMeta.providerCode = error.apiError?.providerCode;
           attemptMeta.responseShape ??= error.apiError?.responseShape;
           attemptMeta.rawLength ??= error.apiError?.rawLength;
@@ -897,9 +953,11 @@ async function generateMeetTurnInternal(
   if (!payload) {
     generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
     generationMeta.saveResult = "not-attempted";
-    generationMeta.error = existingRoundOutputs.length
-      ? "重新生成未完成，已保留原场景"
-      : "本轮场景生成未完成，请重新生成";
+    generationMeta.error = meetFailureMessage(
+      lastError,
+      generationMeta.attempts,
+      existingRoundOutputs.length > 0,
+    );
     await safeUpdateGeneration();
     throw lastError instanceof ProviderError && lastError.kind === "aborted"
       ? lastError
@@ -909,12 +967,13 @@ async function generateMeetTurnInternal(
   const warnings = [
       ...(payload.warnings ?? []),
       ...(lengthWarning ? [lengthWarning] : []),
+      ...(fallbackUsed ? ["主 API 当前受限，已使用副 API 完成本轮场景"] : []),
     ],
     generatedEntries = unifiedRoundEntries({
       payload,
       roundId,
       createdAt: t,
-      model: provider.model,
+      model: successfulProvider.model,
       settings,
       characters,
       conversation: cv,

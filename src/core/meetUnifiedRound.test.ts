@@ -6,6 +6,7 @@ import {
   regenerateMeetRound,
 } from "./meetService";
 import {
+  defaultModelServiceSettings,
   defaultProvider,
   type Character,
   type MeetSession,
@@ -113,6 +114,36 @@ async function setup(ids = ["one", "two", "silent"], range?: { minChars: number;
   });
 }
 
+async function configureSecondary(overrides: Partial<typeof defaultProvider> = {}) {
+  await db.settings.put({
+    key: "model-services-v1",
+    value: {
+      ...defaultModelServiceSettings,
+      secondary: {
+        enabled: true,
+        provider: {
+          ...defaultProvider,
+          baseUrl: "https://secondary.example/v1",
+          apiKey: "secondary-key",
+          model: "secondary-model",
+          ...overrides,
+        },
+      },
+    },
+  });
+}
+
+function rateFailure(retryAfterSeconds = 30) {
+  return new ProviderError("rate", "调用频率或额度已达上限", "", {
+    source: "api",
+    kind: "rate",
+    httpStatus: 429,
+    retryAfterSeconds,
+    providerCode: "bad_response_status_code",
+    meaning: "调用频率或额度已达上限",
+    detail: "rate limited",
+  } as any);
+}
 describe("unified meet round generation", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -390,6 +421,108 @@ describe("unified meet round generation", () => {
     expect(outputs.some((entry) => entry.dialogue === "不应覆盖。")).toBe(false);
     expect(new Set(outputs.map((entry) => entry.id)).size).toBe(outputs.length);
   });
+  it("uses a distinct configured secondary provider after a primary rate limit", async () => {
+    await setup(["one"]);
+    await configureSecondary();
+    const usedModels: string[] = [];
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockImplementation(
+      async function (this: any) {
+        const model = (this as any).settings.model as string;
+        usedModels.push(model);
+        if (model === "test-model") throw rateFailure(45);
+        return response(validRound());
+      },
+    );
+
+    const result = await generateMeetTurn("meet-unified", "继续");
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(usedModels).toEqual(["test-model", "secondary-model"]);
+    expect(result.warning).toContain("已使用副 API 完成本轮场景");
+    const saved = await db.meetSessions.get("meet-unified"),
+      user = saved?.entries.find((entry) => entry.senderType === "user");
+    expect(user?.generation).toMatchObject({
+      status: "complete",
+      saveResult: "saved",
+      model: "secondary-model",
+      fallbackUsed: true,
+      attempts: [
+        { ordinal: 1, providerRole: "primary", errorKind: "rate", httpStatus: 429, retryAfterSeconds: 45 },
+        { ordinal: 2, providerRole: "secondary-fallback", model: "secondary-model" },
+      ],
+    });
+  });
+
+  it("does not repeat a rate-limited primary request when no secondary is available", async () => {
+    await setup(["one"]);
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockRejectedValue(rateFailure(20));
+    await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow(
+      "当前模型暂时达到调用频率或额度限制",
+    );
+    expect(chat).toHaveBeenCalledTimes(1);
+    const user = (await db.meetSessions.get("meet-unified"))?.entries.find(
+      (entry) => entry.senderType === "user",
+    );
+    expect(user?.generation).toMatchObject({
+      status: "failed",
+      stage: "requesting",
+      saveResult: "not-attempted",
+      attempts: [{ ordinal: 1, providerRole: "primary", errorKind: "rate", httpStatus: 429 }],
+    });
+  });
+
+  it("does not treat an identical secondary provider as a fallback", async () => {
+    await setup(["one"]);
+    await configureSecondary({ baseUrl: defaultProvider.baseUrl, apiKey: "test-key", model: "test-model" });
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockRejectedValue(rateFailure());
+    await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow(
+      "当前模型暂时达到调用频率或额度限制",
+    );
+    expect(chat).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops after both providers are rate limited without entering saving", async () => {
+    await setup(["one"]);
+    await configureSecondary();
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta")
+      .mockRejectedValueOnce(rateFailure(10))
+      .mockRejectedValueOnce(rateFailure(60));
+    await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow(
+      "主 API 和副 API 均达到调用频率或额度限制",
+    );
+    expect(chat).toHaveBeenCalledTimes(2);
+    const saved = await db.meetSessions.get("meet-unified"),
+      user = saved?.entries.find((entry) => entry.senderType === "user");
+    expect(saved?.entries.filter((entry) => entry.senderType !== "user")).toEqual([]);
+    expect(user?.generation).toMatchObject({
+      status: "failed",
+      stage: "requesting",
+      saveResult: "not-attempted",
+      fallbackUsed: true,
+      attempts: [
+        { providerRole: "primary", retryAfterSeconds: 10 },
+        { providerRole: "secondary-fallback", retryAfterSeconds: 60 },
+      ],
+    });
+  });
+
+  it("distinguishes a non-rate secondary failure after primary rate limiting", async () => {
+    await setup(["one"]);
+    await configureSecondary();
+    const secondaryFailure = new ProviderError("server", "服务暂时不可用", "", {
+      source: "api",
+      kind: "server",
+      httpStatus: 503,
+      providerCode: "bad_response_status_code",
+      meaning: "服务暂时不可用",
+      detail: "server failure",
+    } as any);
+    vi.spyOn(OpenAIProvider.prototype, "chatWithMeta")
+      .mockRejectedValueOnce(rateFailure())
+      .mockRejectedValueOnce(secondaryFailure);
+    await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow(
+      "主 API 当前受限，副 API 也未完成本轮生成",
+    );
+  });
   it("retains provider response metadata for failed transport parsing", async () => {
     await setup(["one"]);
     const failure = new ProviderError(
@@ -413,7 +546,7 @@ describe("unified meet round generation", () => {
       .spyOn(OpenAIProvider.prototype, "chatWithMeta")
       .mockRejectedValue(failure);
     await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow(
-      "本轮场景生成未完成",
+      "响应截断",
     );
     expect(chat).toHaveBeenCalledTimes(2);
     const user = (await db.meetSessions.get("meet-unified"))?.entries.find(

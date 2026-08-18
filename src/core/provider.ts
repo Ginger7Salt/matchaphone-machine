@@ -13,6 +13,7 @@ import {
 export type ProviderErrorKind = ApiErrorKind | "aborted";
 export interface ProviderErrorMetadata {
   httpStatus?: number;
+  retryAfterSeconds?: number;
   providerCode?: string;
   providerType?: string;
   param?: string;
@@ -1092,6 +1093,7 @@ export function createApiErrorInfo(kind: ApiErrorKind, meta: ProviderErrorMetada
     source: "api",
     kind,
     httpStatus: meta.httpStatus,
+    retryAfterSeconds: meta.retryAfterSeconds,
     providerCode: meta.providerCode,
     providerType: meta.providerType,
     param: meta.param,
@@ -1142,18 +1144,27 @@ export function isContextOverflowError(error: unknown) {
   return Boolean((info?.httpStatus === 400 || info?.httpStatus === 413 || info?.httpStatus === 422) && /context|token|length|too long|maximum|上下文|长度|超出/i.test(text));
 }
 
+function retryAfterSecondsOf(value: string | null) {
+  if (!value) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) return Math.ceil(numeric);
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return undefined;
+  return Math.max(0, Math.ceil((timestamp - Date.now()) / 1000));
+}
+
 export class OpenAIProvider {
   constructor(private settings: ProviderSettings) {}
   private base() { return this.settings.baseUrl.replace(/\/$/, ""); }
   private failure(kind: ApiErrorKind, message: string, partial = "", meta: ProviderErrorMetadata = {}) {
     return new ProviderError(kind, message, partial, createApiErrorInfo(kind, meta));
   }
-  private mapStatus(status: number, text = "") {
+  private mapStatus(status: number, text = "", retryAfterSeconds?: number) {
     const parsed = parsedErrorBody(text, [this.settings.apiKey]);
     const kind: ApiErrorKind = status === 401 || status === 403 ? "auth" : status === 404 ? "model" : status === 408 ? "timeout" : status === 429 ? "rate" : status >= 500 ? "server" : "format";
     const fallback = status === 401 || status === 403 ? "API Key 无效或无权限" : status === 404 ? "接口或模型不存在" : status === 408 ? "请求超时" : status === 429 ? "调用频率或额度已达上限" : status >= 500 ? `服务暂时不可用 (${status})` : `请求失败 (${status})`;
     const detail = parsed.message && parsed.message !== "error" ? parsed.message : fallback;
-    return this.failure(kind, detail, "", { httpStatus: status, providerCode: parsed.providerCode, providerType: parsed.providerType, param: parsed.param, detail });
+    return this.failure(kind, detail, "", { httpStatus: status, retryAfterSeconds, providerCode: parsed.providerCode, providerType: parsed.providerType, param: parsed.param, detail });
   }
   async chatWithMeta(messages: ChatItem[], opts: ProviderChatOptions = {}): Promise<ProviderChatResult> {
     const controller = new AbortController();
@@ -1181,7 +1192,12 @@ export class OpenAIProvider {
         }),
         signal: controller.signal,
       });
-      if (!response.ok) throw this.mapStatus(response.status, await response.text());
+      if (!response.ok)
+        throw this.mapStatus(
+          response.status,
+          await response.text(),
+          retryAfterSecondsOf(response.headers.get("Retry-After")),
+        );
       const contentType = response.headers.get("Content-Type") ?? undefined;
       const parseOrThrow = (raw: string, meta: ResponseTransportMetadata) => {
         try {
@@ -1314,7 +1330,12 @@ export class OpenAIProvider {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort("timeout"), this.settings.timeoutMs);
     try {
       const response = await fetch(this.base() + "/models", { headers: { Authorization: "Bearer " + this.settings.apiKey }, signal: controller.signal });
-      if (!response.ok) throw this.mapStatus(response.status, await response.text());
+      if (!response.ok)
+        throw this.mapStatus(
+          response.status,
+          await response.text(),
+          retryAfterSecondsOf(response.headers.get("Retry-After")),
+        );
       let data: unknown;
       try { data = parseStructuredJson(await response.text()); }
       catch { throw this.failure("format", "服务返回了无法识别的模型列表", "", { providerCode: "invalid_json" }); }

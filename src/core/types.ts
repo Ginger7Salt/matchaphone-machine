@@ -1095,6 +1095,7 @@ export interface ApiErrorInfo {
   source: "api";
   kind: ApiErrorKind;
   httpStatus?: number;
+  retryAfterSeconds?: number;
   providerCode?: string;
   providerType?: string;
   param?: string;
@@ -1607,6 +1608,7 @@ export interface MeetEntry {
     stage?: "requesting" | "parsing" | "validating" | "saving";
     error?: string;
     model?: string;
+    fallbackUsed?: boolean;
     responseShape?: string;
     rawLength?: number;
     outputTokens?: number;
@@ -1620,6 +1622,10 @@ export interface MeetEntry {
     attempts?: Array<{
       ordinal: 1 | 2;
       stage: "requesting" | "parsing" | "validating";
+      model?: string;
+      providerRole?: "primary" | "secondary-fallback";
+      httpStatus?: number;
+      retryAfterSeconds?: number;
       responseShape?: string;
       rawLength?: number;
       outputTokens?: number;

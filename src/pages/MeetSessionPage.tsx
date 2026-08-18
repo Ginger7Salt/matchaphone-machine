@@ -52,6 +52,13 @@ const timeLabel = (value: number) =>
     minute: "2-digit",
     hour12: false,
   });
+const meetGenerationErrorText = (entry: MeetEntry) => {
+  const generation = entry.generation;
+  if (generation?.error) return generation.error;
+  if (generation?.attempts?.some((attempt) => attempt.errorKind === "rate"))
+    return "当前模型暂时达到调用频率或额度限制，请稍后重试，或在设置中配置副 API";
+  return "本轮场景生成未完成，请重试";
+};
 
 export default function MeetSessionPage() {
   const { id = "" } = useParams(),
@@ -322,6 +329,10 @@ export default function MeetSessionPage() {
     if (!generation) return;
     const attemptLines = (generation.attempts ?? []).flatMap((attempt) => [
       `attempt${attempt.ordinal}.stage=${attempt.stage}`,
+      `attempt${attempt.ordinal}.model=${attempt.model ?? "unknown"}`,
+      `attempt${attempt.ordinal}.providerRole=${attempt.providerRole ?? "unknown"}`,
+      `attempt${attempt.ordinal}.httpStatus=${attempt.httpStatus ?? "unknown"}`,
+      `attempt${attempt.ordinal}.retryAfterSeconds=${attempt.retryAfterSeconds ?? "unknown"}`,
       `attempt${attempt.ordinal}.responseShape=${attempt.responseShape ?? "unknown"}`,
       `attempt${attempt.ordinal}.rawLength=${attempt.rawLength ?? "unknown"}`,
       `attempt${attempt.ordinal}.outputTokens=${attempt.outputTokens ?? "unknown"}`,
@@ -346,6 +357,7 @@ export default function MeetSessionPage() {
       "loreInjected=" + (generation.injectedLoreEntries ?? "unknown"),
       "loreSkipped=" + (generation.skippedLoreEntries ?? "unknown"),
       "saveResult=" + (generation.saveResult ?? "unknown"),
+      "fallbackUsed=" + Boolean(generation.fallbackUsed),
       ...attemptLines,
     ].join("\n");
     try {
@@ -534,7 +546,7 @@ export default function MeetSessionPage() {
                   )}
                   {entry.generation?.status === "failed" && !hasRoundResponse(entry) && (
                     <div className="meet-generation-failure" role="alert">
-                      <span>{isLegacyFalseSavingFailure(entry) ? "旧版生成未完成" : entry.generation.error ?? "本轮场景生成未完成，请重试"}</span>
+                      <span>{isLegacyFalseSavingFailure(entry) ? "旧版生成未完成" : meetGenerationErrorText(entry)}</span>
                       <div>
                         <button type="button" disabled={generating} onClick={() => void retryFailedTurn(entry.id)}>
                           {generating ? "\u751f\u6210\u4e2d" : "\u91cd\u65b0\u751f\u6210"}

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { Character, MeetEntry, MeetSession } from "../core/types";
 import MeetSessionPage from "./MeetSessionPage";
@@ -61,6 +61,10 @@ describe("MeetSessionPage unified rounds", () => {
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
       configurable: true,
       value: vi.fn(),
+    });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockResolvedValue(undefined) },
     });
   });
   afterEach(cleanup);
@@ -159,5 +163,56 @@ describe("MeetSessionPage unified rounds", () => {
     expect(screen.getAllByRole("alert")).toHaveLength(1);
     expect(screen.getByText("旧版生成未完成")).toBeInTheDocument();
     expect(screen.queryByText(/本地保存失败/)).not.toBeInTheDocument();
+  });
+
+  it("shows a rate-limit explanation and copies fallback diagnostics", async () => {
+    setup([
+      user("rate", {
+        status: "failed",
+        protocol: "unified-round-v1",
+        runId: "run-rate",
+        stage: "requesting",
+        model: "secondary-model",
+        fallbackUsed: true,
+        saveResult: "not-attempted",
+        attempts: [
+          {
+            ordinal: 1,
+            stage: "requesting",
+            model: "primary-model",
+            providerRole: "primary",
+            httpStatus: 429,
+            retryAfterSeconds: 30,
+            errorKind: "rate",
+            providerCode: "bad_response_status_code",
+          },
+          {
+            ordinal: 2,
+            stage: "requesting",
+            model: "secondary-model",
+            providerRole: "secondary-fallback",
+            httpStatus: 429,
+            retryAfterSeconds: 60,
+            errorKind: "rate",
+            providerCode: "bad_response_status_code",
+          },
+        ],
+      }),
+    ]);
+
+    expect(
+      screen.getByText(/当前模型暂时达到调用频率或额度限制/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制诊断" }));
+
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledTimes(1));
+    const diagnostic = vi.mocked(navigator.clipboard.writeText).mock.calls[0][0];
+    expect(diagnostic).toContain("fallbackUsed=true");
+    expect(diagnostic).toContain("attempt1.model=primary-model");
+    expect(diagnostic).toContain("attempt1.providerRole=primary");
+    expect(diagnostic).toContain("attempt1.httpStatus=429");
+    expect(diagnostic).toContain("attempt1.retryAfterSeconds=30");
+    expect(diagnostic).toContain("attempt2.providerRole=secondary-fallback");
+    expect(diagnostic).not.toContain("我们继续聊");
   });
 });

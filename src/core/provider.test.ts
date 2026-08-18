@@ -281,6 +281,19 @@ describe("OpenAI provider",()=>{ it("does not send output token limits",async()=
   expect(result.text).not.toContain("hidden");
   expect(result.text).not.toContain("secret");
  });
+ it("preserves numeric Retry-After metadata for rate limits",async()=>{
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({error:{message:"slow down",code:"bad_response_status_code"}}),{status:429,headers:{"Content-Type":"application/json","Retry-After":"30"}})));
+  const error=await new OpenAIProvider(settings).chat([{role:"user",content:"hi"}],{stream:false}).catch(value=>value) as ProviderError;
+  expect(error).toMatchObject({kind:"rate",apiError:{httpStatus:429,retryAfterSeconds:30,providerCode:"bad_response_status_code"}});
+ });
+ it("parses HTTP-date Retry-After metadata without exposing credentials",async()=>{
+  const now=Date.UTC(2026,7,18,12,0,0),clock=vi.spyOn(Date,"now").mockReturnValue(now),credential="retry-after-credential";
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({error:{message:"rate limited for "+credential,code:"rate_limited"}}),{status:429,headers:{"Content-Type":"application/json","Retry-After":new Date(now+45000).toUTCString()}})));
+  const error=await new OpenAIProvider({...settings,apiKey:credential}).chat([{role:"user",content:"hi"}],{stream:false}).catch(value=>value) as ProviderError;
+  clock.mockRestore();
+  expect(error.apiError).toMatchObject({httpStatus:429,retryAfterSeconds:45,providerCode:"rate_limited"});
+  expect(error.apiError?.detail).not.toContain(credential);
+ });
 });
 
 
