@@ -1,4 +1,4 @@
-﻿import {
+import {
   CalendarDays,
   Camera,
   Coffee,
@@ -444,11 +444,13 @@ export function RichMessageContent({
   message,
   assets,
   onMusicInvitationResponse,
+  onCoupleIslandInvitationResponse,
   onInvitationRetry,
 }: {
   message: Message;
   assets: Map<string, MediaAsset>;
   onMusicInvitationResponse?: (messageId: string, accept: boolean) => Promise<void>;
+  onCoupleIslandInvitationResponse?: (messageId: string, decision: "accept" | "decline", reason?: string) => Promise<void>;
   onInvitationRetry?: (eventId: string) => Promise<void>;
 }) {
   const nav = useNavigate(),
@@ -465,6 +467,8 @@ export function RichMessageContent({
     [musicTrack, setMusicTrack] = useState<MusicTrack | undefined>(undefined),
     [musicTracks, setMusicTracks] = useState<MusicTrack[]>([]),
     [musicCardState, setMusicCardState] = useState<string | null>(attachment && "state" in attachment && typeof attachment.state === "string" ? attachment.state : null),
+    [coupleState, setCoupleState] = useState(attachment?.type === "couple-island-invitation" ? attachment.state : null),
+    [coupleBusy, setCoupleBusy] = useState(false),
     [musicBusy, setMusicBusy] = useState(false);
   useEffect(() => {
     if (attachment?.type === "music-invitation") setMusicState(attachment.state);
@@ -482,6 +486,7 @@ export function RichMessageContent({
     return () => { cancelled = true; };
   }, [attachment]);
   useEffect(() => { if (attachment && "state" in attachment && typeof attachment.state === "string") setMusicCardState(attachment.state); }, [attachment]);
+  useEffect(() => { if (attachment?.type === "couple-island-invitation") setCoupleState(attachment.state); }, [attachment]);
   if (!attachment) return <TranslatedMessageText message={message} />;
   if (attachment.type === "music-invitation") {
     const response = attachment.cardRole === "response";
@@ -527,23 +532,48 @@ export function RichMessageContent({
   }
   if (attachment.type === "couple-island-invitation") {
     const response = attachment.cardRole === "response";
+    const source = attachment.invitedBy ?? (message.senderType === "character" ? "character" : "user");
+    const state = coupleState ?? attachment.state;
     const retry = async () => {
-      if (!onInvitationRetry || !attachment.responseTaskEventId) return;
-      await onInvitationRetry(attachment.responseTaskEventId);
+      if (!onInvitationRetry || !attachment.responseTaskEventId || coupleBusy) return;
+      setCoupleBusy(true);
+      try { await onInvitationRetry(attachment.responseTaskEventId); }
+      finally { setCoupleBusy(false); }
     };
-    const title = response ? (attachment.state === "accepted" ? "接受茶侣岛邀请" : "暂时拒绝邀请") : "茶侣岛邀请";
-    const detail = attachment.state === "accepted" ? (response ? "我愿意和你一起登岛" : "已接受 · 小岛已经开放") : attachment.state === "declined" ? attachment.reason || "这次邀请暂未接受" : attachment.responseStatus === "failed" ? "角色回应未完成" : "等待角色回应";
+    const respond = async (decision: "accept" | "decline") => {
+      if (!onCoupleIslandInvitationResponse || coupleBusy || state !== "pending") return;
+      setCoupleBusy(true);
+      try {
+        await onCoupleIslandInvitationResponse(message.id, decision);
+        setCoupleState(decision === "accept" ? "accepted" : "declined");
+      } finally { setCoupleBusy(false); }
+    };
+    const title = response ? (state === "accepted" ? "茶侣岛已开启" : state === "declined" ? "暂时拒绝" : "回应茶侣岛邀请") : "茶侣岛邀请";
+    const status = state === "accepted"
+      ? "小岛已经开放，去看看你们的共同角落"
+      : state === "declined"
+        ? attachment.reason || "这次先不了，之后还可以再次邀请"
+        : attachment.responseStatus === "failed"
+          ? "角色回应没有完成，可以重新邀请角色回应"
+          : source === "character"
+            ? "等待你的回应"
+            : "邀请已送达，等待角色回应";
+    const showCharacterActions = !response && source === "character" && state === "pending" && Boolean(onCoupleIslandInvitationResponse);
     return (
-      <div className={`couple-island-invitation-card ${attachment.state} ${response ? "response" : "invitation"}`}>
-        <button onClick={() => nav("/couple-island")} aria-label="打开茶侣岛角色列表">
-          <span className="couple-island-invitation-icon"><HeartHandshake /></span>
-          <span><small>{response ? "ISLAND RESPONSE" : "COUPLE ISLAND"}</small><b>{title}</b><em>{detail}</em></span>
+      <div className={`couple-island-invitation-card ${state} ${response ? "response" : "invitation"} source-${source}`}>
+        <button type="button" className="couple-island-ticket-main" onClick={() => nav("/couple-island")} aria-label="打开茶侣岛">
+          <span className="couple-island-ticket-top"><span className="couple-island-invitation-icon"><HeartHandshake /></span><span><small>COUPLE ISLAND</small><b>{title}</b></span></span>
+          <span className="couple-island-ticket-meta"><em>{source === "character" ? "角色发来的登岛票" : "邀请已送达"}</em><i aria-hidden="true">✦</i></span>
+          <span className="couple-island-ticket-divider" aria-hidden="true"><i /><i /><i /></span>
+          <span className="couple-island-ticket-status"><strong>{state === "accepted" ? "已接受" : state === "declined" ? "暂时拒绝" : source === "character" ? "等待你的回应" : "等待回应"}</strong><em>{status}</em></span>
         </button>
-        {!response && attachment.responseStatus === "failed" && attachment.responseTaskEventId && onInvitationRetry ? <button type="button" className="invitation-response-retry" onClick={() => void retry()}>重试角色回应</button> : null}
+        {showCharacterActions ? <div className="couple-island-ticket-actions" aria-label="茶侣岛邀请操作">
+          <button type="button" disabled={coupleBusy} aria-label="先不了" onClick={(event) => { event.stopPropagation(); void respond("decline"); }}>先不了</button>
+          <button type="button" disabled={coupleBusy} aria-label="接受登岛" onClick={(event) => { event.stopPropagation(); void respond("accept"); }}>{coupleBusy ? "处理中…" : "接受登岛"}</button>
+        </div> : state === "accepted" ? <button type="button" className="couple-island-ticket-enter" onClick={(event) => { event.stopPropagation(); nav("/couple-island"); }}>进入茶侣岛</button> : !response && source === "user" && attachment.responseStatus === "failed" && attachment.responseTaskEventId && onInvitationRetry ? <button type="button" className="couple-island-ticket-retry" disabled={coupleBusy} onClick={(event) => { event.stopPropagation(); void retry(); }}>{coupleBusy ? "重试中…" : "重试角色回应"}</button> : null}
       </div>
     );
-  }
-  if (attachment.type === "sticker") {
+  }  if (attachment.type === "sticker") {
     const src = attachment.assetId
       ? assets.get(attachment.assetId)?.data
       : attachment.url;

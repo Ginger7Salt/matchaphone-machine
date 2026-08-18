@@ -1593,7 +1593,7 @@ async function processPrivate(
       : Promise.resolve(),
     generatedTurn.islandAction
       ? executeCharacterIslandAction({ conversationId: conversation.id, characterId: character.id, action: generatedTurn.islandAction })
-      : islandContext?.pendingInvitation
+      : islandContext?.pendingInvitation && islandContext.pendingInvitationSource === "user"
         ? respondCoupleIslandInvitation(islandContext.pendingInvitation.id, "accept")
         : Promise.resolve(),
     source?.senderType === "user"

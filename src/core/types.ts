@@ -1362,6 +1362,8 @@ export type MessageAttachment =
       type: "couple-island-invitation";
       cardRole?: "invitation" | "response";
       characterId: string;
+      invitedBy?: "user" | "character";
+      responseBy?: "user" | "character";
       islandId?: string;
       state: "pending" | "accepted" | "declined";
       reason?: string;
@@ -2195,6 +2197,7 @@ export interface CoupleIslandEvent extends BaseEntity {
   reward?: { heartShells: number; experience: number };
 }
 export type CharacterIslandAction =
+  | { type: "invite-user" }
   | { type: "accept-invite" }
   | { type: "decline-invite"; reason: string }
   | { type: "leave-letter"; title?: string; text: string }

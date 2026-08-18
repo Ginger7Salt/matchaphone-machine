@@ -622,6 +622,7 @@ function parseIslandActionFromRoot(root: unknown): CharacterIslandAction | undef
   const action = (root as { islandAction?: unknown })?.islandAction;
   if (!action || typeof action !== "object") return;
   const value = action as Record<string, unknown>, type = value.type;
+  if (type === "invite-user") return { type };
   if (type === "accept-invite") return { type };
   if (type === "decline-invite" && typeof value.reason === "string" && value.reason.trim()) return { type, reason: value.reason.trim().slice(0, 240) };
   if (type === "leave-letter" && typeof value.text === "string" && value.text.trim()) return { type, text: value.text.trim().slice(0, 1200), ...(typeof value.title === "string" && value.title.trim() ? { title: value.title.trim().slice(0, 80) } : {}) };

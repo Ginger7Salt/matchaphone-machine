@@ -105,7 +105,7 @@ import { useStore } from "../core/store";
 import {appearanceSourceUrl} from "../core/imageAssetUsage";
 import { useMusicPlayer } from "../core/musicPlayer";
 import { createMusicInvitationMessage, respondMusicInvitation } from "../core/music";
-import { createCoupleIslandInvitation } from "../core/coupleIsland";
+import { createCoupleIslandInvitation, respondToCharacterIslandInvitation } from "../core/coupleIsland";
 import { createOutgoingWalletTransfer } from "../core/mall";
 import {
   now,
@@ -1159,6 +1159,12 @@ export default function ChatPage() {
     if (accept) showToast("已开始一起听");
   };
 
+  const respondToCoupleIslandInvitation = async (messageId: string, decision: "accept" | "decline", reason?: string) => {
+    await respondToCharacterIslandInvitation(messageId, decision, reason);
+    await reload();
+    if (decision === "accept") showToast("茶侣岛已经开放");
+  };
+
   const openExtension = (
     next:
       | Exclude<ChatMediaPanel, "extensions" | null>
@@ -1942,6 +1948,7 @@ export default function ChatPage() {
                                 : m.translation,
                           }}
                           assets={mediaAssets}
+                          onCoupleIslandInvitationResponse={respondToCoupleIslandInvitation}
                           onInvitationRetry={async (eventId) => {
                             await retryChatReply(eventId);
                             wakeChatReplyPump({ source: "foreground" });

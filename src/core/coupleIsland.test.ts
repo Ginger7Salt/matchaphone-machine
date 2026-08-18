@@ -8,6 +8,9 @@ import {
   buyIslandCatalogItem,
   completeIslandWish,
   createCoupleIslandInvitation,
+  createCharacterCoupleIslandInvitation,
+  respondToCharacterIslandInvitation,
+  buildCoupleIslandContext,
   deleteCoupleIslandDataForCharacter,
   executeCharacterIslandAction,
   addIslandEntry,
@@ -47,7 +50,36 @@ async function activeIsland(id = "a", strategy = false) {
   return { ...pair, message: invitation.message, island: accepted.island };
 }
 
-describe("couple island domain", () => {
+describe("couple island domain", () => {  it("supports a character-initiated invitation and an idempotent user response", async () => {
+    const { ch, conv } = await seedPair("character-invite", true);
+    const context = await buildCoupleIslandContext(conv.id, ch.id);
+    expect(context?.canCharacterInviteUser).toBe(true);
+    const created = await createCharacterCoupleIslandInvitation({ conversationId: conv.id, characterId: ch.id });
+    expect(created.created).toBe(true);
+    if (!created.message) throw new Error("missing invitation");
+    expect(created.message.senderType).toBe("character");
+    expect(created.message.attachments?.[0]).toMatchObject({ invitedBy: "character", state: "pending" });
+    const second = await createCharacterCoupleIslandInvitation({ conversationId: conv.id, characterId: ch.id });
+    expect(second.created).toBe(false);
+    const accepted = await respondToCharacterIslandInvitation(created.message.id, "accept");
+    expect(accepted?.decision).toBe("accept");
+    expect(await db.coupleIslands.where("conversationId").equals(conv.id).count()).toBe(1);
+    await respondToCharacterIslandInvitation(created.message.id, "accept");
+    expect(await db.messages.where("conversationId").equals(conv.id).filter((message) => message.id === `couple-island-user-response:${created.message!.id}`).count()).toBe(1);
+  });
+
+  it("declines a character invitation without creating an island and keeps the cooldown", async () => {
+    const { ch, conv } = await seedPair("character-decline", true);
+    const created = await createCharacterCoupleIslandInvitation({ conversationId: conv.id, characterId: ch.id });
+    if (!created.message) throw new Error("missing invitation");
+    const declined = await respondToCharacterIslandInvitation(created.message.id, "decline", "改天吧");
+    expect(declined?.decision).toBe("decline");
+    expect(await db.coupleIslands.where("conversationId").equals(conv.id).count()).toBe(0);
+    const context = await buildCoupleIslandContext(conv.id, ch.id);
+    expect(context?.canCharacterInviteUser).toBe(false);
+    expect((await db.messages.get(created.message.id))?.attachments?.[0]).toMatchObject({ state: "declined", responseBy: "user", reason: "改天吧" });
+  });
+
   beforeEach(async () => { await db.delete(); await db.open(); });
   afterEach(() => vi.restoreAllMocks());
 

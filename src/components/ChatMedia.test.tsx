@@ -161,3 +161,38 @@ describe("sticker message rendering", () => {
     expect(screen.queryByText("[表情包]")).not.toBeInTheDocument();
   });
 });
+
+describe("couple island invitation ticket", () => {
+  const invitation = (overrides: Partial<Message> = {}, attachment: Partial<Extract<NonNullable<Message["attachments"]>[number], { type: "couple-island-invitation" }>> = {}): Message => ({
+    id: "island-invite", schemaVersion: 1, createdAt: 1, updatedAt: 1, conversationId: "conversation", senderType: "character", senderId: "c", content: "邀请", kind: "couple-island-invitation", status: "complete",
+    attachments: [{ type: "couple-island-invitation", cardRole: "invitation", characterId: "c", invitedBy: "character", state: "pending", ...attachment }], ...overrides,
+  });
+
+  it("renders a character invitation as a ticket with accept and decline actions", () => {
+    render(<MemoryRouter><RichMessageContent message={invitation()} assets={new Map()} onCoupleIslandInvitationResponse={vi.fn(async () => {})} /></MemoryRouter>);
+    expect(screen.getByText("茶侣岛邀请")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "接受登岛" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "先不了" })).toBeInTheDocument();
+    expect(screen.queryByText("ISLAND RESPONSE")).not.toBeInTheDocument();
+  });
+
+  it("responds from the card without opening the island", async () => {
+    const onResponse = vi.fn(async () => {});
+    render(<MemoryRouter><RichMessageContent message={invitation()} assets={new Map()} onCoupleIslandInvitationResponse={onResponse} /></MemoryRouter>);
+    fireEvent.click(screen.getByRole("button", { name: "接受登岛" }));
+    await vi.waitFor(() => expect(onResponse).toHaveBeenCalledWith("island-invite", "accept"));
+  });
+
+  it("keeps user invitations in waiting state without user decision buttons", () => {
+    render(<MemoryRouter><RichMessageContent message={invitation({ senderType: "user" }, { invitedBy: "user" })} assets={new Map()} onCoupleIslandInvitationResponse={vi.fn(async () => {})} /></MemoryRouter>);
+    expect(screen.getByText("邀请已送达")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "接受登岛" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "先不了" })).not.toBeInTheDocument();
+  });
+
+  it("infers character source for legacy attachments and has no default button border", () => {
+    const { container } = render(<MemoryRouter><RichMessageContent message={invitation({}, { invitedBy: undefined })} assets={new Map()} onCoupleIslandInvitationResponse={vi.fn(async () => {})} /></MemoryRouter>);
+    expect(screen.getByRole("button", { name: "接受登岛" })).toBeInTheDocument();
+    expect(container.querySelector(".couple-island-ticket-main")?.className).toBe("couple-island-ticket-main");
+  });
+});

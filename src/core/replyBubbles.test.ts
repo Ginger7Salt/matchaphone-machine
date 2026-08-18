@@ -271,6 +271,12 @@ describe("reply bubble normalization", () => {
 
 
 // Character DJ 2.0 structured action coverage.
+describe("character island invite action", () => {
+  it("parses invite-user as a strict island action", () => {
+    const parsed = parseReplyTurn(JSON.stringify({ messages: [{ content: "我想带你去一个小岛。" }], islandAction: { type: "invite-user" } }), false, { min: 1, max: 8, adaptive: true }, false);
+    expect(parsed.islandAction).toEqual({ type: "invite-user" });
+  });
+});
 describe("character DJ music actions", () => {
   it("parses queue, search and balanced-control actions", () => {
     const base = { messages: [{ content: "这首之后换一首吧" }] };
