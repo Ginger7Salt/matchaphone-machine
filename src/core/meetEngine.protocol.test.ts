@@ -157,3 +157,29 @@ describe("unified meet round protocol", () => {
     ).toMatchObject({ count: 5, belowMinimum: false, aboveMaximum: false });
   });
 });
+
+describe("meet regression validation details", () => {
+  it("records deterministic detail codes for conservative round rejection", () => {
+    try {
+      parseMeetRoundResponseWithMeta(JSON.stringify({ version: 1, segments: [{ type: "dialogue", characterId: "ghost", text: "bad" }] }), ["one"]);
+      throw new Error("expected rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(MeetProtocolError);
+      expect((error as MeetProtocolError).detailCode).toBe("unknown-character");
+    }
+    try {
+      parseMeetRoundResponseWithMeta(JSON.stringify({ version: 1, segments: [{ type: "dialogue", characterId: "one", text: "ok" }], updates: [{ characterId: "one", scenePatch: { clothing: [123] } }] }), ["one"]);
+      throw new Error("expected rejection");
+    } catch (error) {
+      expect(error).toBeInstanceOf(MeetProtocolError);
+      expect((error as MeetProtocolError).detailCode).toBe("invalid-scene-update");
+    }
+  });
+
+  it("accepts deterministic version and optional-field normalization", () => {
+    const result = parseMeetRoundResponseWithMeta(JSON.stringify({ version: "1", segments: [{ type: "dialogue", characterId: "one", text: "ok" }], thoughts: null, updates: null, suggestions: null }), ["one"]);
+    expect(result.payload.version).toBe(1);
+    expect(result.repairApplied).toBe(true);
+  });
+
+});

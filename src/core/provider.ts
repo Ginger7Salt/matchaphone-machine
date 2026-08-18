@@ -76,6 +76,8 @@ export interface ProviderChatResult {
   contentLengthMatched?: boolean;
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
+  /** Sanitized structural path used to extract visible model output. */
+  normalizationPath?: string;
 }
 export interface ProviderChatOptions {
   signal?: AbortSignal;
@@ -214,7 +216,7 @@ function replyRowLike(value: unknown) {
   return ["content", "message", "reply"].some((key) => typeof value[key] === "string");
 }
 function directMeetRoundText(value: unknown) {
-  if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.segments)) return undefined;
+  if (!isRecord(value) || (value.version !== 1 && value.version !== "1") || !Array.isArray(value.segments)) return undefined;
   return safeJson(value);
 }
 function meetRoundValueOf(value: unknown): unknown {
@@ -850,6 +852,7 @@ function parseSseOrNdjson(
       declaredContentLength: transportMeta?.declaredContentLength,
       contentLengthMatched: transportMeta?.contentLengthMatched,
       tailKind: transportMeta?.tailKind ?? responseTailKind(raw),
+      normalizationPath: visibleCandidatePaths[0] ?? normalized.normalizationPath,
     };
   } catch (error) {
     if (error instanceof ProviderResponseParseError) {
@@ -1062,6 +1065,7 @@ function parseChatResponse(
     protocolValidationReached: Boolean(
       completeVisibleRole || (signals.structuredDiagnostics ?? structuredDiagnostics)?.wireFormat,
     ),
+    normalizationPath: visibleCandidatePaths[0],
     ...transportMetaFields(transportMeta),
   };
 }

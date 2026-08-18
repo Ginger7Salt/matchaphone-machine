@@ -50,6 +50,8 @@ import {
   type Conversation,
   type Memory,
   type MeetEntry,
+  type MeetFailureDetailCode,
+  type MeetRetryDecision,
   type MeetNarrativeSettings,
   type MeetRoundPayload,
   type MeetScene,
@@ -115,7 +117,16 @@ function buildMeetMemorySections(memories:Memory[],characters:Character[],conver
 function shouldUseCompactStreamingRetry(error: unknown) {
   if (!(error instanceof ProviderError)) return false;
   const code = error.apiError?.providerCode;
-  return code === "truncated_json" || code === "transport_truncated" || code === "malformed_envelope";
+  return [
+    "truncated_json",
+    "transport_truncated",
+    "malformed_envelope",
+    "invalid_response",
+    "empty_response",
+    "empty_stream",
+    "reasoning_only",
+    "tool_only_response",
+  ].includes(code ?? "");
 }
 
 function providerIdentity(provider: ProviderSettings) {
@@ -170,6 +181,8 @@ function meetFailureMessage(
   if (rateAttempts) return "当前模型暂时达到调用频率或额度限制，请稍后重试，或在设置中配置副 API";
   if (blockedAttempts) return fallbackAttempted ? "主 API 和副 API 均被模型安全策略拦截" : "当前内容被模型安全策略拦截，请尝试缩短上下文或更换模型";
   if (corsAttempts) return fallbackAttempted ? "主 API 无法从浏览器访问，副 API 也未完成" : "当前模型无法被浏览器访问，请检查 CORS 或配置副 API";
+  const detailCode = meetFailureDetailCodeOf(error);
+  if (detailCode && detailCode !== "invalid-segment") return `统一见面结构校验失败（${detailCode}），请重新生成`;
   if (error instanceof ProviderError && error.message) return error.message;
   return "本轮场景生成未完成，请重新生成";
 }
@@ -371,7 +384,10 @@ async function updateMeetGeneration(
 }
 class MeetRoundValidationError extends Error {
   readonly code = "invalid_meet_round";
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly detailCode: MeetFailureDetailCode,
+  ) {
     super(message);
     this.name = "MeetRoundValidationError";
   }
@@ -399,6 +415,27 @@ function meetRoundOutputBudget(
       Math.ceil(settings.maxChars * 2.2) + thoughtReserve + 1_000,
     ),
   );
+}
+
+function meetFailureDetailCodeOf(error: unknown): MeetFailureDetailCode | undefined {
+  if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError)
+    return error.detailCode;
+  return undefined;
+}
+
+function retryInstructionOf(error: unknown) {
+  if (shouldUseCompactStreamingRetry(error))
+    return "上一次响应未形成完整可解析的正文。本次使用更短上下文重新生成：只输出一个完整单行 JSON；不得续写或拼接上一次响应。";
+  if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError)
+    return `上一次完整响应未通过统一见面结构校验（${error.detailCode}）。请重新生成完整对象：version 必须为 1，segments 必须按发生顺序排列并包含至少一条当前角色的 dialogue；不要解释、不要代码块、不要普通聊天 {m,v}。`;
+  return "上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成：只输出一个完整单行 JSON；必须包含 version=1、按顺序的 segments 和至少一条有效角色台词；不要续写、解释、代码块或普通聊天 {m,v}。";
+}
+
+function retryDecisionOf(error: unknown, hasDistinctSecondary: boolean): MeetRetryDecision {
+  if (shouldUseSecondaryMeetProvider(error))
+    return hasDistinctSecondary ? "secondary-fallback" : "stop-no-distinct-secondary";
+  if (shouldUseCompactStreamingRetry(error)) return "compact-primary-retry";
+  return "structure-primary-retry";
 }
 
 function meetAttemptErrorKind(error: unknown) {
@@ -850,10 +887,18 @@ async function generateMeetTurnInternal(
 
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
       const fallbackRequested = attemptIndex === 1 && shouldUseSecondaryMeetProvider(lastError);
-      if (fallbackRequested && !hasDistinctSecondary) break;
+      if (fallbackRequested && !hasDistinctSecondary) {
+        generationMeta.retryDecision = "stop-no-distinct-secondary";
+        generationMeta.sameProviderRetryPrevented = true;
+        const previousAttempt = generationMeta.attempts?.[(generationMeta.attempts?.length ?? 1) - 1];
+        if (previousAttempt) previousAttempt.retryDecision = "stop-no-distinct-secondary";
+        await safeUpdateGeneration();
+        break;
+      }
       const attemptProvider = fallbackRequested ? secondaryProvider : provider,
         providerRole = fallbackRequested ? "secondary-fallback" as const : "primary" as const,
         ordinal = (attemptIndex + 1) as 1 | 2,
+        retryDecision = attemptIndex ? retryDecisionOf(lastError, hasDistinctSecondary) : undefined,
         fittedPrompt = fitPrioritizedPromptSections(
           [
             ...promptSections,
@@ -861,8 +906,7 @@ async function generateMeetTurnInternal(
               ? [
                   {
                     id: "retry-contract",
-                    content:
-                      "上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成：只输出一个完整单行 JSON；必须包含 version=1、按顺序的 segments 和至少一条有效角色台词；不要续写、解释、代码块或普通聊天 {m,v}。",
+                    content: retryInstructionOf(lastError),
                     required: true,
                   } satisfies PrioritizedPromptSection,
                 ]
@@ -895,8 +939,10 @@ async function generateMeetTurnInternal(
           model: attemptProvider.model,
           providerRole,
           inputTokens,
+          retryDecision,
         };
       generationMeta.contextPruned = Boolean(generationMeta.contextPruned || promptWasPruned);
+      if (retryDecision) generationMeta.retryDecision = retryDecision;
       generationMeta.contextBudgetTokens = MEET_ROUND_INPUT_BUDGET[attemptIndex];
       if (generationMeta.contextDiagnostics) {
         generationMeta.contextDiagnostics.contextPruned = generationMeta.contextPruned;
@@ -940,6 +986,7 @@ async function generateMeetTurnInternal(
           outputTokens: response.outputTokens,
           finishReason: response.finishReason,
           truncated: response.truncated,
+          normalizationPath: response.normalizationPath,
         });
         Object.assign(generationMeta, {
           stage: "parsing" as const,
@@ -948,6 +995,7 @@ async function generateMeetTurnInternal(
           outputTokens: response.outputTokens,
           finishReason: response.finishReason,
           truncated: response.truncated,
+          normalizationPath: response.normalizationPath,
         });
         await safeUpdateGeneration();
 
@@ -971,7 +1019,7 @@ async function generateMeetTurnInternal(
         await safeUpdateGeneration();
         const violation = meetRoundStyleViolation(parsed, settings);
         if (violation.styleInvalid)
-          throw new MeetRoundValidationError("见面整轮文风或结构不符合要求");
+          throw new MeetRoundValidationError("见面整轮文风或结构不符合要求", "style-invalid");
         if (violation.belowMinimum || violation.aboveMaximum) {
           const slightDeviation =
             violation.count >= Math.floor(settings.minChars * 0.75) &&
@@ -979,6 +1027,7 @@ async function generateMeetTurnInternal(
           if (attemptIndex === 0 || !slightDeviation)
             throw new MeetRoundValidationError(
               `见面整轮正文篇幅未达到设置范围（需要 ${settings.minChars}-${settings.maxChars} 字，实际 ${violation.count} 字）`,
+              "length-out-of-range",
             );
           lengthWarning = `本轮正文为 ${violation.count} 字，略偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
         }
@@ -986,6 +1035,7 @@ async function generateMeetTurnInternal(
         successfulAttempt = ordinal;
         successfulProvider = attemptProvider;
         generationMeta.failureClass = undefined;
+        generationMeta.failureDetailCode = undefined;
         lastError = undefined;
         break;
       } catch (error) {
@@ -1004,11 +1054,15 @@ async function generateMeetTurnInternal(
         )
           attemptMeta.stage = "parsing";
         attemptMeta.errorKind = meetAttemptErrorKind(error);
+        attemptMeta.failureDetailCode = meetFailureDetailCodeOf(error);
         generationMeta.failureClass = meetFailureClassOf(error);
+        generationMeta.failureDetailCode = meetFailureDetailCodeOf(error);
         if (error instanceof ProviderError) {
           attemptMeta.httpStatus = error.apiError?.httpStatus;
           attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;
           attemptMeta.providerCode = error.apiError?.providerCode;
+          attemptMeta.normalizationPath = error.apiError?.visibleCandidatePaths?.[0];
+          generationMeta.normalizationPath = error.apiError?.visibleCandidatePaths?.[0];
           attemptMeta.responseShape ??= error.apiError?.responseShape;
           attemptMeta.rawLength ??= error.apiError?.rawLength;
           attemptMeta.finishReason ??= error.apiError?.finishReason;
@@ -1023,6 +1077,11 @@ async function generateMeetTurnInternal(
           );
         }
         generationMeta.stage = attemptMeta.stage;
+        const nextDecision = retryDecisionOf(error, hasDistinctSecondary);
+        attemptMeta.retryDecision = attemptIndex === 1 ? "stop-after-second-attempt" : nextDecision;
+        generationMeta.retryDecision = attemptMeta.retryDecision;
+        if (nextDecision === "stop-no-distinct-secondary")
+          generationMeta.sameProviderRetryPrevented = true;
         await safeUpdateGeneration();
       }
     }

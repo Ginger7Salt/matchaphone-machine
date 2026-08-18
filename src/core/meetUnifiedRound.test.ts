@@ -144,6 +144,13 @@ function rateFailure(retryAfterSeconds = 30) {
     detail: "rate limited",
   } as any);
 }
+function corsFailure() {
+  return new ProviderError("cors", "浏览器无法访问", "", { kind: "cors", providerCode: "cors_or_fetch_failed", detail: "Failed to fetch" } as any);
+}
+function blockedFailure() {
+  return new ProviderError("format", "内容被拦截", "", { kind: "format", providerCode: "prompt_blocked", detail: "blocked" } as any);
+}
+
 describe("unified meet round generation", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -566,5 +573,47 @@ describe("unified meet round generation", () => {
       rawLength: 321,
       providerCode: "transport_truncated",
     });
+  });
+});
+
+
+describe("meet production error closure regressions", () => {
+  beforeEach(() => { vi.restoreAllMocks(); });
+  it("uses a distinct secondary provider after CORS without retrying the primary", async () => {
+    await setup(["one"]);
+    await configureSecondary();
+    const models: string[] = [];
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockImplementation(async function (this: any) {
+      models.push((this as any).settings.model);
+      if (models.length === 1) throw corsFailure();
+      return response(validRound());
+    });
+    await generateMeetTurn("meet-unified", "继续");
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(models).toEqual(["test-model", "secondary-model"]);
+    const user = (await db.meetSessions.get("meet-unified"))?.entries.find((entry) => entry.senderType === "user");
+    expect(user?.generation).toMatchObject({ fallbackUsed: true, retryDecision: "secondary-fallback", attempts: [{ providerRole: "primary", errorKind: "cors" }, { providerRole: "secondary-fallback" }] });
+  });
+
+  it("stops after prompt blocking when no distinct secondary exists", async () => {
+    await setup(["one"]);
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockRejectedValue(blockedFailure());
+    await expect(generateMeetTurn("meet-unified", "继续")).rejects.toThrow("安全策略拦截");
+    expect(chat).toHaveBeenCalledTimes(1);
+    const user = (await db.meetSessions.get("meet-unified"))?.entries.find((entry) => entry.senderType === "user");
+    expect(user?.generation).toMatchObject({ failureClass: "provider-prompt-blocked", retryDecision: "stop-no-distinct-secondary", sameProviderRetryPrevented: true, saveResult: "not-attempted" });
+  });
+
+  it("retries a structural round failure once on the same primary without including failed output", async () => {
+    await setup(["one"]);
+    const invalid = { version: 1, segments: [{ type: "narration", text: "only narration" }], debug: "must not be copied" };
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValueOnce(response(invalid)).mockResolvedValueOnce(response(validRound()));
+    await generateMeetTurn("meet-unified", "继续");
+    expect(chat).toHaveBeenCalledTimes(2);
+    const retryPrompt = chat.mock.calls[1][0].map((item) => item.content).join("\n");
+    expect(retryPrompt).toContain("missing-dialogue");
+    expect(retryPrompt).not.toContain("must not be copied");
+    const user = (await db.meetSessions.get("meet-unified"))?.entries.find((entry) => entry.senderType === "user");
+    expect(user?.generation?.attempts).toMatchObject([{ errorKind: "invalid_meet_protocol", failureDetailCode: "missing-dialogue", retryDecision: "structure-primary-retry" }, { providerRole: "primary" }]);
   });
 });

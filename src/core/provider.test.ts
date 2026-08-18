@@ -328,3 +328,20 @@ describe("chat timeout override",()=>{
   await expect(new OpenAIProvider(slowSettings).chat([{role:"user",content:"hi"}],{stream:false,timeoutMs:null})).resolves.toBe("OK");
  });
 });
+
+describe("meet regression envelopes", () => {
+  it("normalizes a string version and null optional arrays without changing visible content", async () => {
+    const round = { version: "1", segments: [{ type: "dialogue", characterId: "one", text: "Stable dialogue" }], thoughts: null, updates: null, suggestions: null };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(round) } }] }), { status: 200, headers: { "Content-Type": "application/json" } })));
+    const result = await new OpenAIProvider(settings).chatWithMeta([{ role: "user", content: "meet" }], { stream: false });
+    expect(result.text).toContain('"version":"1"');
+    expect(result.normalizationPath).toContain("choices[0].message.content");
+  });
+
+  it("does not mistake SSE event metadata for a visible meet response", async () => {
+    const body = `data: ${JSON.stringify({ status: "completed", usage: { output_tokens: 12 } })}\n\ndata: [DONE]\n`;
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(streamResponse([body])));
+    await expect(new OpenAIProvider({ ...settings, stream: true }).chatWithMeta([{ role: "user", content: "meet" }], { stream: true })).rejects.toMatchObject({ apiError: { providerCode: "empty_stream" } });
+  });
+
+});

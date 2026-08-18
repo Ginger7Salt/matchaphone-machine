@@ -1605,6 +1605,21 @@ export interface MeetRoundPayload {
   warnings?: string[];
 }
 
+export type MeetFailureDetailCode =
+  | "empty-segments"
+  | "missing-dialogue"
+  | "unknown-character"
+  | "invalid-segment"
+  | "invalid-scene-update"
+  | "length-out-of-range"
+  | "style-invalid";
+export type MeetRetryDecision =
+  | "secondary-fallback"
+  | "compact-primary-retry"
+  | "structure-primary-retry"
+  | "stop-no-distinct-secondary"
+  | "stop-after-second-attempt";
+
 export interface MeetEntry {
   id: string;
   roundId: string;
@@ -1650,6 +1665,10 @@ export interface MeetEntry {
       | "invalid-meet-round"
       | "storage-failed"
       | "aborted";
+    failureDetailCode?: MeetFailureDetailCode;
+    retryDecision?: MeetRetryDecision;
+    normalizationPath?: string;
+    sameProviderRetryPrevented?: boolean;
     error?: string;
     model?: string;
     fallbackUsed?: boolean;
@@ -1686,6 +1705,9 @@ export interface MeetEntry {
       inputTokens?: number;
       errorKind?: string;
       providerCode?: string;
+      failureDetailCode?: MeetFailureDetailCode;
+      retryDecision?: MeetRetryDecision;
+      normalizationPath?: string;
     }>;
     characterResults?: Array<{
       characterId: string;

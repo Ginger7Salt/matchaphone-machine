@@ -7,6 +7,7 @@ import { meetLengthRangeViolation, meetVisibleCharacterCount } from "./meet";
 import type {
   Character,
   MeetCompiledStyle,
+  MeetFailureDetailCode,
   MeetNarrativeSettings,
   MeetPlotProgress,
   MeetRoundPayload,
@@ -124,7 +125,13 @@ export const meetTurnSchema = z
   ;
 export class MeetProtocolError extends Error {
   readonly code = "invalid_meet_protocol" as const;
-  constructor(message = "见面回复未遵循见面专用协议") { super(message); this.name = "MeetProtocolError"; }
+  constructor(
+    message = "见面回复未遵循见面专用协议",
+    readonly detailCode: MeetFailureDetailCode = "invalid-segment",
+  ) {
+    super(message);
+    this.name = "MeetProtocolError";
+  }
 }
 function meetRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
@@ -181,19 +188,40 @@ const meetRoundUpdateSchema = z.object({
   plotProgress: meetTurnSchema.shape.plotProgress.optional(),
 });
 
+function normalizedMeetRoundRoot(record: Record<string, unknown>) {
+  const root = { ...record };
+  let repairApplied = false;
+  if (root.version === "1") {
+    root.version = 1;
+    repairApplied = true;
+  }
+  for (const key of ["thoughts", "updates", "suggestions"] as const) {
+    if (root[key] === null) {
+      delete root[key];
+      repairApplied = true;
+    }
+  }
+  return { root, repairApplied };
+}
+
 function unwrapMeetRoundRoot(value: unknown): { root: Record<string, unknown>; repairApplied: boolean } | undefined {
   let current = value;
   let repairApplied = false;
   for (let depth = 0; depth < 5; depth += 1) {
     if (Array.isArray(current)) {
-      const candidate = current.find((item) => meetRecord(item)?.version === 1 && Array.isArray(meetRecord(item)?.segments));
+      const candidate = current.find((item) => {
+        const record = meetRecord(item);
+        return Boolean(record && (record.version === 1 || record.version === "1") && Array.isArray(record.segments));
+      });
       if (candidate) { current = candidate; repairApplied = true; continue; }
       return undefined;
     }
     const record = meetRecord(current);
     if (!record) return undefined;
-    if (record.version === 1 && Array.isArray(record.segments))
-      return { root: record, repairApplied };
+    if ((record.version === 1 || record.version === "1") && Array.isArray(record.segments)) {
+      const normalized = normalizedMeetRoundRoot(record);
+      return { root: normalized.root, repairApplied: repairApplied || normalized.repairApplied };
+    }
     const key = ["data", "result", "response", "body", "payload", "output"].find((name) => record[name] !== undefined);
     if (!key) return undefined;
     const nested = record[key];
@@ -222,6 +250,7 @@ export function parseMeetRoundResponseWithMeta(
   } catch (error) {
     throw new MeetProtocolError(
       error instanceof Error ? error.message : "见面整轮 JSON 无法解析",
+      "invalid-segment",
     );
   }
   const originalRoot = meetRecord(value);
@@ -230,12 +259,16 @@ export function parseMeetRoundResponseWithMeta(
   const unwrapped = unwrapMeetRoundRoot(value);
   const root = unwrapped?.root;
   if (!root)
-    throw new MeetProtocolError("\u89c1\u9762\u6574\u8f6e\u56de\u590d\u5fc5\u987b\u662f JSON \u5bf9\u8c61");
+    throw new MeetProtocolError("见面整轮回复必须是 JSON 对象", "invalid-segment");
+  if (!Array.isArray(root.segments))
+    throw new MeetProtocolError("见面整轮缺少有效的 segments 数组", "invalid-segment");
+  if (!root.segments.length)
+    throw new MeetProtocolError("见面整轮没有可保存的场景片段", "empty-segments");
   let parsed: z.infer<typeof meetRoundCoreSchema>;
   try {
     parsed = meetRoundCoreSchema.parse(root);
   } catch {
-    throw new MeetProtocolError("见面整轮字段不完整或格式不符合要求");
+    throw new MeetProtocolError("见面整轮片段字段不完整或格式不符合要求", "invalid-segment");
   }
   const allowed = new Set(participantIds);
   const dialogueSegments = parsed.segments.filter(
@@ -243,12 +276,12 @@ export function parseMeetRoundResponseWithMeta(
       segment.type === "dialogue",
   );
   if (!dialogueSegments.length)
-    throw new MeetProtocolError("见面整轮至少需要一条角色台词");
+    throw new MeetProtocolError("见面整轮至少需要一条角色台词", "missing-dialogue");
   const unknownDialogue = dialogueSegments.find(
     (segment) => !allowed.has(segment.characterId),
   );
   if (unknownDialogue)
-    throw new MeetProtocolError("见面整轮包含不在当前场景中的角色 ID");
+    throw new MeetProtocolError("见面整轮包含不在当前场景中的角色 ID", "unknown-character");
 
   const warnings: string[] = [];
   const thoughts: NonNullable<MeetRoundPayload["thoughts"]> = [];
@@ -283,15 +316,19 @@ export function parseMeetRoundResponseWithMeta(
   const seenUpdates = new Set<string>();
   for (const candidate of parsed.updates ?? []) {
     const result = meetRoundUpdateSchema.safeParse(candidate);
+    if (!result.success)
+      throw new MeetProtocolError("见面整轮包含无效的场景状态更新", "invalid-scene-update");
+    if (!allowed.has(result.data.characterId)) {
+      warnings.push("已忽略不在当前场景中的场景状态更新");
+      continue;
+    }
     if (
-      !result.success ||
-      !allowed.has(result.data.characterId) ||
       seenUpdates.has(result.data.characterId) ||
       !dialogueSegments.some(
         (segment) => segment.characterId === result.data.characterId,
       )
     ) {
-      warnings.push("已忽略无效或重复的场景状态更新");
+      warnings.push("已忽略重复或没有对应台词的场景状态更新");
       continue;
     }
     seenUpdates.add(result.data.characterId);

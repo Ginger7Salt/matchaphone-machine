@@ -52,9 +52,26 @@ const timeLabel = (value: number) =>
     minute: "2-digit",
     hour12: false,
   });
+const meetFailureDetailText: Record<string, string> = {
+  "empty-segments": "响应没有可保存的场景片段",
+  "missing-dialogue": "响应没有包含有效的角色台词",
+  "unknown-character": "响应引用了当前场景之外的角色",
+  "invalid-segment": "响应中的场景片段结构无法识别",
+  "invalid-scene-update": "响应中的场景状态更新无法识别",
+  "length-out-of-range": "响应篇幅不符合见面设置",
+  "style-invalid": "响应文风或结构不符合见面设置",
+};
 const meetGenerationErrorText = (entry: MeetEntry) => {
   const generation = entry.generation;
   if (generation?.error) return generation.error;
+  if (generation?.failureClass === "provider-cors")
+    return "当前 Provider 不支持浏览器直连或跨域访问，请更换支持 CORS 的接口或配置副 API";
+  if (generation?.failureClass === "provider-prompt-blocked")
+    return "当前内容被模型安全策略拦截，请缩短上下文或更换模型";
+  if (generation?.failureClass === "response-truncated")
+    return "Provider 返回的响应被截断，请重新生成";
+  if (generation?.failureDetailCode && meetFailureDetailText[generation.failureDetailCode])
+    return meetFailureDetailText[generation.failureDetailCode];
   if (generation?.attempts?.some((attempt) => attempt.errorKind === "rate"))
     return "当前模型暂时达到调用频率或额度限制，请稍后重试，或在设置中配置副 API";
   return "本轮场景生成未完成，请重试";
@@ -341,6 +358,9 @@ export default function MeetSessionPage() {
       `attempt${attempt.ordinal}.inputTokens=${attempt.inputTokens ?? "unknown"}`,
       `attempt${attempt.ordinal}.errorKind=${attempt.errorKind ?? "none"}`,
       `attempt${attempt.ordinal}.providerCode=${attempt.providerCode ?? "none"}`,
+      `attempt${attempt.ordinal}.failureDetailCode=${attempt.failureDetailCode ?? "none"}`,
+      `attempt${attempt.ordinal}.retryDecision=${attempt.retryDecision ?? "none"}`,
+      `attempt${attempt.ordinal}.normalizationPath=${attempt.normalizationPath ?? "none"}`,
     ]);
     const diagnostic = [
       "feature=meet",
@@ -354,6 +374,10 @@ export default function MeetSessionPage() {
       "contextBudgetTokens=" + (generation.contextBudgetTokens ?? "unknown"),
       "repairApplied=" + Boolean(generation.repairApplied),
       "repairRejected=" + Boolean(generation.repairRejected),
+      "failureDetailCode=" + (generation.failureDetailCode ?? "none"),
+      "retryDecision=" + (generation.retryDecision ?? "none"),
+      "normalizationPath=" + (generation.normalizationPath ?? "none"),
+      "sameProviderRetryPrevented=" + Boolean(generation.sameProviderRetryPrevented),
       "postProcessingStatus=" + (generation.postProcessingStatus ?? "not-applicable"),
       "model=" + (generation.model ?? "unknown"),
       "responseShape=" + (generation.responseShape ?? "unknown"),
