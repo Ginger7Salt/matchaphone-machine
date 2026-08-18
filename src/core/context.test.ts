@@ -1,5 +1,5 @@
 import {describe,expect,it} from "vitest";
-import {buildContext,matchLore} from "./context";
+import {buildContext,buildContextWithDiagnostics,matchLore} from "./context";
 import {localTimeSnapshot} from "./localTime";
 import {defaultProvider,type Character,type Conversation,type LoreBook} from "./types";
 const character:Character={id:"c",schemaVersion:1,createdAt:1,updatedAt:1,name:"月白",avatar:"",bio:"旅人",personality:"安静",speakingStyle:"简洁",background:"来自旧城",language:"中文",proactive:{messages:false,timeAware:false,frequency:"medium",quietStart:"23:00",quietEnd:"08:00",catchupLimit:3,dailyLimit:10},relationship:{intimacy:1,trust:2,mood:"平静",recentEvents:[]},lastActiveAt:1};const conversation:Conversation={id:"v",schemaVersion:1,createdAt:1,updatedAt:1,title:"月白",type:"private",memberIds:["c"],presetIds:[],loreBookIds:[],lastActivityAt:1};
@@ -16,4 +16,10 @@ describe("sticker model context",()=>{
  });
  it("uses the supplied generation time snapshot only when time awareness is enabled",()=>{const at=new Date(2026,0,2,3,4),aware={...character,proactive:{...character.proactive,timeAware:true}},snapshot=localTimeSnapshot(at),enabled=buildContext({character:aware,conversation,messages:[],loreBooks:[],memories:[],userText:"hello",settings:{},provider:defaultProvider,timeAt:at})[0].content,disabled=buildContext({character,conversation,messages:[],loreBooks:[],memories:[],userText:"hello",settings:{},provider:defaultProvider,timeAt:at})[0].content;expect(enabled).toContain(snapshot.time);expect(enabled).toContain(snapshot.timezoneOffset);expect(disabled).not.toContain(snapshot.time)});
 
+});
+
+
+describe("bounded mobile context",()=>{
+ it("reports redacted section sizes and caps memory tokens",()=>{const memories=Array.from({length:10},(_,index)=>({id:"memory-"+index,schemaVersion:1,createdAt:1,updatedAt:index+1,characterId:"c",conversationId:"v",kind:"fact" as const,content:(index===0?"current topic ":"")+"m".repeat(1800)+index,source:"test",importance:10-index,locked:false})),built=buildContextWithDiagnostics({character,conversation,messages:[],loreBooks:[],memories,userText:"current topic",settings:{},provider:defaultProvider});expect(built.diagnostics.memoryTokens).toBeLessThanOrEqual(3200);expect(built.diagnostics.memoryCount).toBeLessThan(10);expect(built.diagnostics.totalInputTokens).toBeGreaterThan(0);expect(JSON.stringify(built.diagnostics)).not.toContain("current topic")});
+ it("keeps recent history within the private-chat token profile",()=>{const messages=Array.from({length:30},(_,index)=>({id:"history-"+index,schemaVersion:1,createdAt:index+1,updatedAt:index+1,conversationId:"v",senderType:index%2?"character" as const:"user" as const,senderId:index%2?"c":"user",content:"h".repeat(1800)+index,status:"complete" as const})),built=buildContextWithDiagnostics({character,conversation,messages,loreBooks:[],memories:[],userText:"latest",settings:{},provider:defaultProvider});expect(built.diagnostics.historyTokens).toBeLessThanOrEqual(8200);expect(built.items.filter(item=>item.role!=="system").length).toBeLessThan(messages.length+1)});
 });

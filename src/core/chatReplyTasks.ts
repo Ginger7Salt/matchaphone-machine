@@ -1,6 +1,6 @@
 import { dataLifecycleMutationActive } from "./dataLifecycle";
 import { db, getAppSettings, getProvider } from "./db";
-import { buildContext } from "./context";
+import { buildContext, buildContextWithDiagnostics } from "./context";
 import { buildListeningContext, executeCharacterMusicAction, listeningContextPrompt } from "./music";
 import { buildCoupleIslandContext, coupleIslandContextPrompt, executeCharacterIslandAction, respondCoupleIslandInvitation, rewardIslandChat } from "./coupleIsland";
 import {
@@ -64,6 +64,7 @@ import {
   type ChatReplyTaskPayload,
   type ReplyBubbleCountDiagnostics,
   type ReplyBubbleCountPlan,
+  type ContextSectionDiagnostics,
   type Conversation,
   type LoreBook,
   type MediaAsset,
@@ -79,6 +80,13 @@ const CHAT_PROVIDER_CALL_LIMIT = 2 as const;
 const AUTO_RESUME_DELAY_MS = 2_000;
 const CHAT_REPLY_OWNER_ID = uid();
 const activeControllers = new Map<string, AbortController>();
+
+async function recordContextDiagnostics(task:BackgroundTask,diagnostics:ContextSectionDiagnostics,actorId?:string){
+  const current=await db.backgroundTasks.get(task.id);
+  if(!current||!validReplyTaskPayload(current.payload))return;
+  const currentPayload=current.payload;
+  await db.backgroundTasks.update(task.id,{payload:actorId?{...currentPayload,contextDiagnosticsByActor:{...(currentPayload.contextDiagnosticsByActor??{}),[actorId]:diagnostics}}:{...currentPayload,contextDiagnostics:diagnostics},updatedAt:now()});
+}
 export type ChatReplyGuidance = {
   reasons: RegenerationReason[];
   instruction: string;
@@ -1412,7 +1420,7 @@ async function processPrivate(
       meetSessions,
       names: Object.fromEntries(characters.map((item) => [item.id, item.name])),
     }),
-    ctx = buildContext({
+    builtContext = buildContextWithDiagnostics({
       character,
       conversation,
       messages: history,
@@ -1431,7 +1439,9 @@ async function processPrivate(
       presence,
       crossModeContinuity,
       timeAt: generationTime,
-    });
+    }),
+    ctx = builtContext.items;
+  await recordContextDiagnostics(task,builtContext.diagnostics);
   const continuityContext = innerVoiceContinuityContext(history, character.id);
   if (continuityContext) ctx.push({ role: "system", content: continuityContext });
   const bubbleCountPlan = await ensurePersistedBubbleCountPlan(task, character, ctx, "private");
@@ -1895,7 +1905,7 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         meetSessions,
         names: Object.fromEntries(actors.map((actor) => [actor.id, actor.name])),
       }),
-      ctx = buildContext({
+      builtContext = buildContextWithDiagnostics({
         character: speaker.character,
         conversation,
         messages: history,
@@ -1917,7 +1927,9 @@ async function processGroup(task: BackgroundTask, controller: AbortController) {
         presence,
         crossModeContinuity,
         timeAt: generationTime,
-      });
+      }),
+      ctx = builtContext.items;
+    await recordContextDiagnostics(task,builtContext.diagnostics,speaker.id);
     const bubbleCountPlan = await ensurePersistedBubbleCountPlan(
       task,
       speaker.character,
@@ -2392,6 +2404,8 @@ export async function chatReplyDiagnostic(eventId: string) {
       providerCallLimit: payload?.providerCallLimit ?? CHAT_PROVIDER_CALL_LIMIT,
       providerCallCount: payload?.providerCallCount ?? 0,
       providerCallTrace: payload?.providerCallTrace ?? [],
+      contextDiagnostics: payload?.contextDiagnostics,
+      contextDiagnosticsByActor: payload?.contextDiagnosticsByActor,
       groupProviderCallLimit,
       groupProviderCallCount,
       groupProviderCallBudgets,

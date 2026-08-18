@@ -53,3 +53,10 @@ describe("global lore budget", () => {
     expect(low.entries[0].content).toBe("L".repeat(7));
   });
 });
+
+
+describe("unlimited lore source storage",()=>{
+ it("keeps a very long TXT entry intact",()=>{const body="start-"+"x".repeat(120000)+"-end",preview=parseLoreImport("Long lore\n"+body,"long.txt"),content=preview.books[0].entries[0].content;expect(content).toContain("start-");expect(content.endsWith("-end")).toBe(true);expect(content.length).toBeGreaterThanOrEqual(body.length)});
+ it("never mutates oversized source content when runtime budget skips it",()=>{const source="z".repeat(10000),book=makeBookForLongSource(source),result=evaluateLore({books:[book],texts:["anything"],characterId:"char",conversationId:"conversation",budget:100});expect(result[0].injected).toBe(false);expect(result[0].reason).toBe("\u6ce8\u5165\u9884\u7b97\u4e0d\u8db3");expect(book.entries[0].content).toBe(source)});
+});
+function makeBookForLongSource(content:string){return{id:"long",schemaVersion:1,createdAt:1,updatedAt:1,name:"long",description:"",enabled:true,entries:[{id:"long-entry",title:"long",keywords:[],constant:true,content,priority:100,enabled:true,scope:{type:"global" as const}}]}}

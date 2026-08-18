@@ -7,8 +7,10 @@ import { OpenAIProvider, ProviderError, isContextOverflowError } from "./provide
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
+  estimateTextTokens,
   fitPrioritizedPromptSections,
-  INTERNAL_LORE_BUDGET_TOKENS,
+  INTERNAL_CONTEXT_WINDOW_TOKENS,
+  MEET_LORE_BUDGET_CHARS,
   type PrioritizedPromptSection,
 } from "./tokenBudget";
 import {
@@ -20,7 +22,7 @@ import {
 } from "./character";
 import { evaluateStrategyInteraction } from "./relationshipStrategy";
 import { autoTranslateCharacter, completedTranslation } from "./bilingual";
-import { selectMemories } from "./memory";
+import { estimateMemoryTokens, memoryContentHash, selectMemories } from "./memory";
 import {
   evaluateLore,
   groupLoreByInsertion,
@@ -46,6 +48,7 @@ import {
   type ProviderSettings,
   type Character,
   type Conversation,
+  type Memory,
   type MeetEntry,
   type MeetNarrativeSettings,
   type MeetRoundPayload,
@@ -75,6 +78,32 @@ import {
 } from "./meetEngine";
 import { resolveSecondaryProvider } from "./modelServices";
 import { buildMeetCrossModeContinuity, closeMeetOnlineWindow, resumeMeetSessionForOfflineActivity } from "./crossModeContinuity";
+
+function configuredMeetLoreBudget(books:Array<{triggerSettings?:{maxContextChars?:number}}>){
+  const configured=books.map((book)=>book.triggerSettings?.maxContextChars).filter((value):value is number=>Number.isFinite(value)&&Number(value)>0);
+  return configured.length?Math.min(MEET_LORE_BUDGET_CHARS,Math.max(...configured)):MEET_LORE_BUDGET_CHARS;
+}
+
+function buildMeetMemorySections(memories:Memory[],characters:Character[],conversationId:string,query:string){
+  const rows=new Map<string,{memory:Memory;characterIds:Set<string>}>();
+  for(const character of characters){
+    const selected=selectMemories(memories,character.id,conversationId,6,query,true,{maxItems:6,maxTokens:1_200,query,mode:"meet"});
+    for(const memory of selected){
+      const key=memory.contentHash??memoryContentHash(memory.content),existing=rows.get(key);
+      if(existing)existing.characterIds.add(character.id);else rows.set(key,{memory,characterIds:new Set([character.id])});
+    }
+  }
+  const shared=[...rows.values()].filter(row=>row.characterIds.size>1),sections:PrioritizedPromptSection[]=[],usedKeys=new Set<string>();
+  let usedTokens=0;
+  const take=(row:{memory:Memory;characterIds:Set<string>})=>{const key=row.memory.contentHash??memoryContentHash(row.memory.content),cost=estimateMemoryTokens(row.memory);if(usedKeys.has(key)||usedTokens&&usedTokens+cost>3_500)return false;usedKeys.add(key);usedTokens+=cost;return true};
+  const sharedTaken=shared.filter(take);
+  if(sharedTaken.length)sections.push({id:"memories:shared",content:`参与者共享的相关事实与经历：${sharedTaken.map(row=>row.memory.content).join("；")}`,priority:70});
+  for(const character of characters){
+    const personal=[...rows.values()].filter(row=>row.characterIds.size===1&&row.characterIds.has(character.id)).filter(take);
+    if(personal.length)sections.push({id:`memories:${character.id}`,content:`${character.name}的专属关系与经历：${personal.map(row=>row.memory.content).join("；")}`,priority:68});
+  }
+  return{sections,count:usedKeys.size,tokens:usedTokens};
+}
 
 function shouldUseCompactStreamingRetry(error: unknown) {
   if (!(error instanceof ProviderError)) return false;
@@ -598,7 +627,7 @@ async function generateMeetTurnInternal(
         character,
         conversation,
         seed: `meet:${session.id}:${roundId}`,
-        budget: Math.floor(INTERNAL_LORE_BUDGET_TOKENS * 3.2),
+        budget: configuredMeetLoreBudget(mounted),
       });
     evaluatedLoreCount += decisions.length;
     for (const decision of decisions) {
@@ -622,23 +651,8 @@ async function generateMeetTurnInternal(
       content: `角色 ${character.id}（${character.name}）完整设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${performanceProfileContext(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}`,
       priority: 96,
     })),
-    memorySections = characters.map((character) => {
-      const selected = selectMemories(
-        memories,
-        character.id,
-        session.conversationId ?? "",
-        10,
-        text,
-        true,
-      );
-      return {
-        id: `memories:${character.id}`,
-        content: selected.length
-          ? `${character.name} 的相关记忆：${selected.map((item) => item.content).join("；")}`
-          : false,
-        priority: 68,
-      } satisfies PrioritizedPromptSection;
-    }),
+    meetMemory = buildMeetMemorySections(memories, characters, session.conversationId ?? "", text),
+    memorySections = meetMemory.sections,
     translationContract = bilingualCharacterIds.length
       ? `以下角色开启自动翻译：${bilingualCharacterIds.join("、")}。这些角色的每条 dialogue 必须同时返回 translation；如果返回 thought，也必须返回对应 translation。translation 是忠实简体中文译文，不得改变剧情。`
       : "所有 translation 字段均可省略。",
@@ -655,6 +669,19 @@ async function generateMeetTurnInternal(
     model: provider.model,
     injectedLoreEntries: injectedLore.length,
     skippedLoreEntries: uniqueLore.filter((item) => !item.injected).length,
+    contextDiagnostics: {
+      personaTokens: estimateTextTokens([characterIdentity,...characterDetails.map((item)=>String(item.content??"")),userPersonaContext(appSettings)].join("\n")),
+      relationshipTokens: estimateTextTokens(characters.map((character)=>relationshipContextOf(character)).join("\n")),
+      historyTokens: estimateTextTokens(history),
+      memoryTokens: meetMemory.tokens,
+      loreTokens: injectedLore.reduce((sum,item)=>sum+estimateTextTokens(item.content),0),
+      continuityTokens: estimateTextTokens(planningContinuity),
+      protocolTokens: estimateTextTokens([outputContract,translationContract,meetNarrativeInstructions(settings),meetStyleContract(settings)].join("\n")),
+      totalInputTokens: 0,
+      providerWindow: INTERNAL_CONTEXT_WINDOW_TOKENS,
+      memoryCount: meetMemory.count,
+      loreCount: injectedLore.length,
+    },
   };
   const safeUpdateGeneration = async () => {
     try {
@@ -845,6 +872,7 @@ async function generateMeetTurnInternal(
         generationMeta.estimatedInputTokens ?? 0,
         inputTokens,
       );
+      if(generationMeta.contextDiagnostics)generationMeta.contextDiagnostics.totalInputTokens=Math.max(generationMeta.contextDiagnostics.totalInputTokens,inputTokens);
       await safeUpdateGeneration();
       try {
         const response = await new OpenAIProvider({
@@ -1684,19 +1712,8 @@ export async function generateMeetOpeningDraft(
           `${message.senderType === "user" ? app.userName || "用户" : (allCharacters.find((item) => item.id === message.senderId)?.name ?? "成员")}：${message.content}`,
       )
       .join("\n"),
-    memory = characters
-      .flatMap((character) =>
-        selectMemories(
-          memories,
-          character.id,
-          conversation.id,
-          4,
-          history,
-          true,
-        ),
-      )
-      .map((item) => item.content)
-      .join("；"),
+    openingMemory = buildMeetMemorySections(memories, characters, conversation.id, history),
+    memory = openingMemory.sections.map((section)=>String(section.content??"")).filter(Boolean).join("\n"),
     mounted = books.filter((book) =>
       characters.some((character) =>
         isLoreBookMounted(
@@ -1715,7 +1732,7 @@ export async function generateMeetOpeningDraft(
       conversationId: conversation.id,
       character: characters[0],
       conversation,
-      budget: 6000,
+      budget: configuredMeetLoreBudget(mounted),
       seed: `meet-opening:${conversation.id}:${recent.at(-1)?.id ?? ""}`,
     }).filter((item) => item.injected),
     openingLoreGroups = groupLoreByInsertion(lore),

@@ -704,6 +704,19 @@ export interface ChatGroupProviderCallBudget {
   leaseGeneration?: number;
   state?: "pending" | "running" | "completed" | "failed";
 }
+export interface ContextSectionDiagnostics {
+  personaTokens: number;
+  relationshipTokens: number;
+  historyTokens: number;
+  memoryTokens: number;
+  loreTokens: number;
+  continuityTokens: number;
+  protocolTokens: number;
+  totalInputTokens: number;
+  providerWindow: number;
+  memoryCount: number;
+  loreCount: number;
+}
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
   outputMessageId?: string;
@@ -748,6 +761,9 @@ export interface ChatReplyTaskPayload {
   variationApplied?: boolean;
   reviewerInvoked?: boolean;
   retryContextCompacted?: boolean;
+  /** Sanitized context size diagnostics; never contains prompt text. */
+  contextDiagnostics?: ContextSectionDiagnostics;
+  contextDiagnosticsByActor?: Record<string, ContextSectionDiagnostics>;
   /** Last deterministic failure stage, used only for status/diagnostics. */
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
   cancelled?: boolean;
@@ -1619,6 +1635,7 @@ export interface MeetEntry {
     skippedLoreEntries?: number;
     saveResult?: "not-attempted" | "pending" | "saved" | "failed";
     warnings?: string[];
+    contextDiagnostics?: ContextSectionDiagnostics;
     attempts?: Array<{
       ordinal: 1 | 2;
       stage: "requesting" | "parsing" | "validating";
@@ -1730,7 +1747,8 @@ export interface LoreMount {
 }
 export interface LoreTriggerSettings {
   defaultScanDepth: number;
-  maxContextChars: number;
+  /** Runtime-only injection budget. Undefined means use the global context profile. */
+  maxContextChars?: number;
 }
 export type LoreInsertionPosition =
   | "base-rules"

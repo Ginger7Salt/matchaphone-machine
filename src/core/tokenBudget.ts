@@ -8,6 +8,11 @@ export const INTERNAL_INPUT_BUDGET_TOKENS =
   INTERNAL_CONTEXT_WINDOW_TOKENS -
   INTERNAL_SAFETY_RESERVE_TOKENS -
   INTERNAL_REPLY_RESERVE_TOKENS;
+/** Runtime lore budgets use characters because lore matching counts source characters. */
+export const CHAT_PRIVATE_LORE_BUDGET_CHARS = 12_000;
+export const CHAT_GROUP_LORE_BUDGET_CHARS = 16_000;
+export const MEET_LORE_BUDGET_CHARS = 20_000;
+/** Legacy export retained for callers outside the context compiler. */
 export const INTERNAL_LORE_BUDGET_TOKENS = 48_000;
 
 export interface GenerationTokenBudget {

@@ -37,7 +37,7 @@ export default function LorePage() {
     const t = now(), id = uid();
     try {
       const shelfGroupId = await resolveGroup(groupId, newGroupName);
-      await createLoreBook({ id, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, name: name.trim(), description: description.trim(), entries: [], enabled: true, mount, shelfGroupId, triggerSettings: { defaultScanDepth: 20, maxContextChars: 3000 } });
+      await createLoreBook({ id, schemaVersion: SCHEMA_VERSION, createdAt: t, updatedAt: t, name: name.trim(), description: description.trim(), entries: [], enabled: true, mount, shelfGroupId, triggerSettings: { defaultScanDepth: 20 } });
       await reload(); setOpen(false); setName(""); setDescription(""); setMount(emptyMount()); setGroupId(""); setNewGroupName(""); nav(`/lore/${id}`);
     } catch (e) { setError(e instanceof Error ? e.message : "创建世界书失败"); }
   };

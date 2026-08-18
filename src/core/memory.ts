@@ -1,6 +1,13 @@
 import {db} from "./db";
 import {now,type Memory,type MemoryState} from "./types";
 
+export interface MemorySelectionOptions {
+  maxItems?: number;
+  maxTokens?: number;
+  query?: string;
+  mode?: "chat" | "group" | "meet";
+}
+
 export function memoryContentHash(value:string){let h=2166136261;for(let i=0;i<value.length;i++){h^=value.charCodeAt(i);h=Math.imul(h,16777619)}return(h>>>0).toString(16)}
 const clamp=(value:number,min=0,max=1)=>Math.max(min,Math.min(max,value));
 const normalizeText=(value:string)=>value.toLowerCase().replace(/[\s\p{P}\p{S}]/gu,"");
@@ -12,6 +19,56 @@ export function memoryStrength(input:Memory,at=now()){const memory=normalizedMem
 export function memoryStateAt(memory:Memory,at=now()):MemoryState{if(memory.locked)return"active";const score=memoryStrength(memory,at);if(score>=.55)return"active";if(score>=.3)return"faded";const since=memory.archivedCandidateAt??memory.updatedAt;return at-since>=7*24*60*60*1000?"archived":"faded"}
 export function memoryTimeBand(memory:Memory,at=now()){const days=Math.max(0,at-(memory.occurredAt??memory.createdAt))/86_400_000;return days<=3?"3 天内":days<=14?"4–14 天":days<=90?"15–90 天":"90 天以上"}
 export function memoryEmotionBand(memory:Memory){const positive=(memory.valence??.5)>=.5,intense=(memory.arousal??.2)>=.5;return`${positive?"积极":"消极"}${intense?"强烈":"平静"}`}
-export function selectMemories(items:Memory[],characterId:string,conversationId:string,limit=12,query="",enabled=true){if(!enabled)return[];const eligible=items.filter(item=>item.characterId===characterId&&(!item.conversationId||item.conversationId===conversationId)&&!item.dontSurface).map(normalizedMemory);if(!query.trim())return eligible.sort((a,b)=>Number(b.locked)-Number(a.locked)||b.importance-a.importance||b.updatedAt-a.updatedAt).slice(0,limit);const emotion=estimateMemoryEmotion(query),scored=eligible.map(memory=>{const state=memoryStateAt(memory),text=[memory.title,memory.content,memory.meaning,...(memory.topics??[]),...(memory.entities??[])].filter(Boolean).join(" "),semantic=query?lexicalMemorySimilarity(query,text):0,emotionScore=1-Math.hypot((memory.valence??.5)-emotion.valence,(memory.arousal??.2)-emotion.arousal)/Math.SQRT2,timeScore=Math.exp(-Math.max(0,now()-(memory.occurredAt??memory.createdAt))/86_400_000/30),importance=memory.importance/10,strength=memoryStrength(memory),score=Number(memory.locked)*3+semantic*4+emotionScore*2+timeScore*1.5+importance+strength*2+(memory.reinforcementCount??0)*.05-(state==="archived"&&semantic<.35?4:0);return{memory:{...memory,state},score,semantic}}).sort((a,b)=>b.score-a.score),chosen:Memory[]=[],topicCount=new Map<string,number>();for(const row of scored){if(chosen.length>=limit)break;const topic=row.memory.topics?.[0]??row.memory.kind,count=topicCount.get(topic)??0;if(count>=2&&!row.memory.locked)continue;if(row.memory.state==="archived"&&row.semantic<.35&&!row.memory.locked)continue;topicCount.set(topic,count+1);chosen.push(row.memory)}return chosen}
+export function estimateMemoryTokens(memory:Memory){
+  const text=[memory.title,memory.content,memory.meaning].filter(Boolean).join("\n");
+  let count=0,asciiRun=0;
+  const flush=()=>{if(asciiRun){count+=Math.ceil(asciiRun/3.5);asciiRun=0}};
+  for(const char of text){if(/^[\x00-\x7F]$/.test(char))asciiRun+=1;else{flush();if(!/\s/.test(char))count+=1}}
+  flush();
+  return Math.max(1,count+6);
+}
+
+function normalizedMemorySelectionOptions(limit:number,query:string,options?:MemorySelectionOptions){
+  return{
+    maxItems:Math.max(1,Math.trunc(options?.maxItems??limit)),
+    maxTokens:options?.maxTokens===undefined?undefined:Math.max(1,Math.trunc(options.maxTokens)),
+    query:options?.query??query,
+    mode:options?.mode??"chat",
+  };
+}
+
+export function selectMemories(items:Memory[],characterId:string,conversationId:string,limit=12,query="",enabled=true,options?:MemorySelectionOptions){
+  if(!enabled)return[];
+  const selection=normalizedMemorySelectionOptions(limit,query,options),search=selection.query.trim();
+  const eligible=items.filter(item=>item.characterId===characterId&&(!item.conversationId||item.conversationId===conversationId)&&!item.dontSurface).map(normalizedMemory);
+  const seenHashes=new Set<string>(),deduped=eligible.filter(memory=>{
+    const hash=memory.contentHash??memoryContentHash(memory.content);
+    if(seenHashes.has(hash))return false;
+    seenHashes.add(hash);
+    return true;
+  });
+  const emotion=estimateMemoryEmotion(search);
+  const scored=deduped.map(memory=>{
+    const state=memoryStateAt(memory),text=[memory.title,memory.content,memory.meaning,...(memory.topics??[]),...(memory.entities??[])].filter(Boolean).join(" "),semantic=search?lexicalMemorySimilarity(search,text):0,emotionScore=1-Math.hypot((memory.valence??.5)-emotion.valence,(memory.arousal??.2)-emotion.arousal)/Math.SQRT2,timeScore=Math.exp(-Math.max(0,now()-(memory.occurredAt??memory.createdAt))/86_400_000/30),importance=memory.importance/10,strength=memoryStrength(memory),relationshipBoost=memory.kind==="relationship"?.25:0,unresolvedBoost=memory.resolved?0:.3,score=Number(memory.locked)*3+semantic*4+emotionScore*2+timeScore*1.5+importance+strength*2+(memory.reinforcementCount??0)*.05+relationshipBoost+unresolvedBoost-(state==="archived"&&search&&semantic<.35?4:0);
+    return{memory:{...memory,state},score,semantic};
+  }).sort((a,b)=>b.score-a.score||b.memory.updatedAt-a.memory.updatedAt);
+  const chosen:Memory[]=[],topicCount=new Map<string,number>(),sourceIds=new Set<string>();
+  let usedTokens=0;
+  for(const row of scored){
+    if(chosen.length>=selection.maxItems)break;
+    if(row.memory.state==="archived"&&search&&row.semantic<.35&&!row.memory.locked)continue;
+    const topic=row.memory.topics?.[0]??row.memory.kind,topicHits=topicCount.get(topic)??0;
+    if(search&&topicHits>=2&&!row.memory.locked)continue;
+    const sourceOverlap=(row.memory.sourceIds??[]).some(id=>sourceIds.has(id));
+    if(sourceOverlap&&!row.memory.locked)continue;
+    const cost=estimateMemoryTokens(row.memory);
+    if(selection.maxTokens!==undefined&&usedTokens>0&&usedTokens+cost>selection.maxTokens)continue;
+    topicCount.set(topic,topicHits+1);
+    for(const id of row.memory.sourceIds??[])sourceIds.add(id);
+    usedTokens+=cost;
+    chosen.push(row.memory);
+  }
+  return chosen;
+}
 export async function recordMemoryAccess(ids:string[],eventId:string){const unique=[...new Set(ids)];for(const id of unique){const memory=await db.memories.get(id);if(!memory||memory.lastActivationEventId===eventId)continue;await db.memories.update(id,{activationCount:(memory.activationCount??0)+1,lastAccessedAt:now(),lastActivationEventId:eventId,state:"active",updatedAt:now()})}}
 export async function refreshMemoryStates(characterId?:string){const rows=characterId?await db.memories.where("characterId").equals(characterId).toArray():await db.memories.toArray();for(const row of rows){const state=memoryStateAt(row),strength=memoryStrength(row);if(state===row.state)continue;await db.memories.update(row.id,{state,archivedCandidateAt:strength<.3?(row.archivedCandidateAt??now()):undefined,updatedAt:now()})}}
