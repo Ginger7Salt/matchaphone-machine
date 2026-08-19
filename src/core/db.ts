@@ -1,4 +1,5 @@
 import Dexie,{type EntityTable} from "dexie";
+import {defaultProvider} from "./types";
 import type {Character,Conversation,Message,Preset,LoreBook,Memory,FeedPost,ProviderSettings,AppSettings,MemoryExtractionBatch,ImageAsset,AppearanceSettings,MediaAsset,StickerPack,SpeechSettings,ImageGenerationSettings,ModelServiceSettings,MeetSession,MallCatalogItem,MallCartItem,MallOrder,WalletTransaction,MallWalletSettings,ForumServer,ForumChannel,ForumPost,BackgroundTask,MemoryVector,CharacterPhoneState,MusicTrack,MusicFile,MusicPlaylist,ListeningSession,MusicEvent,CoupleIsland,CoupleIslandObject,CoupleIslandEntry,CoupleIslandEvent} from "./types";
 import {defaultSpeechSettings,defaultModelServiceSettings,defaultImageGenerationSettings} from "./types";
 export interface SettingRecord{key:string;value:unknown}
@@ -29,7 +30,7 @@ export class MiraDB extends Dexie{
 export const db=new MiraDB();
 export async function getSetting<T>(key:string,fallback:T):Promise<T>{const row=await db.settings.get(key);return (row?.value as T)??fallback}
 export async function setSetting(key:string,value:unknown){await db.settings.put({key,value})}
-export const getProvider=()=>getSetting<ProviderSettings>("provider",{baseUrl:"https://api.openai.com/v1",apiKey:"",model:"gpt-4.1-mini",stream:false,temperature:.85,maxTokens:800,contextLimit:30,timeoutMs:60000});
+export const getProvider=async():Promise<ProviderSettings>=>{const raw=await getSetting<Partial<ProviderSettings>>("provider",defaultProvider);return{...defaultProvider,...raw,baseUrl:(raw.baseUrl??defaultProvider.baseUrl).trim(),apiKey:(raw.apiKey??"").trim(),model:(raw.model??defaultProvider.model).trim(),contextBudgetMode:(raw.contextBudgetMode==="custom"?"custom":"auto") as "auto" | "custom",contextWindowTokens:Math.max(8_000,Math.min(1_000_000,Math.trunc(Number(raw.contextWindowTokens??defaultProvider.contextWindowTokens??128_000))))};};
 export const getAppSettings=()=>getSetting<AppSettings>("app",{onboarded:false,adultConfirmed:false,sensitiveContent:false,accent:"#7c6df2",userName:"我"});
 export const getSpeechSettings=()=>getSetting<SpeechSettings>("speech",defaultSpeechSettings);
 export const getModelServiceSettings=()=>getSetting<ModelServiceSettings>("model-services-v1",defaultModelServiceSettings);

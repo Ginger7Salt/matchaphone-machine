@@ -31,12 +31,17 @@ export interface PrioritizedPromptSection {
   content?: string | false | null;
   required?: boolean;
   priority?: number;
+  /** Required sections cannot be omitted; core sections are retained before optional context. */
+  core?: boolean;
 }
 
 export interface FittedPromptSections {
   text: string;
   estimatedTokens: number;
   removedSections: string[];
+  requiredTokens: number;
+  coreTokens: number;
+  optionalTokens: number;
 }
 
 export function estimateTextTokens(value: string) {
@@ -164,26 +169,32 @@ export function fitPrioritizedPromptSections(
     }))
     .filter((section) => section.content);
   const required = normalized.filter((section) => section.required);
-  const optional = normalized.filter((section) => !section.required);
+  const core = normalized.filter((section) => !section.required && section.core);
+  const optional = normalized.filter((section) => !section.required && !section.core);
   const selected = new Set(required.map((section) => section.index));
-  let used = required.reduce(
-    (sum, section) => sum + estimateTextTokens(section.content) + 2,
-    0,
-  );
-  for (const section of [...optional].sort(
-    (a, b) => b.priority - a.priority || b.index - a.index,
-  )) {
-    const size = estimateTextTokens(section.content) + 2;
-    if (used + size > tokenBudget) continue;
-    selected.add(section.index);
-    used += size;
+  const sizeOf = (section: { content: string }) => estimateTextTokens(section.content) + 2;
+  let used = required.reduce((sum, section) => sum + sizeOf(section), 0);
+  const requiredTokens = used;
+  if (used > tokenBudget) throw new RequiredChatContextTooLargeError(used);
+  for (const pool of [core, optional]) {
+    for (const section of [...pool].sort(
+      (a, b) => b.priority - a.priority || b.index - a.index,
+    )) {
+      const size = sizeOf(section);
+      if (used + size > tokenBudget) continue;
+      selected.add(section.index);
+      used += size;
+    }
   }
   const kept = normalized.filter((section) => selected.has(section.index));
+  const coreTokens = kept.filter((section) => section.core).reduce((sum, section) => sum + sizeOf(section), 0);
+  const optionalTokens = kept.filter((section) => !section.required && !section.core).reduce((sum, section) => sum + sizeOf(section), 0);
   return {
     text: kept.map((section) => section.content).join("\n\n"),
     estimatedTokens: used,
-    removedSections: optional
-      .filter((section) => !selected.has(section.index))
-      .map((section) => section.id),
+    removedSections: normalized.filter((section) => !selected.has(section.index)).map((section) => section.id),
+    requiredTokens,
+    coreTokens,
+    optionalTokens,
   };
 }

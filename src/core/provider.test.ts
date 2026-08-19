@@ -345,3 +345,13 @@ describe("meet regression envelopes", () => {
   });
 
 });
+
+
+describe("provider family adapters",()=>{
+ it("uses the final cumulative SSE snapshot without duplicating earlier text",async()=>{const first=JSON.stringify({choices:[{message:{content:"{\"version\":1,"}}]}),second=JSON.stringify({choices:[{message:{content:"{\"version\":1,\"segments\":[{\"type\":\"dialogue\",\"characterId\":\"one\",\"text\":\"hello\"}]}"}}]}),body="data: "+first+"\n\ndata: "+second+"\n\ndata: [DONE]\n";vi.stubGlobal("fetch",vi.fn().mockResolvedValue(streamResponse([body])));const result=await new OpenAIProvider({...settings,stream:true}).chatWithMeta([{role:"user",content:"hi"}],{stream:true});expect(result.text).toContain("hello");expect(result.text.match(/version/g)?.length).toBe(1);expect(result.sseMode).toBe("complete-object");});
+ it("extracts Gemini candidates and Claude content blocks",async()=>{
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({candidates:[{content:{parts:[{text:"gemini text"}]}}]}),{status:200,headers:{"Content-Type":"application/json"}})).mockResolvedValueOnce(new Response(JSON.stringify({content:[{type:"text",text:"claude text"}]}),{status:200,headers:{"Content-Type":"application/json"}})));
+  await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"gemini text",responseAdapter:"gemini"});
+  await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"claude text",responseAdapter:"claude"});
+ });
+});

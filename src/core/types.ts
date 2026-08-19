@@ -720,6 +720,17 @@ export interface ContextSectionDiagnostics {
   contextPruned?: boolean;
   /** The per-attempt input budget used by the context compiler. */
   contextBudgetTokens?: number;
+  requestedInputBudgetTokens?: number;
+  effectiveInputBudgetTokens?: number;
+  requiredInputTokens?: number;
+  coreInputTokens?: number;
+  optionalInputTokens?: number;
+  actualInputTokens?: number;
+  outputReserveTokens?: number;
+  contextWindowSource?: "auto" | "custom" | "fallback";
+  prunedSectionCount?: number;
+  responseAdapter?: string;
+  sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
 }
 export interface ProviderConnectivityResult {
   ok: boolean;
@@ -1660,6 +1671,7 @@ export interface MeetEntry {
       | "provider-cors"
       | "provider-prompt-blocked"
       | "provider-timeout"
+      | "context-overflow"
       | "response-truncated"
       | "response-invalid"
       | "invalid-meet-round"
@@ -1669,6 +1681,17 @@ export interface MeetEntry {
     retryDecision?: MeetRetryDecision;
     normalizationPath?: string;
     sameProviderRetryPrevented?: boolean;
+    requestedInputBudgetTokens?: number;
+    effectiveInputBudgetTokens?: number;
+    requiredInputTokens?: number;
+    coreInputTokens?: number;
+    optionalInputTokens?: number;
+    actualInputTokens?: number;
+    outputReserveTokens?: number;
+    contextWindowTokens?: number;
+    contextWindowSource?: "auto" | "custom" | "fallback";
+    responseAdapter?: string;
+    sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
     error?: string;
     model?: string;
     fallbackUsed?: boolean;
@@ -1962,6 +1985,8 @@ export interface ProviderSettings {
   temperature: number;
   maxTokens: number;
   contextLimit: number;
+  contextBudgetMode?: "auto" | "custom";
+  contextWindowTokens?: number;
   timeoutMs: number;
 }
 export interface ProviderPreset {

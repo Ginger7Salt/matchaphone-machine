@@ -3,7 +3,7 @@ import { enqueueBackgroundTask } from "./backgroundTasks";
 import { rewardIslandMeet } from "./coupleIsland";
 import { memoryExtractionSettingsOf } from "./memoryExtraction";
 import { userPersonaContext } from "./userPersona";
-import { OpenAIProvider, ProviderError, isContextOverflowError } from "./provider";
+import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, isContextOverflowError } from "./provider";
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
@@ -145,6 +145,7 @@ export function shouldUseSecondaryMeetProvider(error: unknown) {
   return error.kind === "rate" || error.kind === "cors" || error.apiError?.providerCode === "prompt_blocked";
 }
 function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]>["failureClass"] {
+  if (error instanceof MeetContextBudgetError) return "context-overflow";
   if (error instanceof ProviderError) {
     if (error.kind === "aborted") return "aborted";
     if (error.kind === "rate") return "provider-rate-limit";
@@ -167,6 +168,7 @@ function meetFailureMessage(
   const rateAttempts = attempts?.filter((attempt) => attempt.errorKind === "rate").length ?? 0;
   const corsAttempts = attempts?.filter((attempt) => attempt.errorKind === "cors").length ?? 0;
   const blockedAttempts = attempts?.filter((attempt) => attempt.providerCode === "prompt_blocked").length ?? 0;
+  if (error instanceof MeetContextBudgetError) return preservedExistingRound ? "\u4e0a\u4e0b\u6587\u8d85\u8fc7\u6709\u6548\u9884\u7b97\uff0c\u5df2\u4fdd\u7559\u539f\u573a\u666f\uff1b\u8bf7\u7f29\u77ed\u6700\u65b0\u8f93\u5165\u6216\u8c03\u6574\u4e0a\u4e0b\u6587\u7a97\u53e3" : error.message;
   if (preservedExistingRound) {
     if (rateAttempts) return fallbackAttempted ? "主 API 和副 API 均未完成重新生成，已保留原场景" : "当前模型暂时达到调用频率或额度限制，已保留原场景";
     if (blockedAttempts) return fallbackAttempted ? "主 API 和副 API 均被模型安全策略拦截" : "当前内容被模型安全策略拦截，请尝试缩短上下文或更换模型";
@@ -393,6 +395,14 @@ class MeetRoundValidationError extends Error {
   }
 }
 
+class MeetContextBudgetError extends Error {
+  readonly code = "context-overflow";
+  constructor(readonly actualTokens: number, readonly budgetTokens: number) {
+    super(`\u89c1\u9762\u4e0a\u4e0b\u6587\u9700\u8981\u7ea6 ${actualTokens} tokens\uff0c\u8d85\u8fc7\u672c\u8f6e\u6709\u6548\u9884\u7b97 ${budgetTokens} tokens`);
+    this.name = "MeetContextBudgetError";
+  }
+}
+
 class StaleMeetRoundError extends Error {
   constructor() {
     super("本轮结果已被新的重新生成替代");
@@ -400,7 +410,22 @@ class StaleMeetRoundError extends Error {
   }
 }
 
-export const MEET_ROUND_INPUT_BUDGET = [24_000, 16_000] as const;
+export const MEET_ROUND_INPUT_BUDGET = [48_000, 32_000] as const;
+const MEET_OUTPUT_RESERVE_TOKENS = [16_000, 12_000] as const;
+const MEET_CONTEXT_SAFETY_TOKENS = 2_000;
+function meetContextWindowOf(provider: ProviderSettings) {
+  const custom = provider.contextBudgetMode === "custom" && Number.isFinite(provider.contextWindowTokens) && (provider.contextWindowTokens ?? 0) >= 8_000;
+  return {
+    tokens: custom ? Math.trunc(provider.contextWindowTokens!) : INTERNAL_CONTEXT_WINDOW_TOKENS,
+    source: custom ? "custom" as const : "auto" as const,
+  };
+}
+export function meetInputBudgetOf(provider: ProviderSettings, attemptIndex: number) {
+  const window = meetContextWindowOf(provider);
+  const requested = MEET_ROUND_INPUT_BUDGET[attemptIndex];
+  const effective = Math.max(2_000, Math.min(requested, window.tokens - MEET_OUTPUT_RESERVE_TOKENS[attemptIndex] - MEET_CONTEXT_SAFETY_TOKENS));
+  return { ...window, requested, effective, outputReserve: MEET_OUTPUT_RESERVE_TOKENS[attemptIndex] };
+}
 
 function meetRoundOutputBudget(
   provider: Awaited<ReturnType<typeof getProvider>>,
@@ -606,6 +631,7 @@ async function generateMeetTurnInternal(
     await db.meetSessions.put(sessionForTurn);
   });
 
+  const meetTransport = new BrowserDirectProviderTransport();
   const [provider, memories, loreBooks, conversation, appSettings, onlineMessages] =
       await Promise.all([
         getProvider(),
@@ -708,15 +734,21 @@ async function generateMeetTurnInternal(
     injectedLore = uniqueLore.filter((item) => item.injected),
     loreGroups = groupLoreByInsertion(injectedLore),
     characterIdentity = characters
-      .map(
-        (character) =>
-          `[${character.id}] ${character.name}\n身份简介：${character.bio || "无"}\n性格：${character.personality || "无"}\n说话方式：${character.speakingStyle || "无"}\n语言：${chatSettingsOf(character).language}\n现场关系：亲密 ${character.relationship.intimacy}，信任 ${character.relationship.trust}，情绪 ${character.relationship.mood}`,
-      )
-      .join("\n\n"),
+      .map((character) => `[${character.id}] ${character.name}; language: ${chatSettingsOf(character).language}`)
+      .join("\n"),
+    characterRelationships = characters
+      .map((character) => `character ${character.id} relationship: intimacy ${character.relationship.intimacy}, trust ${character.relationship.trust}, mood ${character.relationship.mood}`)
+      .join("\n"),
     characterDetails = characters.map((character) => ({
       id: `character-detail:${character.id}`,
       content: `角色 ${character.id}（${character.name}）完整设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${performanceProfileContext(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}`,
       priority: 96,
+      core: true,
+    })),
+    historySections: PrioritizedPromptSection[] = promptHistoryEntries.slice(-60).map((entry, index, rows) => ({
+      id: `history:${entry.id}`,
+      content: referenceBlock("RECENT_HISTORY", entryText(entry, names)),
+      priority: 35 + Math.floor((index / Math.max(1, rows.length)) * 18),
     })),
     meetMemory = buildMeetMemorySections(memories, characters, session.conversationId ?? "", text),
     memorySections = meetMemory.sections.map((section) => ({ ...section, content: referenceBlock("LONG_TERM_MEMORY", section.content) })),
@@ -734,7 +766,12 @@ async function generateMeetTurnInternal(
   const generationMeta: NonNullable<MeetEntry["generation"]> = {
     ...initialGeneration,
     contextPruned: false,
-    contextBudgetTokens: MEET_ROUND_INPUT_BUDGET[0],
+    contextBudgetTokens: meetInputBudgetOf(provider, 0).effective,
+    requestedInputBudgetTokens: meetInputBudgetOf(provider, 0).requested,
+    effectiveInputBudgetTokens: meetInputBudgetOf(provider, 0).effective,
+    outputReserveTokens: meetInputBudgetOf(provider, 0).outputReserve,
+    contextWindowTokens: meetInputBudgetOf(provider, 0).tokens,
+    contextWindowSource: meetInputBudgetOf(provider, 0).source,
     responseNormalized: false,
     repairApplied: false,
     repairRejected: false,
@@ -750,11 +787,15 @@ async function generateMeetTurnInternal(
       continuityTokens: estimateTextTokens(planningContinuity),
       protocolTokens: estimateTextTokens([outputContract,translationContract,meetNarrativeInstructions(settings),meetStyleContract(settings)].join("\n")),
       totalInputTokens: 0,
-      providerWindow: INTERNAL_CONTEXT_WINDOW_TOKENS,
+      providerWindow: meetInputBudgetOf(provider, 0).tokens,
       memoryCount: meetMemory.count,
       loreCount: injectedLore.length,
       contextPruned: false,
-      contextBudgetTokens: MEET_ROUND_INPUT_BUDGET[0],
+      contextBudgetTokens: meetInputBudgetOf(provider, 0).effective,
+      requestedInputBudgetTokens: meetInputBudgetOf(provider, 0).requested,
+      effectiveInputBudgetTokens: meetInputBudgetOf(provider, 0).effective,
+      outputReserveTokens: meetInputBudgetOf(provider, 0).outputReserve,
+      contextWindowSource: meetInputBudgetOf(provider, 0).source,
     },
   };
   const safeUpdateGeneration = async () => {
@@ -809,6 +850,13 @@ async function generateMeetTurnInternal(
         id: "user-persona",
         content: userPersonaContext(appSettings),
         priority: 92,
+        core: true,
+      },
+      {
+        id: "relationships",
+        content: characterRelationships,
+        priority: 95,
+        core: true,
       },
       {
         id: "scene",
@@ -829,7 +877,8 @@ async function generateMeetTurnInternal(
       {
         id: "style",
         content: `叙事规则：\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}`,
-        required: true,
+        priority: 97,
+        core: true,
       },
       {
         id: "base-lore",
@@ -852,11 +901,7 @@ async function generateMeetTurnInternal(
         content: referenceBlock("WORLD_BOOK", loreEntriesBlock(loreGroups["before-history"])),
         priority: 72,
       },
-      {
-        id: "history",
-        content: history ? referenceBlock("RECENT_HISTORY", history) : false,
-        priority: 35,
-      },
+      ...historySections,
       {
         id: "continuity",
         content: referenceBlock("CONTINUITY_REFERENCE", planningContinuity),
@@ -899,21 +944,20 @@ async function generateMeetTurnInternal(
         providerRole = fallbackRequested ? "secondary-fallback" as const : "primary" as const,
         ordinal = (attemptIndex + 1) as 1 | 2,
         retryDecision = attemptIndex ? retryDecisionOf(lastError, hasDistinctSecondary) : undefined,
-        fittedPrompt = fitPrioritizedPromptSections(
-          [
-            ...promptSections,
-            ...(attemptIndex
-              ? [
-                  {
-                    id: "retry-contract",
-                    content: retryInstructionOf(lastError),
-                    required: true,
-                  } satisfies PrioritizedPromptSection,
-                ]
-              : []),
-          ],
-          MEET_ROUND_INPUT_BUDGET[attemptIndex],
-        ),
+        budget = meetInputBudgetOf(attemptProvider, attemptIndex),
+        fitResult = (() => {
+          try { return { fitted: fitPrioritizedPromptSections(
+            [
+              ...promptSections,
+              ...(attemptIndex
+                ? [{ id: "retry-contract", content: retryInstructionOf(lastError), required: true } satisfies PrioritizedPromptSection]
+                : []),
+            ],
+            Math.max(2_000, budget.effective - 300),
+          ) }; } catch (error) { return { error }; }
+        })(),
+        fittedPrompt = fitResult.fitted ?? { text: "", estimatedTokens: 0, removedSections: [], requiredTokens: 0, coreTokens: 0, optionalTokens: 0 },
+        fittedPromptError = fitResult.error,
         compactStreamingRetry =
           attemptIndex === 1 && shouldUseCompactStreamingRetry(lastError),
         messages = [
@@ -941,12 +985,48 @@ async function generateMeetTurnInternal(
           inputTokens,
           retryDecision,
         };
+      if (fittedPromptError) {
+        const contextError = fittedPromptError instanceof MeetContextBudgetError ? fittedPromptError : new MeetContextBudgetError(
+          (fittedPromptError as { estimatedTokens?: number })?.estimatedTokens ?? budget.effective + 1,
+          budget.effective,
+        );
+        attemptMeta.stage = "requesting";
+        attemptMeta.errorKind = contextError.code;
+        attemptMeta.retryDecision = "stop-after-second-attempt";
+        generationMeta.stage = "building-context";
+        generationMeta.failureClass = "context-overflow";
+        generationMeta.error = contextError.message;
+        generationMeta.retryDecision = "stop-after-second-attempt";
+        generationMeta.saveResult = "not-attempted";
+        lastError = contextError;
+        generationMeta.attempts = [...(generationMeta.attempts ?? []), attemptMeta];
+        await safeUpdateGeneration();
+        break;
+      }
       generationMeta.contextPruned = Boolean(generationMeta.contextPruned || promptWasPruned);
       if (retryDecision) generationMeta.retryDecision = retryDecision;
-      generationMeta.contextBudgetTokens = MEET_ROUND_INPUT_BUDGET[attemptIndex];
+      generationMeta.contextBudgetTokens = budget.effective;
+      generationMeta.requestedInputBudgetTokens = budget.requested;
+      generationMeta.effectiveInputBudgetTokens = budget.effective;
+      generationMeta.outputReserveTokens = budget.outputReserve;
+      generationMeta.contextWindowTokens = budget.tokens;
+      generationMeta.contextWindowSource = budget.source;
+      generationMeta.requiredInputTokens = fittedPrompt.requiredTokens;
+      generationMeta.coreInputTokens = fittedPrompt.coreTokens;
+      generationMeta.optionalInputTokens = fittedPrompt.optionalTokens;
+      generationMeta.responseAdapter = undefined;
       if (generationMeta.contextDiagnostics) {
         generationMeta.contextDiagnostics.contextPruned = generationMeta.contextPruned;
-        generationMeta.contextDiagnostics.contextBudgetTokens = MEET_ROUND_INPUT_BUDGET[attemptIndex];
+        generationMeta.contextDiagnostics.contextBudgetTokens = budget.effective;
+        generationMeta.contextDiagnostics.requestedInputBudgetTokens = budget.requested;
+        generationMeta.contextDiagnostics.effectiveInputBudgetTokens = budget.effective;
+        generationMeta.contextDiagnostics.requiredInputTokens = fittedPrompt.requiredTokens;
+        generationMeta.contextDiagnostics.coreInputTokens = fittedPrompt.coreTokens;
+        generationMeta.contextDiagnostics.optionalInputTokens = fittedPrompt.optionalTokens;
+        generationMeta.contextDiagnostics.outputReserveTokens = budget.outputReserve;
+        generationMeta.contextDiagnostics.providerWindow = budget.tokens;
+        generationMeta.contextDiagnostics.contextWindowSource = budget.source;
+        generationMeta.contextDiagnostics.prunedSectionCount = fittedPrompt.removedSections.length;
       }
       generationMeta.attempts = [
         ...(generationMeta.attempts ?? []),
@@ -962,10 +1042,13 @@ async function generateMeetTurnInternal(
         generationMeta.estimatedInputTokens ?? 0,
         inputTokens,
       );
-      if(generationMeta.contextDiagnostics)generationMeta.contextDiagnostics.totalInputTokens=Math.max(generationMeta.contextDiagnostics.totalInputTokens,inputTokens);
+      const budgetOverflow = inputTokens > budget.effective;
+      if(generationMeta.contextDiagnostics){generationMeta.contextDiagnostics.totalInputTokens=Math.max(generationMeta.contextDiagnostics.totalInputTokens,inputTokens);generationMeta.contextDiagnostics.actualInputTokens=inputTokens;}
+      generationMeta.actualInputTokens = inputTokens;
       await safeUpdateGeneration();
       try {
-        const response = await new OpenAIProvider({
+        if (budgetOverflow) throw new MeetContextBudgetError(inputTokens, budget.effective);
+        const response = await meetTransport.chat({
           ...attemptProvider,
           stream: compactStreamingRetry,
           maxTokens: meetRoundOutputBudget(
@@ -973,7 +1056,7 @@ async function generateMeetTurnInternal(
             settings,
             characters.length,
           ),
-        }).chatWithMeta(messages, {
+        }, messages, {
           stream: compactStreamingRetry,
           signal,
           timeoutMs: null,
@@ -988,6 +1071,12 @@ async function generateMeetTurnInternal(
           truncated: response.truncated,
           normalizationPath: response.normalizationPath,
         });
+        generationMeta.responseAdapter = response.responseAdapter ?? response.normalizationPath?.split(".")[0] ?? response.responseShape;
+        generationMeta.sseMode = response.sseMode ?? (response.transportMode === "sse" ? "delta" : "not-applicable");
+        if (generationMeta.contextDiagnostics) {
+          generationMeta.contextDiagnostics.responseAdapter = generationMeta.responseAdapter;
+          generationMeta.contextDiagnostics.sseMode = generationMeta.sseMode;
+        }
         Object.assign(generationMeta, {
           stage: "parsing" as const,
           responseShape: response.responseShape,
@@ -1039,6 +1128,19 @@ async function generateMeetTurnInternal(
         lastError = undefined;
         break;
       } catch (error) {
+        if (error instanceof MeetContextBudgetError) {
+          attemptMeta.stage = "requesting";
+          attemptMeta.errorKind = error.code;
+          attemptMeta.retryDecision = "stop-after-second-attempt";
+          generationMeta.stage = "building-context";
+          generationMeta.failureClass = "context-overflow";
+          generationMeta.error = error.message;
+          generationMeta.retryDecision = "stop-after-second-attempt";
+          generationMeta.saveResult = "not-attempted";
+          lastError = error;
+          await safeUpdateGeneration();
+          break;
+        }
         if (error instanceof ProviderError && error.kind === "aborted") {
           attemptMeta.errorKind = error.kind;
           await safeUpdateGeneration();

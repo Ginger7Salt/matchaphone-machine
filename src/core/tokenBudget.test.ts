@@ -27,6 +27,26 @@ describe("internal token budget", () => {
     expect(fitted.items.at(-1)?.content).toBe(latest);
   });
 
+
+  it("reports section budgets and retains core sections before optional history", () => {
+    const fitted = fitPrioritizedPromptSections([
+      { id: "required", content: "????", required: true },
+      { id: "core", content: "??????", core: true, priority: 1 },
+      { id: "history", content: "???".repeat(2000), priority: 0 },
+    ], 30);
+    expect(fitted.requiredTokens).toBeGreaterThan(0);
+    expect(fitted.coreTokens).toBeGreaterThan(0);
+    expect(fitted.optionalTokens).toBe(0);
+    expect(fitted.removedSections).toContain("history");
+    expect(fitted.estimatedTokens).toBeLessThanOrEqual(30);
+  });
+
+  it("fails before request when immutable sections exceed the budget", () => {
+    expect(() => fitPrioritizedPromptSections([
+      { id: "latest", content: "????".repeat(100), required: true },
+      { id: "protocol", content: "??".repeat(100), required: true },
+    ], 20)).toThrow();
+  });
   it("drops low-priority Meet sections before required contracts", () => {
     const fitted = fitPrioritizedPromptSections([
       { id: "protocol", content: "REQUIRED_JSON_PROTOCOL", required: true },

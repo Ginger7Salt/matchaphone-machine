@@ -344,6 +344,9 @@ export default function SettingsPage(){
     <label>模型名称<div className="model-input"><input value={form.model} onFocus={()=>models.length&&setModelPickerOpen(true)} onChange={event=>set("model",event.target.value)}/><button disabled={busy} onClick={fetchModels}><RefreshCw/>拉取模型</button></div></label>
     {modelPickerOpen&&models.length>0&&<ModelPicker models={models} query={query} selected={form.model} onQuery={setQuery} onClose={()=>setModelPickerOpen(false)} onSelect={model=>{set("model",model);setModelPickerOpen(false)}}/>}
     <label>Temperature<input type="number" min="0" max="2" step="0.1" value={form.temperature} onChange={event=>set("temperature",Number(event.target.value))}/></label>
+    <label>?????<select value={form.contextBudgetMode??"auto"} onChange={event=>set("contextBudgetMode",event.target.value as ProviderSettings["contextBudgetMode"])}><option value="auto">????????????</option><option value="custom">???</option></select></label>
+    {form.contextBudgetMode==="custom"&&<label>????? Token ?<input type="number" min="8000" max="1000000" step="1000" value={form.contextWindowTokens??128000} onChange={event=>set("contextWindowTokens",Math.max(8000,Math.min(1000000,Math.trunc(Number(event.target.value)||128000))))}/><small className="section-note">???????????????? Provider ???? Token ???</small></label>}
+    <p className="section-note">???????????????????????????????????????????????????????????</p>
     {status&&<Status value={status}/>}<div className="settings-actions"><button disabled={busy} onClick={test}>{busy?<LoaderCircle className="spin"/>:<CloudCog/>}测试连接</button><button className="save" disabled={busy} onClick={save}><Save/>保存设置</button></div>
 
    </section>

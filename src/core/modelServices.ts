@@ -3,7 +3,25 @@ import {OpenAIProvider,testProviderConnection as testProviderConnectionRaw} from
 import {defaultModelServiceSettings,defaultProvider,type ModelServiceSettings,type ProviderSettings} from "./types";
 
 export const MODEL_SERVICES_KEY="model-services-v1";
-function providerOf(value:Partial<ProviderSettings>|undefined,fallback:ProviderSettings):ProviderSettings{return{...fallback,...value,baseUrl:(value?.baseUrl??fallback.baseUrl).trim(),apiKey:(value?.apiKey??"").trim(),model:(value?.model??fallback.model).trim(),stream:false,temperature:Math.max(0,Math.min(2,Number(value?.temperature??fallback.temperature))),maxTokens:Math.max(1,Math.trunc(Number(value?.maxTokens??fallback.maxTokens))),contextLimit:Math.max(2,Math.min(100,Math.trunc(Number(value?.contextLimit??fallback.contextLimit)))),timeoutMs:Math.max(1000,Math.trunc(Number(value?.timeoutMs??fallback.timeoutMs)))}}
+function providerOf(value: Partial<ProviderSettings> | undefined, fallback: ProviderSettings): ProviderSettings {
+ const result: ProviderSettings = {
+  ...fallback,
+  ...value,
+  baseUrl: (value?.baseUrl ?? fallback.baseUrl).trim(),
+  apiKey: (value?.apiKey ?? "").trim(),
+  model: (value?.model ?? fallback.model).trim(),
+  stream: false,
+  temperature: Math.max(0, Math.min(2, Number(value?.temperature ?? fallback.temperature))),
+  maxTokens: Math.max(1, Math.trunc(Number(value?.maxTokens ?? fallback.maxTokens))),
+  contextLimit: Math.max(2, Math.min(100, Math.trunc(Number(value?.contextLimit ?? fallback.contextLimit)))),
+  timeoutMs: Math.max(1000, Math.trunc(Number(value?.timeoutMs ?? fallback.timeoutMs))),
+ };
+ if (value?.contextBudgetMode !== undefined || value?.contextWindowTokens !== undefined || fallback.contextBudgetMode !== undefined || fallback.contextWindowTokens !== undefined) {
+  result.contextBudgetMode = (value?.contextBudgetMode ?? fallback.contextBudgetMode) === "custom" ? "custom" : "auto";
+  result.contextWindowTokens = Math.max(8_000, Math.min(1_000_000, Math.trunc(Number(value?.contextWindowTokens ?? fallback.contextWindowTokens ?? 128_000))));
+ }
+ return result;
+}
 export function normalizeModelServiceSettings(value:unknown):ModelServiceSettings{const raw=value as Partial<ModelServiceSettings>|undefined;return{version:1,secondary:{enabled:raw?.secondary?.enabled??false,provider:providerOf(raw?.secondary?.provider,{...defaultProvider,stream:false,temperature:.3})},vision:{enabled:raw?.vision?.enabled??false,provider:providerOf(raw?.vision?.provider,{...defaultProvider,model:"gpt-4.1-mini",stream:false,temperature:.2,maxTokens:500}),instruction:raw?.vision?.instruction?.trim()||defaultModelServiceSettings.vision.instruction}}}
 export async function getModelServiceSettings(){return normalizeModelServiceSettings(await getSetting<unknown>(MODEL_SERVICES_KEY,defaultModelServiceSettings))}
 export async function saveModelServiceSettings(settings:ModelServiceSettings){const normalized=normalizeModelServiceSettings(settings);await setSetting(MODEL_SERVICES_KEY,normalized);return normalized}

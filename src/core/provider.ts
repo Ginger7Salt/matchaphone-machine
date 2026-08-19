@@ -78,6 +78,8 @@ export interface ProviderChatResult {
   tailKind?: ChatProviderTailKind;
   /** Sanitized structural path used to extract visible model output. */
   normalizationPath?: string;
+  responseAdapter?: string;
+  sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
 }
 export interface ProviderChatOptions {
   signal?: AbortSignal;
@@ -87,6 +89,16 @@ export interface ProviderChatOptions {
   /** null disables the provider-owned timeout while preserving caller cancellation. */
   timeoutMs?: number | null;
 }
+export interface ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options?: ProviderChatOptions): Promise<ProviderChatResult>;
+}
+
+export class BrowserDirectProviderTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider(settings).chatWithMeta(messages, options);
+  }
+}
+
 export type ProviderChatInvoker = (
   settings: ProviderSettings,
   messages: ChatItem[],
@@ -379,6 +391,19 @@ function visibleTextOf(
   const blockReason = cleanScalar(promptFeedback?.blockReason ?? value.block_reason ?? value.blockReason, MAX_ERROR_DETAIL);
   if (blockReason) signals.refusal = blockReason;
 
+  const eventType = cleanScalar(value.type, 120)?.toLowerCase();
+  if (isRecord(value.delta)) {
+    const deltaType = cleanScalar(value.delta.type, 80)?.toLowerCase();
+    if ((deltaType && HIDDEN_TYPES.has(deltaType)) || (eventType && HIDDEN_TYPES.has(eventType))) signals.reasoning = true;
+    else if ((deltaType && TOOL_TYPES.has(deltaType)) || (eventType && TOOL_TYPES.has(eventType))) signals.tool = true;
+    else if (typeof value.delta.text === "string" && value.delta.text) {
+      addCandidate(paths, `${path ? `${path}.` : ""}delta.text`);
+      return value.delta.text;
+    }
+  } else if (typeof value.delta === "string" && value.delta && eventType?.includes("delta")) {
+    addCandidate(paths, `${path ? `${path}.` : ""}delta`);
+    return value.delta;
+  }
   if (Array.isArray(value.choices)) {
     for (let index = 0; index < value.choices.length; index++) {
       const text = choiceText(value.choices[index], `${path ? `${path}.` : ""}choices[${index}]`, paths, signals);
@@ -732,7 +757,9 @@ function parseSseOrNdjson(
   transportMeta?: ResponseTransportMetadata,
   onVisibleChunk?: (value: string) => void,
 ): ProviderChatResult | undefined {
-  const chunks: string[] = [];
+  const deltaChunks: string[] = [];
+  const genericChunks: string[] = [];
+  const completeObjects: string[] = [];
   let finishReason: string | undefined;
   let outputTokens: number | undefined;
   let doneMarker = false;
@@ -765,8 +792,17 @@ function parseSseOrNdjson(
           ...transportMetaFields(transportMeta),
         });
       }
+      const pathCount = visibleCandidatePaths.length;
       const visible = visibleTextOf(value, `${mode}[${parsedCount - 1}]`, 0, visibleCandidatePaths, signals);
-      if (visible) chunks.push(visible);
+      if (visible) {
+        const candidatePath = visibleCandidatePaths[pathCount] ?? visibleCandidatePaths.at(-1) ?? "";
+        const eventType = isRecord(value) ? cleanScalar(value.type, 120)?.toLowerCase() : undefined;
+        const complete = Boolean(meetRoundValueOf(value)) || Boolean(directMeetRoundText(parseNestedString(visible)));
+        const explicitDelta = candidatePath.includes(".delta") || Boolean(eventType?.includes("delta"));
+        if (complete) completeObjects.push(visible);
+        else if (explicitDelta) deltaChunks.push(visible);
+        else genericChunks.push(visible);
+      }
       finishReason = finishReasonOf(value) ?? finishReason;
       outputTokens = outputTokensOf(value) ?? outputTokens;
       return "parsed";
@@ -829,8 +865,21 @@ function parseSseOrNdjson(
     if (parsePayload(carry) === "invalid") malformedCount += 1;
     carry = "";
   }
-  if (!parsedCount || !chunks.length) return undefined;
-  const combined = chunks.join("");
+  if (!parsedCount || (!deltaChunks.length && !genericChunks.length && !completeObjects.length)) return undefined;
+  let sseMode: "delta" | "snapshot" | "complete-object" = "delta";
+  let combined = "";
+  if (completeObjects.length) {
+    combined = completeObjects.at(-1)!;
+    sseMode = "complete-object";
+  } else if (deltaChunks.length) {
+    combined = deltaChunks.join("");
+  } else {
+    for (const chunk of genericChunks) {
+      if (!combined) combined = chunk;
+      else if (chunk.startsWith(combined)) { combined = chunk; sseMode = "snapshot"; }
+      else if (!combined.endsWith(chunk)) combined += chunk;
+    }
+  }
   try {
     const normalized = parseChatResponse(
       combined,
@@ -838,7 +887,8 @@ function parseSseOrNdjson(
       secrets,
       transportMeta ? { ...transportMeta, transportMode: mode } : undefined,
     );
-    chunks.forEach((chunk) => onVisibleChunk?.(chunk));
+    if (sseMode === "snapshot" || sseMode === "complete-object") onVisibleChunk?.(combined);
+    else [...deltaChunks, ...genericChunks].forEach((chunk) => onVisibleChunk?.(chunk));
     return {
       ...normalized,
       finishReason: finishReason ?? normalized.finishReason,
@@ -853,6 +903,8 @@ function parseSseOrNdjson(
       contentLengthMatched: transportMeta?.contentLengthMatched,
       tailKind: transportMeta?.tailKind ?? responseTailKind(raw),
       normalizationPath: visibleCandidatePaths[0] ?? normalized.normalizationPath,
+      responseAdapter: normalized.responseAdapter ?? (sseMode === "complete-object" ? "direct-meet-object" : "stream-text"),
+      sseMode,
     };
   } catch (error) {
     if (error instanceof ProviderResponseParseError) {
@@ -1066,6 +1118,8 @@ function parseChatResponse(
       completeVisibleRole || (signals.structuredDiagnostics ?? structuredDiagnostics)?.wireFormat,
     ),
     normalizationPath: visibleCandidatePaths[0],
+    responseAdapter: responseShape === "gemini-candidates" ? "gemini" : responseShape === "content-array" ? "claude" : responseShape === "responses-output" ? "openai-responses" : responseShape === "choices" ? "openai-compatible" : responseShape === "meet-round-object" ? "direct-meet-object" : responseShape.startsWith("wrapper:") ? "relay-wrapper" : "generic",
+    sseMode: "not-applicable",
     ...transportMetaFields(transportMeta),
   };
 }
