@@ -11,6 +11,7 @@ function providerOf(value: Partial<ProviderSettings> | undefined, fallback: Prov
   apiKey: (value?.apiKey ?? "").trim(),
   model: (value?.model ?? fallback.model).trim(),
   stream: false,
+  protocol: ["auto","openai-compatible","openai-responses","gemini","claude","deepseek-compatible"].includes(String(value?.protocol)) ? value?.protocol : fallback.protocol,
   temperature: Math.max(0, Math.min(2, Number(value?.temperature ?? fallback.temperature))),
   maxTokens: Math.max(1, Math.trunc(Number(value?.maxTokens ?? fallback.maxTokens))),
   contextLimit: Math.max(2, Math.min(100, Math.trunc(Number(value?.contextLimit ?? fallback.contextLimit)))),

@@ -734,10 +734,11 @@ export interface ContextSectionDiagnostics {
 }
 export interface ProviderConnectivityResult {
   ok: boolean;
-  kind?: "auth" | "cors" | "network" | "rate" | "server" | "format";
+  kind?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format";
   httpStatus?: number;
   providerCode?: string;
   model?: string;
+  protocol?: ProviderProtocol;
 }
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
@@ -1126,6 +1127,8 @@ export type ApiErrorKind =
   | "timeout"
   | "network"
   | "cors"
+  | "context"
+  | "protocol"
   | "server"
   | "format"
   | "interrupted";
@@ -1691,6 +1694,12 @@ export interface MeetEntry {
     contextWindowTokens?: number;
     contextWindowSource?: "auto" | "custom" | "fallback";
     responseAdapter?: string;
+    providerProtocol?: ProviderProtocol;
+    providerAdapter?: string;
+    endpointKind?: "base-url" | "full-endpoint";
+    requestMode?: ProviderProtocol;
+    connectivityFailure?: string;
+    protocolMismatch?: boolean;
     sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
     error?: string;
     model?: string;
@@ -1728,6 +1737,9 @@ export interface MeetEntry {
       inputTokens?: number;
       errorKind?: string;
       providerCode?: string;
+      providerProtocol?: ProviderProtocol;
+      providerAdapter?: string;
+      endpointKind?: "base-url" | "full-endpoint";
       failureDetailCode?: MeetFailureDetailCode;
       retryDecision?: MeetRetryDecision;
       normalizationPath?: string;
@@ -1977,6 +1989,14 @@ export interface FeedPost extends BaseEntity {
     prompt: string;
   };
 }
+export type ProviderProtocol =
+  | "auto"
+  | "openai-compatible"
+  | "openai-responses"
+  | "gemini"
+  | "claude"
+  | "deepseek-compatible";
+
 export interface ProviderSettings {
   baseUrl: string;
   apiKey: string;
@@ -1987,6 +2007,7 @@ export interface ProviderSettings {
   contextLimit: number;
   contextBudgetMode?: "auto" | "custom";
   contextWindowTokens?: number;
+  protocol?: ProviderProtocol;
   timeoutMs: number;
 }
 export interface ProviderPreset {
@@ -2506,6 +2527,7 @@ export const defaultProvider: ProviderSettings = {
   temperature: 0.85,
   maxTokens: 800,
   contextLimit: 30,
+  protocol: "auto",
   timeoutMs: 60000,
 };
 export const defaultEmbeddingServiceSettings: EmbeddingServiceSettings = {

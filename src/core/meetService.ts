@@ -3,7 +3,7 @@ import { enqueueBackgroundTask } from "./backgroundTasks";
 import { rewardIslandMeet } from "./coupleIsland";
 import { memoryExtractionSettingsOf } from "./memoryExtraction";
 import { userPersonaContext } from "./userPersona";
-import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, isContextOverflowError } from "./provider";
+import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, isContextOverflowError, resolveProviderProtocol } from "./provider";
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
@@ -982,6 +982,8 @@ async function generateMeetTurnInternal(
           stage: "requesting",
           model: attemptProvider.model,
           providerRole,
+          providerProtocol: resolveProviderProtocol(attemptProvider),
+          providerAdapter: resolveProviderProtocol(attemptProvider),
           inputTokens,
           retryDecision,
         };
@@ -1070,7 +1072,14 @@ async function generateMeetTurnInternal(
           finishReason: response.finishReason,
           truncated: response.truncated,
           normalizationPath: response.normalizationPath,
+          providerProtocol: response.requestMode,
+          providerAdapter: response.adapter,
+          endpointKind: response.endpointKind,
+          requestMode: response.requestMode,
         });
+        attemptMeta.providerProtocol = response.requestMode;
+        attemptMeta.providerAdapter = response.adapter;
+        attemptMeta.endpointKind = response.endpointKind;
         generationMeta.responseAdapter = response.responseAdapter ?? response.normalizationPath?.split(".")[0] ?? response.responseShape;
         generationMeta.sseMode = response.sseMode ?? (response.transportMode === "sse" ? "delta" : "not-applicable");
         if (generationMeta.contextDiagnostics) {
@@ -1085,6 +1094,10 @@ async function generateMeetTurnInternal(
           finishReason: response.finishReason,
           truncated: response.truncated,
           normalizationPath: response.normalizationPath,
+          providerProtocol: response.requestMode,
+          providerAdapter: response.adapter,
+          endpointKind: response.endpointKind,
+          requestMode: response.requestMode,
         });
         await safeUpdateGeneration();
 
@@ -1160,6 +1173,15 @@ async function generateMeetTurnInternal(
         generationMeta.failureClass = meetFailureClassOf(error);
         generationMeta.failureDetailCode = meetFailureDetailCodeOf(error);
         if (error instanceof ProviderError) {
+          const resolvedProtocol = resolveProviderProtocol(attemptProvider);
+          attemptMeta.providerProtocol ??= resolvedProtocol;
+          attemptMeta.providerAdapter ??= resolvedProtocol;
+          generationMeta.providerProtocol ??= resolvedProtocol;
+          generationMeta.providerAdapter ??= resolvedProtocol;
+          generationMeta.endpointKind ??= "base-url";
+          generationMeta.requestMode ??= resolvedProtocol;
+          if (error.kind === "cors") generationMeta.connectivityFailure = "cors";
+          if (error.kind === "protocol" || error.apiError?.kind === "protocol") generationMeta.protocolMismatch = true;
           attemptMeta.httpStatus = error.apiError?.httpStatus;
           attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;
           attemptMeta.providerCode = error.apiError?.providerCode;

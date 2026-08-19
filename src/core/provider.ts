@@ -1,5 +1,5 @@
 import type { ChatItem } from "./context";
-import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderConnectivityResult, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
+import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderConnectivityResult, ProviderProtocol, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
 import {
   parseStructuredJson,
   parseStructuredJsonWithMeta,
@@ -80,6 +80,10 @@ export interface ProviderChatResult {
   normalizationPath?: string;
   responseAdapter?: string;
   sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
+  adapter?: string;
+  endpointKind?: "base-url" | "full-endpoint";
+  requestMode?: ProviderProtocol;
+  streamMode?: "sse" | "json" | "not-applicable";
 }
 export interface ProviderChatOptions {
   signal?: AbortSignal;
@@ -95,7 +99,7 @@ export interface ProviderTransport {
 
 export class BrowserDirectProviderTransport implements ProviderTransport {
   chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider(settings).chatWithMeta(messages, options);
+    return createProviderTransport(settings).chat(settings, messages, options);
   }
 }
 
@@ -1146,6 +1150,8 @@ function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
   if (providerCode === "missing_inner_voice") return "角色回复缺少完整心声";
   if (providerCode === "invalid_role_protocol") return "服务返回的 JSON 未通过角色回复协议校验";
   if (status === 400 || status === 413 || status === 422) return "请求参数、上下文长度或服务兼容格式不正确";
+  if (kind === "context") return "Provider 不接受当前输入长度或上下文窗口配置";
+  if (kind === "protocol") return "请求协议与 Provider Endpoint 不匹配";
   if (kind === "auth") return "API Key 无效、已过期或当前账户没有访问权限";
   if (kind === "model") return "接口地址或模型名称不存在";
   if (kind === "rate") return "调用频率受限，或账户余额与额度不足";
@@ -1246,15 +1252,114 @@ function retryAfterSecondsOf(value: string | null) {
   return Math.max(0, Math.ceil((timestamp - Date.now()) / 1000));
 }
 
+
+export interface ProviderEndpoint {
+  protocol: Exclude<ProviderProtocol, "auto">;
+  url: string;
+  endpointKind: "base-url" | "full-endpoint";
+}
+
+function cleanProviderUrl(value: string): string {
+  return value.trim().replace(/[\/]+$/, "");
+}
+
+export function resolveProviderProtocol(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol">): Exclude<ProviderProtocol, "auto"> {
+  const explicit = settings.protocol;
+  if (explicit && explicit !== "auto") return explicit;
+  const url = settings.baseUrl.toLowerCase();
+  if (/\/(?:chat\/completions)(?:[?#]|$)/.test(url)) return "openai-compatible";
+  if (/\/(?:responses)(?:[?#]|$)/.test(url)) return "openai-responses";
+  if (url.includes("generativelanguage.googleapis.com") || /(?:v1beta|generatecontent|streamgeneratecontent)/i.test(url)) return "gemini";
+  if (url.includes("api.anthropic.com") || /\/messages(?:[?#]|$)/i.test(url)) return "claude";
+  if (url.includes("api.deepseek.com")) return "deepseek-compatible";
+  return "openai-compatible";
+}
+
+function endpointPath(protocol: Exclude<ProviderProtocol, "auto">): string {
+  if (protocol === "openai-responses") return "/responses";
+  if (protocol === "gemini") return ":generateContent";
+  if (protocol === "claude") return "/messages";
+  return "/chat/completions";
+}
+function appendProviderPath(source: string, path: string): string {
+  const match = source.match(/^([^?#]*)([?#].*)?$/);
+  return (match?.[1] ?? source) + path + (match?.[2] ?? "");
+}
+
+export function resolveProviderEndpoint(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol" | "apiKey" | "stream">): ProviderEndpoint {
+  const protocol = resolveProviderProtocol(settings);
+  const source = cleanProviderUrl(settings.baseUrl);
+  const lower = source.toLowerCase();
+  const full = protocol === "gemini"
+    ? /:(?:stream)?generatecontent(?:[?#]|$)/i.test(lower)
+    : lower.endsWith(endpointPath(protocol).toLowerCase()) || lower.includes(endpointPath(protocol).toLowerCase() + "?");
+  if (full) return { protocol, url: source, endpointKind: "full-endpoint" };
+  if (protocol === "gemini") {
+    const model = encodeURIComponent(settings.model.trim());
+    return { protocol, url: appendProviderPath(source, "/models/" + model + (settings.stream ? ":streamGenerateContent?alt=sse" : ":generateContent")), endpointKind: "base-url" };
+  }
+  return { protocol, url: appendProviderPath(source, endpointPath(protocol)), endpointKind: "base-url" };
+}
+
+function providerHeaders(settings: ProviderSettings, protocol: Exclude<ProviderProtocol, "auto">): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (protocol === "gemini") headers["x-goog-api-key"] = settings.apiKey;
+  else if (protocol === "claude") {
+    headers["x-api-key"] = settings.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else headers.Authorization = "Bearer " + settings.apiKey;
+  return headers;
+}
+
+function providerMessageContent(message: ChatItem): unknown {
+  const urls = [...(message.imageUrls ?? []), ...(message.imageUrl ? [message.imageUrl] : [])];
+  if (!urls.length) return message.content;
+  return [{ type: "text", text: message.content }, ...urls.map(url => ({ type: "image_url", image_url: { url } }))];
+}
+function geminiContents(messages: ChatItem[]) {
+  return messages.filter(message => message.role !== "system").map(message => ({
+    role: message.role === "assistant" ? "model" : "user",
+    parts: [{ text: message.content }],
+  }));
+}
+function claudeMessages(messages: ChatItem[]) {
+  const result: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
+  for (const message of messages.filter(item => item.role !== "system")) {
+    const role = message.role === "assistant" ? "assistant" : "user";
+    const content = [{ type: "text", text: message.content }];
+    const previous = result.at(-1);
+    if (previous?.role === role) previous.content.push(...content); else result.push({ role, content });
+  }
+  return result;
+}
+function responsesInput(messages: ChatItem[]) {
+  return messages.map(message => ({ role: message.role, content: [{ type: "input_text", text: message.content }] }));
+}
+function protocolRequestBody(settings: ProviderSettings, messages: ChatItem[], protocol: Exclude<ProviderProtocol, "auto">, stream: boolean, temperature: number): Record<string, unknown> {
+  if (protocol === "gemini") {
+    const system = messages.filter(message => message.role === "system").map(message => message.content).join("\n\n");
+    return { contents: geminiContents(messages), ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}), generationConfig: { temperature }, };
+  }
+  if (protocol === "claude") {
+    const system = messages.filter(message => message.role === "system").map(message => message.content).join("\n\n");
+    return { model: settings.model, messages: claudeMessages(messages), ...(system ? { system } : {}), temperature, max_tokens: settings.maxTokens > 0 ? settings.maxTokens : 8192, ...(stream ? { stream: true } : {}) };
+  }
+  if (protocol === "openai-responses") return { model: settings.model, input: responsesInput(messages), temperature, ...(stream ? { stream: true } : {}) };
+  return { model: settings.model, messages: messages.map(message => ({ role: message.role, content: providerMessageContent(message) })), temperature, ...(stream ? { stream: true } : {}) };
+}
+
 export class OpenAIProvider {
   constructor(private settings: ProviderSettings) {}
-  private base() { return this.settings.baseUrl.replace(/\/$/, ""); }
+  private endpoint() { return resolveProviderEndpoint(this.settings); }
+  private base() { return cleanProviderUrl(this.settings.baseUrl); }
   private failure(kind: ApiErrorKind, message: string, partial = "", meta: ProviderErrorMetadata = {}) {
     return new ProviderError(kind, message, partial, createApiErrorInfo(kind, meta));
   }
   private mapStatus(status: number, text = "", retryAfterSeconds?: number) {
     const parsed = parsedErrorBody(text, [this.settings.apiKey]);
-    const kind: ApiErrorKind = status === 401 || status === 403 ? "auth" : status === 404 ? "model" : status === 408 ? "timeout" : status === 429 ? "rate" : status >= 500 ? "server" : "format";
+    const lowered = text.toLowerCase();
+    const protocolMismatch = /unsupported.*(endpoint|protocol)|invalid.*(endpoint|protocol)|unknown.*(endpoint|protocol)|chat\/completions.*(not|unsupported)|generatecontent.*(not|unsupported)|messages.*(not|unsupported)|endpoint.*(not|found)|protocol.*(mismatch|invalid)/i.test(lowered);
+    const kind: ApiErrorKind = status === 401 || status === 403 ? "auth" : status === 404 && protocolMismatch ? "protocol" : status === 404 ? "model" : status === 408 ? "timeout" : status === 429 ? "rate" : status >= 500 ? "server" : protocolMismatch ? "protocol" : ((status === 400 || status === 413 || status === 422) && /context|token|too long|maximum|length|上下文|令牌|长度|超出/.test(lowered) ? "context" : "format");
     const fallback = status === 401 || status === 403 ? "API Key 无效或无权限" : status === 404 ? "接口或模型不存在" : status === 408 ? "请求超时" : status === 429 ? "调用频率或额度已达上限" : status >= 500 ? `服务暂时不可用 (${status})` : `请求失败 (${status})`;
     const detail = parsed.message && parsed.message !== "error" ? parsed.message : fallback;
     return this.failure(kind, detail, "", { httpStatus: status, retryAfterSeconds, providerCode: parsed.providerCode, providerType: parsed.providerType, param: parsed.param, detail });
@@ -1268,21 +1373,12 @@ export class OpenAIProvider {
     const stream = opts.stream ?? this.settings.stream;
     let out = "";
     try {
-      const payloadMessages = messages.map(({ imageUrl, imageUrls, ...message }) => {
-        const urls = [...(imageUrls ?? []), ...(imageUrl ? [imageUrl] : [])];
-        return urls.length
-          ? { ...message, content: [{ type: "text", text: message.content }, ...urls.map((url) => ({ type: "image_url", image_url: { url } }))] }
-          : message;
-      });
-      const response = await fetch(this.base() + "/chat/completions", {
+      const endpoint = resolveProviderEndpoint({ ...this.settings, stream });
+      const temperature = opts.temperature ?? this.settings.temperature;
+      const response = await fetch(endpoint.url, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + this.settings.apiKey },
-        body: JSON.stringify({
-          model: this.settings.model,
-          messages: payloadMessages,
-          temperature: opts.temperature ?? this.settings.temperature,
-          stream,
-        }),
+        headers: providerHeaders(this.settings, endpoint.protocol),
+        body: JSON.stringify(protocolRequestBody(this.settings, messages, endpoint.protocol, stream, temperature)),
         signal: controller.signal,
       });
       if (!response.ok)
@@ -1294,7 +1390,8 @@ export class OpenAIProvider {
       const contentType = response.headers.get("Content-Type") ?? undefined;
       const parseOrThrow = (raw: string, meta: ResponseTransportMetadata) => {
         try {
-          return parseChatResponse(raw, contentType, [this.settings.apiKey], meta);
+          const parsed = parseChatResponse(raw, contentType, [this.settings.apiKey], meta);
+          return { ...parsed, adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (meta.transportMode === "sse" || meta.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
             throw this.failure(error.kind, error.message, "", error.meta);
@@ -1375,6 +1472,7 @@ export class OpenAIProvider {
       } else {
         result = parseOrThrow(raw, transportMetadataOf(response, raw, "json-fallback", receivedBytes));
       }
+      if (result) result = { ...result, adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (result.transportMode === "sse" || result.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
       if (!result)
         throw this.failure("format", "数据流已结束，但没有生成完整正文", "", {
           providerCode: "empty_stream",
@@ -1446,13 +1544,51 @@ export class OpenAIProvider {
   async test() { return this.chat([{ role: "user", content: "只回复 OK" }], { stream: false }); }
 }
 
+
+export class OpenAICompatibleTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider({ ...settings, protocol: "openai-compatible" }).chatWithMeta(messages, options);
+  }
+}
+export class OpenAIResponsesTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider({ ...settings, protocol: "openai-responses" }).chatWithMeta(messages, options);
+  }
+}
+export class GeminiTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider({ ...settings, protocol: "gemini" }).chatWithMeta(messages, options);
+  }
+}
+export class ClaudeTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider({ ...settings, protocol: "claude" }).chatWithMeta(messages, options);
+  }
+}
+export class DeepSeekCompatibleTransport implements ProviderTransport {
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
+    return new OpenAIProvider({ ...settings, protocol: "deepseek-compatible" }).chatWithMeta(messages, options);
+  }
+}
+export function createProviderTransport(settings: ProviderSettings): ProviderTransport {
+  switch (resolveProviderProtocol(settings)) {
+    case "openai-responses": return new OpenAIResponsesTransport();
+    case "gemini": return new GeminiTransport();
+    case "claude": return new ClaudeTransport();
+    case "deepseek-compatible": return new DeepSeekCompatibleTransport();
+    default: return new OpenAICompatibleTransport();
+  }
+}
+
 function connectivityKind(error: unknown): ProviderConnectivityResult["kind"] {
   const info = apiErrorInfoOf(error);
   if (!info) return "network";
   if (info.kind === "auth") return "auth";
   if (info.kind === "cors") return "cors";
   if (info.kind === "rate") return "rate";
+  if (info.kind === "context") return "context";
   if (info.kind === "server" || info.kind === "timeout") return "server";
+  if (info.kind === "protocol") return "protocol";
   return "format";
 }
 
@@ -1461,7 +1597,7 @@ export async function testProviderConnection(settings: ProviderSettings): Promis
   const model = settings.model.trim();
   try {
     await new OpenAIProvider({ ...settings, stream: false }).test();
-    return { ok: true, model };
+    return { ok: true, model, protocol: resolveProviderProtocol(settings) };
   } catch (error) {
     const info = apiErrorInfoOf(error);
     return {
@@ -1470,6 +1606,7 @@ export async function testProviderConnection(settings: ProviderSettings): Promis
       httpStatus: info?.httpStatus,
       providerCode: info?.providerCode,
       model,
+      protocol: resolveProviderProtocol(settings),
     };
   }
 }

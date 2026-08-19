@@ -14,7 +14,7 @@ const completeCompactRolePayload=()=>JSON.stringify({
 });
 function streamResponse(chunks:string[],fail=false){let i=0;return new Response(new ReadableStream<Uint8Array>({pull(controller){if(i<chunks.length){controller.enqueue(encoder.encode(chunks[i++]));return}if(fail){controller.error(new Error("broken"));return}controller.close()}}),{status:200,headers:{"Content-Type":"text/event-stream"}})}
 describe("provider connectivity diagnostics",()=>{
- it("returns a sanitized success result",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})));await expect(testProviderConnection(settings)).resolves.toEqual({ok:true,model:settings.model});});
+ it("returns a sanitized success result",async()=>{vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})));await expect(testProviderConnection(settings)).resolves.toMatchObject({ok:true,model:settings.model,protocol:"openai-compatible"});});
  it("classifies CORS without exposing credentials",async()=>{vi.stubGlobal("fetch",vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));await expect(testProviderConnection(settings)).resolves.toMatchObject({ok:false,kind:"cors",providerCode:"cors_or_fetch_failed",model:settings.model});});
 });
 describe("meet response extraction",()=>{
@@ -354,4 +354,47 @@ describe("provider family adapters",()=>{
   await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"gemini text",responseAdapter:"gemini"});
   await expect(new OpenAIProvider(settings).chatWithMeta([{role:"user",content:"hi"}],{stream:false})).resolves.toMatchObject({text:"claude text",responseAdapter:"claude"});
  });
+});
+
+
+describe("protocol-aware transports", () => {
+  it("does not append duplicate paths and builds OpenAI Responses requests", async () => {
+    let url = ""; let body: any;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); return new Response(JSON.stringify({ output_text: "OK" }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
+    const settings = { ...defaultProvider, apiKey: "secret", baseUrl: "https://api.example/v1/responses", protocol: "openai-responses" as const, stream: false };
+    await expect(new OpenAIProvider(settings).chat([{ role: "user", content: "hi" }], { stream: false })).resolves.toBe("OK");
+    expect(url).toBe("https://api.example/v1/responses");
+    expect(body.input[0].role).toBe("user");
+  });
+
+  it("builds a native Gemini request without using chat completions", async () => {
+    let url = ""; let body: any; let headers: HeadersInit | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); headers = options.headers; return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "gemini" }] } }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
+    const settings = { ...defaultProvider, apiKey: "gemini-secret", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.5-flash", protocol: "gemini" as const, stream: false };
+    await expect(new OpenAIProvider(settings).chat([{ role: "system", content: "system" }, { role: "user", content: "hi" }], { stream: false })).resolves.toBe("gemini");
+    expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
+    expect(url).not.toContain("chat/completions");
+    expect(body.systemInstruction.parts[0].text).toBe("system");
+    expect((headers as Record<string, string>)["x-goog-api-key"]).toBe("gemini-secret");
+  });
+
+  it("builds a native Claude request with a separate system instruction", async () => {
+    let url = ""; let body: any; let headers: HeadersInit | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); headers = options.headers; return new Response(JSON.stringify({ content: [{ type: "text", text: "claude" }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
+    const settings = { ...defaultProvider, apiKey: "claude-secret", baseUrl: "https://api.anthropic.com/v1", model: "claude-sonnet", protocol: "claude" as const, stream: false };
+    await expect(new OpenAIProvider(settings).chat([{ role: "system", content: "system" }, { role: "user", content: "hi" }], { stream: false })).resolves.toBe("claude");
+    expect(url).toBe("https://api.anthropic.com/v1/messages");
+    expect(body.system).toBe("system");
+    expect((headers as Record<string, string>)["x-api-key"]).toBe("claude-secret");
+    expect((headers as Record<string, string>)["anthropic-version"]).toBe("2023-06-01");
+  });
+
+  it("keeps DeepSeek on the OpenAI-compatible transport and never exposes its key in errors", async () => {
+    let url = ""; let body: any;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); return new Response(JSON.stringify({ choices: [{ message: { content: "deepseek" } }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
+    const settings = { ...defaultProvider, apiKey: "deep-secret", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", protocol: "deepseek-compatible" as const, stream: false };
+    await expect(new OpenAIProvider(settings).chat([{ role: "user", content: "hi" }], { stream: false })).resolves.toBe("deepseek");
+    expect(url).toBe("https://api.deepseek.com/v1/chat/completions");
+    expect(body.model).toBe("deepseek-chat");
+  });
 });
