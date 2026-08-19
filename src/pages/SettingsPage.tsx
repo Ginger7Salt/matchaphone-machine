@@ -33,7 +33,7 @@ import {
  saveModelServiceSettings,
  testDedicatedProvider
 } from "../core/modelServices";
-import {OpenAIProvider,ProviderError,testProviderConnection} from "../core/provider";
+import {OpenAIProvider,ProviderError,createProviderTransport,testProviderConnection} from "../core/provider";
 import {backgroundActivitySettingsOf,notificationSettingsOf,saveBackgroundActivitySettings,saveNotificationSettings} from "../core/notificationSettings";
 import {notificationSupported,requestTeaNotificationPermission,sendTestNotification} from "../core/notifications";
 import {getEmbeddingSettings,saveEmbeddingSettings,testEmbeddingConnection} from "../core/embedding";
@@ -145,6 +145,17 @@ export default function SettingsPage(){
  const requireFields=()=>{
   if(!form.baseUrl.trim()||!form.apiKey.trim())throw new ProviderError("format","请先填写 Base URL 和 API Key");
  };
+ const discoverModels=async(provider:ProviderSettings)=>{
+  const transport=createProviderTransport(provider);
+  return transport.listModels?.(provider) ?? {supported:false,protocol:provider.protocol??"auto",reason:"unsupported" as const,models:[]};
+ };
+ const modelDiscoveryMessage=(result:{reason?:string;protocol?:string})=>{
+  if(result.reason==="unsupported")return "当前协议（"+(result.protocol??"auto")+"）不提供通用模型列表，请手动填写模型名称。";
+  if(result.reason==="auth")return "模型列表认证失败，请检查 API Key 和模型权限。";
+  if(result.reason==="cors")return "模型列表请求被浏览器 CORS 拦截，请确认 Provider 允许网页直连。";
+  if(result.reason==="invalid-response")return "Provider 返回的模型列表格式无法识别。";
+  return "当前 Provider 不支持自动拉取模型，请手动填写模型名称。";
+ };
  const test=async()=>{
   setBusy(true);
   try{
@@ -161,10 +172,12 @@ export default function SettingsPage(){
   setStatus(null);
   try{
    requireFields();
-   const ids=await new OpenAIProvider(form).models();
+   const result=await discoverModels(form);
+   if(!result.supported){setModels([]);setModelPickerOpen(false);setStatus({ok:false,text:modelDiscoveryMessage(result)});return;}
+   const ids=result.models??[];
    setModels(ids);
    setModelPickerOpen(true);
-   setStatus({ok:true,text:`已拉取 ${ids.length} 个模型`});
+   setStatus({ok:true,text:"已拉取 "+ids.length+" 个模型（"+result.protocol+"）"});
   }catch(error){setStatus({ok:false,text:error instanceof Error?error.message:"拉取失败"})}
   finally{setBusy(false)}
  };
@@ -240,7 +253,7 @@ export default function SettingsPage(){
  };
  const fetchServiceModels=async(kind:ServiceKind)=>{
   const provider=modelServices[kind].provider;setBusy(true);setServiceStatus(current=>({...current,[kind]:null}));
-  try{if(!provider.baseUrl.trim()||!provider.apiKey.trim())throw new Error("请先填写 Base URL 和 API Key");const ids=await new OpenAIProvider({...provider,model:provider.model.trim()||defaultProvider.model}).models();setServiceModels(current=>({...current,[kind]:ids}));setServiceQueries(current=>({...current,[kind]:""}));setServicePickerOpen(current=>({...current,[kind]:true}));setServiceStatus(current=>({...current,[kind]:{ok:true,text:`已拉取 ${ids.length} 个模型`}}))}catch(error){setServiceStatus(current=>({...current,[kind]:{ok:false,text:error instanceof Error?error.message:"拉取模型失败"}}))}finally{setBusy(false)}
+  try{if(!provider.baseUrl.trim()||!provider.apiKey.trim())throw new Error("请先填写 Base URL 和 API Key");const result=await discoverModels({...provider,model:provider.model.trim()||defaultProvider.model});if(!result.supported){setServiceModels(current=>({...current,[kind]:[]}));setServicePickerOpen(current=>({...current,[kind]:false}));setServiceStatus(current=>({...current,[kind]:{ok:false,text:modelDiscoveryMessage(result)}}));return;}const ids=result.models??[];setServiceModels(current=>({...current,[kind]:ids}));setServiceQueries(current=>({...current,[kind]:""}));setServicePickerOpen(current=>({...current,[kind]:true}));setServiceStatus(current=>({...current,[kind]:{ok:true,text:"已拉取 "+ids.length+" 个模型（"+result.protocol+"）"}}))}catch(error){setServiceStatus(current=>({...current,[kind]:{ok:false,text:error instanceof Error?error.message:"拉取模型失败"}}))}finally{setBusy(false)}
  };
  const fetchEmbeddingModels=async()=>{setBusy(true);setEmbeddingStatus(null);try{if(!embeddingDraft.baseUrl.trim()||!embeddingDraft.apiKey.trim())throw new Error("请先填写 Base URL 和 API Key");const ids=await new OpenAIProvider({...defaultProvider,baseUrl:embeddingDraft.baseUrl,apiKey:embeddingDraft.apiKey,model:embeddingDraft.model.trim()||defaultProvider.model,stream:false}).models(),sorted=[...ids].sort((a,b)=>Number(!/(?:embed|embedding)/i.test(a))-Number(!/(?:embed|embedding)/i.test(b))||a.localeCompare(b));setEmbeddingModels(sorted);setEmbeddingQuery("");setEmbeddingPickerOpen(true);setEmbeddingStatus({ok:true,text:`已拉取 ${ids.length} 个模型`})}catch(error){setEmbeddingStatus({ok:false,text:error instanceof Error?error.message:"拉取模型失败"})}finally{setBusy(false)}};
  const saveServices=async(kind:ServiceKind)=>{

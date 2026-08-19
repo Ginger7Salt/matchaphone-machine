@@ -93,13 +93,24 @@ export interface ProviderChatOptions {
   /** null disables the provider-owned timeout while preserving caller cancellation. */
   timeoutMs?: number | null;
 }
+export interface ProviderModelDiscovery {
+  supported: boolean;
+  models?: string[];
+  protocol: ProviderProtocol;
+  endpointKind?: "base-url" | "full-endpoint";
+  reason?: "unsupported" | "invalid-response" | "auth" | "cors" | "network" | "server";
+}
 export interface ProviderTransport {
   chat(settings: ProviderSettings, messages: ChatItem[], options?: ProviderChatOptions): Promise<ProviderChatResult>;
+  listModels?(settings: ProviderSettings): Promise<ProviderModelDiscovery>;
 }
 
 export class BrowserDirectProviderTransport implements ProviderTransport {
   chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
     return createProviderTransport(settings).chat(settings, messages, options);
+  }
+  listModels(settings: ProviderSettings) {
+    return createProviderTransport(settings).listModels?.(settings) ?? Promise.resolve({ supported: false, protocol: resolveProviderProtocol(settings), reason: "unsupported" as const, models: [] });
   }
 }
 
@@ -1260,7 +1271,17 @@ export interface ProviderEndpoint {
 }
 
 function cleanProviderUrl(value: string): string {
-  return value.trim().replace(/[\/]+$/, "");
+  const source = value.trim();
+  const match = source.match(/^([^?#]*)([?#].*)?$/);
+  const pathname = (match?.[1] ?? source).replace(/[\/]+$/, "");
+  return pathname + (match?.[2] ?? "");
+}
+function splitProviderUrl(value: string) {
+  const match = cleanProviderUrl(value).match(/^([^?#]*)([?#].*)?$/);
+  return { pathname: match?.[1] ?? value, suffix: match?.[2] ?? "" };
+}
+function replaceProviderPath(value: string, pathname: string) {
+  return pathname.replace(/[\/]+$/, "") + splitProviderUrl(value).suffix;
 }
 
 export function resolveProviderProtocol(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol">): Exclude<ProviderProtocol, "auto"> {
@@ -1284,6 +1305,22 @@ function endpointPath(protocol: Exclude<ProviderProtocol, "auto">): string {
 function appendProviderPath(source: string, path: string): string {
   const match = source.match(/^([^?#]*)([?#].*)?$/);
   return (match?.[1] ?? source) + path + (match?.[2] ?? "");
+}
+
+export function resolveProviderModelsEndpoint(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol" | "apiKey" | "stream">): ProviderEndpoint {
+  const protocol = resolveProviderProtocol(settings);
+  const source = cleanProviderUrl(settings.baseUrl);
+  const { pathname } = splitProviderUrl(source);
+  const lowerPath = pathname.toLowerCase();
+  if (lowerPath.endsWith("/models")) return { protocol, url: source, endpointKind: "full-endpoint" };
+  if (protocol === "gemini") {
+    const generateIndex = lowerPath.indexOf("/models/");
+    if (generateIndex >= 0) return { protocol, url: replaceProviderPath(source, pathname.slice(0, generateIndex) + "/models"), endpointKind: "base-url" };
+  }
+  for (const suffix of ["/chat/completions", "/responses", "/messages"]) {
+    if (lowerPath.endsWith(suffix)) return { protocol, url: replaceProviderPath(source, pathname.slice(0, -suffix.length) + "/models"), endpointKind: "base-url" };
+  }
+  return { protocol, url: appendProviderPath(source, "/models"), endpointKind: "base-url" };
 }
 
 export function resolveProviderEndpoint(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol" | "apiKey" | "stream">): ProviderEndpoint {
@@ -1519,20 +1556,17 @@ export class OpenAIProvider {
   }
   async models() {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort("timeout"), this.settings.timeoutMs);
+    const endpoint = resolveProviderModelsEndpoint(this.settings);
     try {
-      const response = await fetch(this.base() + "/models", { headers: { Authorization: "Bearer " + this.settings.apiKey }, signal: controller.signal });
-      if (!response.ok)
-        throw this.mapStatus(
-          response.status,
-          await response.text(),
-          retryAfterSecondsOf(response.headers.get("Retry-After")),
-        );
+      const response = await fetch(endpoint.url, { headers: providerHeaders(this.settings, endpoint.protocol), signal: controller.signal });
+      const responseText = await response.text();
+      if (!response.ok) throw this.mapStatus(response.status, responseText, retryAfterSecondsOf(response.headers.get("Retry-After")));
       let data: unknown;
-      try { data = parseStructuredJson(await response.text()); }
-      catch { throw this.failure("format", "服务返回了无法识别的模型列表", "", { providerCode: "invalid_json" }); }
-      const raw = (data as { data?: unknown })?.data;
+      try { data = parseStructuredJson(responseText); } catch { throw this.failure("format", "服务返回了无法识别的模型列表", "", { providerCode: "invalid_model_list" }); }
+      const record = data && typeof data === "object" ? data as JsonRecord : {};
+      const raw = endpoint.protocol === "gemini" ? record.models : endpoint.protocol === "claude" ? (Array.isArray(record.data) ? record.data : record.models) : record.data;
       if (!Array.isArray(raw)) throw this.failure("format", "服务返回了无法识别的模型列表", "", { providerCode: "invalid_model_list" });
-      const ids = raw.map((item) => (item as { id?: unknown }).id).filter((id): id is string => typeof id === "string");
+      const ids = raw.map((item) => { if (typeof item === "string") return item; if (!item || typeof item !== "object") return undefined; const value = (item as JsonRecord).id ?? (item as JsonRecord).name; return typeof value === "string" ? value.replace(/^models\//, "") : undefined; }).filter((id): id is string => Boolean(id?.trim())).map((id) => id.trim());
       return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
     } catch (error) {
       if (error instanceof ProviderError) throw error;
@@ -1546,30 +1580,33 @@ export class OpenAIProvider {
 
 
 export class OpenAICompatibleTransport implements ProviderTransport {
-  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider({ ...settings, protocol: "openai-compatible" }).chatWithMeta(messages, options);
-  }
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) { return new OpenAIProvider({ ...settings, protocol: "openai-compatible" }).chatWithMeta(messages, options); }
+  listModels(settings: ProviderSettings) { return discoverProviderModels({ ...settings, protocol: "openai-compatible" }); }
 }
 export class OpenAIResponsesTransport implements ProviderTransport {
-  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider({ ...settings, protocol: "openai-responses" }).chatWithMeta(messages, options);
-  }
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) { return new OpenAIProvider({ ...settings, protocol: "openai-responses" }).chatWithMeta(messages, options); }
+  listModels(settings: ProviderSettings) { return discoverProviderModels({ ...settings, protocol: "openai-responses" }); }
 }
 export class GeminiTransport implements ProviderTransport {
-  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider({ ...settings, protocol: "gemini" }).chatWithMeta(messages, options);
-  }
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) { return new OpenAIProvider({ ...settings, protocol: "gemini" }).chatWithMeta(messages, options); }
+  listModels(settings: ProviderSettings) { return discoverProviderModels({ ...settings, protocol: "gemini" }); }
 }
 export class ClaudeTransport implements ProviderTransport {
-  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider({ ...settings, protocol: "claude" }).chatWithMeta(messages, options);
-  }
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) { return new OpenAIProvider({ ...settings, protocol: "claude" }).chatWithMeta(messages, options); }
+  listModels(settings: ProviderSettings) { const endpoint=resolveProviderModelsEndpoint({ ...settings, protocol:"claude" }); if(endpoint.endpointKind!=="full-endpoint") return Promise.resolve({supported:false,protocol:"claude" as const,endpointKind:endpoint.endpointKind,reason:"unsupported" as const,models:[]}); return discoverProviderModels({...settings,protocol:"claude"}); }
 }
 export class DeepSeekCompatibleTransport implements ProviderTransport {
-  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) {
-    return new OpenAIProvider({ ...settings, protocol: "deepseek-compatible" }).chatWithMeta(messages, options);
-  }
+  chat(settings: ProviderSettings, messages: ChatItem[], options: ProviderChatOptions = {}) { return new OpenAIProvider({ ...settings, protocol: "deepseek-compatible" }).chatWithMeta(messages, options); }
+  listModels(settings: ProviderSettings) { return discoverProviderModels({ ...settings, protocol: "deepseek-compatible" }); }
 }
+export async function discoverProviderModels(settings: ProviderSettings): Promise<ProviderModelDiscovery> {
+  const protocol = resolveProviderProtocol(settings);
+  const endpoint = resolveProviderModelsEndpoint(settings);
+  if (protocol === "claude" && endpoint.endpointKind !== "full-endpoint") return { supported: false, protocol, endpointKind: endpoint.endpointKind, reason: "unsupported", models: [] };
+  try { const models = await new OpenAIProvider(settings).models(); return { supported: true, models, protocol, endpointKind: endpoint.endpointKind }; }
+  catch (error) { const info=apiErrorInfoOf(error); const reason: ProviderModelDiscovery["reason"] = info?.kind === "auth" ? "auth" : info?.kind === "cors" ? "cors" : info?.kind === "server" || info?.kind === "timeout" ? "server" : info?.kind === "network" ? "network" : "invalid-response"; return { supported:false, protocol, endpointKind:endpoint.endpointKind, reason, models:[] }; }
+}
+
 export function createProviderTransport(settings: ProviderSettings): ProviderTransport {
   switch (resolveProviderProtocol(settings)) {
     case "openai-responses": return new OpenAIResponsesTransport();
@@ -1596,8 +1633,10 @@ function connectivityKind(error: unknown): ProviderConnectivityResult["kind"] {
 export async function testProviderConnection(settings: ProviderSettings): Promise<ProviderConnectivityResult> {
   const model = settings.model.trim();
   try {
+    const resolvedProtocol = resolveProviderProtocol(settings);
     await new OpenAIProvider({ ...settings, stream: false }).test();
-    return { ok: true, model, protocol: resolveProviderProtocol(settings) };
+    const endpoint = resolveProviderEndpoint({ ...settings, stream: false });
+    return { ok: true, model, protocol: resolvedProtocol, requestMode: resolvedProtocol, providerAdapter: resolvedProtocol, endpointKind: endpoint.endpointKind, modelDiscoverySupported: resolvedProtocol !== "claude" };
   } catch (error) {
     const info = apiErrorInfoOf(error);
     return {
@@ -1607,6 +1646,11 @@ export async function testProviderConnection(settings: ProviderSettings): Promis
       providerCode: info?.providerCode,
       model,
       protocol: resolveProviderProtocol(settings),
+      requestMode: resolveProviderProtocol(settings),
+      providerAdapter: resolveProviderProtocol(settings),
+      endpointKind: resolveProviderEndpoint({ ...settings, stream: false }).endpointKind,
+      connectivityFailure: info?.kind === "timeout" || info?.kind === "interrupted" ? "server" : info?.kind === "model" ? "protocol" : info?.kind,
+      modelDiscoverySupported: resolveProviderProtocol(settings) !== "claude",
     };
   }
 }

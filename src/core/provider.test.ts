@@ -1,5 +1,5 @@
 ﻿import {describe,expect,it,vi} from "vitest";
-import {OpenAIProvider,ProviderError,testProviderConnection} from "./provider";
+import {OpenAIProvider,ProviderError,createProviderTransport,discoverProviderModels,resolveProviderModelsEndpoint,testProviderConnection} from "./provider";
 import {defaultProvider} from "./types";
 import {parseReplyTurn,parseStrictReplyTurn} from "./replyBubbles";
 const settings={...defaultProvider,apiKey:"test",baseUrl:"https://api.test/v1",stream:false,timeoutMs:1000};
@@ -397,4 +397,54 @@ describe("protocol-aware transports", () => {
     expect(url).toBe("https://api.deepseek.com/v1/chat/completions");
     expect(body.model).toBe("deepseek-chat");
   });
+});
+
+describe("protocol-aware model discovery",()=>{
+ it("derives an OpenAI models endpoint without duplicating paths or dropping query params",()=>{
+  expect(resolveProviderModelsEndpoint({...settings,baseUrl:"https://api.test/v1/chat/completions?tenant=demo#x"})).toMatchObject({url:"https://api.test/v1/models?tenant=demo#x",endpointKind:"base-url",protocol:"openai-compatible"});
+  expect(resolveProviderModelsEndpoint({...settings,baseUrl:"https://api.test/v1/models"})).toMatchObject({url:"https://api.test/v1/models",endpointKind:"full-endpoint"});
+ });
+ it("uses OpenAI-compatible auth and parses sorted model ids",async()=>{
+  let url="";let headers:Record<string,string>|undefined;
+  vi.stubGlobal("fetch",vi.fn().mockImplementation(async(input:string,options:any)=>{url=input;headers=options.headers;return new Response(JSON.stringify({data:[{id:"z"},{id:"a"}]}),{status:200,headers:{"Content-Type":"application/json"}})}));
+  const result=await createProviderTransport({...settings,apiKey:"model-secret"}).listModels?.({...settings,apiKey:"model-secret"});
+  expect(result).toMatchObject({supported:true,models:["a","z"],protocol:"openai-compatible"});
+  expect(url).toBe("https://api.test/v1/models");expect(headers?.Authorization).toBe("Bearer model-secret");
+ });
+ it("uses Gemini native model listing and strips models/ prefixes",async()=>{
+  let url="";let headers:Record<string,string>|undefined;
+  vi.stubGlobal("fetch",vi.fn().mockImplementation(async(input:string,options:any)=>{url=input;headers=options.headers;return new Response(JSON.stringify({models:[{name:"models/gemini-2.5-flash"},{name:"models/gemini-2.5-pro"}]}),{status:200,headers:{"Content-Type":"application/json"}})}));
+  const settings={...defaultProvider,apiKey:"gemini-secret",baseUrl:"https://generativelanguage.googleapis.com/v1beta",protocol:"gemini" as const};
+  await expect(discoverProviderModels(settings)).resolves.toMatchObject({supported:true,models:["gemini-2.5-flash","gemini-2.5-pro"],protocol:"gemini"});
+  expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models");expect(headers?.["x-goog-api-key"]).toBe("gemini-secret");expect(headers?.Authorization).toBeUndefined();
+ });
+ it("does not probe Claude with a guessed models endpoint",async()=>{
+  const fetchMock=vi.fn();vi.stubGlobal("fetch",fetchMock);
+  const settings={...defaultProvider,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1",protocol:"claude" as const};
+  await expect(createProviderTransport(settings).listModels?.(settings)).resolves.toMatchObject({supported:false,protocol:"claude",reason:"unsupported"});
+  expect(fetchMock).not.toHaveBeenCalled();
+ });
+ it("allows an explicitly supplied Claude models endpoint",async()=>{
+  let url="";let headers:Record<string,string>|undefined;
+  vi.stubGlobal("fetch",vi.fn().mockImplementation(async(input:string,options:any)=>{url=input;headers=options.headers;return new Response(JSON.stringify({data:[{id:"claude-sonnet"}]}),{status:200,headers:{"Content-Type":"application/json"}})}));
+  const settings={...defaultProvider,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1/models",protocol:"claude" as const};
+  await expect(discoverProviderModels(settings)).resolves.toMatchObject({supported:true,models:["claude-sonnet"],protocol:"claude",endpointKind:"full-endpoint"});
+  expect(url).toBe(settings.baseUrl);expect(headers?.["x-api-key"]).toBe("claude-secret");expect(headers?.Authorization).toBeUndefined();
+ });
+});
+
+
+describe("model discovery failure classification",()=>{
+ it("returns a sanitized CORS discovery result without throwing",async()=>{
+  vi.stubGlobal("fetch",vi.fn().mockRejectedValue(new TypeError("Failed to fetch with secret-model-key")));
+  const result=await discoverProviderModels({...defaultProvider,apiKey:"secret-model-key",baseUrl:"https://api.test/v1"});
+  expect(result).toMatchObject({supported:false,protocol:"openai-compatible",reason:"cors",models:[]});
+  expect(JSON.stringify(result)).not.toContain("secret-model-key");
+ });
+ it("reports connection metadata without credentials",async()=>{
+  vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})));
+  const result=await testProviderConnection({...defaultProvider,apiKey:"connection-secret",baseUrl:"https://api.test/v1",stream:false});
+  expect(result).toMatchObject({ok:true,protocol:"openai-compatible",requestMode:"openai-compatible",providerAdapter:"openai-compatible",endpointKind:"base-url",modelDiscoverySupported:true});
+  expect(JSON.stringify(result)).not.toContain("connection-secret");
+ });
 });

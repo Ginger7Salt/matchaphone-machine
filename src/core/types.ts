@@ -739,6 +739,11 @@ export interface ProviderConnectivityResult {
   providerCode?: string;
   model?: string;
   protocol?: ProviderProtocol;
+  providerAdapter?: string;
+  endpointKind?: "base-url" | "full-endpoint";
+  requestMode?: ProviderProtocol;
+  modelDiscoverySupported?: boolean;
+  connectivityFailure?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format";
 }
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
