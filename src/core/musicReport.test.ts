@@ -72,7 +72,7 @@ describe("music listening reports", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: "这周我们听见了很温柔的旋律。" } }] }), { status: 200, headers: { "Content-Type": "application/json" } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: "重新翻看，还是很喜欢这段音乐时光。" } }] }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
-    const provider = { ...defaultProvider, apiKey: "test", baseUrl: "https://api.test/v1", stream: false };
+    const provider = { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", baseUrl: "https://api.test/v1", stream: false };
     const first = await generateMusicReportCommentary(report, character, provider), cached = await generateMusicReportCommentary(report, character, provider);
     expect(first.text).toContain("温柔的旋律"); expect(cached.text).toBe(first.text); expect(fetchMock).toHaveBeenCalledTimes(1);
     const manual = await generateMusicReportCommentary(report, character, provider, true);

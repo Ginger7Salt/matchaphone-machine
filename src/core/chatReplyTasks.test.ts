@@ -67,6 +67,7 @@ const groupConversation = {
 } as Conversation;
 const provider: ProviderSettings = {
   baseUrl: "https://example.com/v1",
+  networkMode: "direct",
   apiKey: "test-key",
   model: "test-model",
   stream: false,

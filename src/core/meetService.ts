@@ -1076,6 +1076,14 @@ async function generateMeetTurnInternal(
           providerAdapter: response.adapter,
           endpointKind: response.endpointKind,
           requestMode: response.requestMode,
+          networkMode: response.networkMode,
+          relayUsed: response.relayUsed,
+          relayRequestId: response.relayRequestId,
+          relayStatus: response.relayStatus,
+          relayErrorCode: response.relayErrorCode,
+          relayDurationMs: response.relayDurationMs,
+          upstreamHttpStatus: response.upstreamHttpStatus,
+          upstreamBytes: response.upstreamBytes,
         });
         attemptMeta.providerProtocol = response.requestMode;
         attemptMeta.providerAdapter = response.adapter;
@@ -1098,6 +1106,14 @@ async function generateMeetTurnInternal(
           providerAdapter: response.adapter,
           endpointKind: response.endpointKind,
           requestMode: response.requestMode,
+          networkMode: response.networkMode,
+          relayUsed: response.relayUsed,
+          relayRequestId: response.relayRequestId,
+          relayStatus: response.relayStatus,
+          relayErrorCode: response.relayErrorCode,
+          relayDurationMs: response.relayDurationMs,
+          upstreamHttpStatus: response.upstreamHttpStatus,
+          upstreamBytes: response.upstreamBytes,
         });
         await safeUpdateGeneration();
 
@@ -1181,6 +1197,9 @@ async function generateMeetTurnInternal(
           generationMeta.endpointKind ??= "base-url";
           generationMeta.requestMode ??= resolvedProtocol;
           if (error.kind === "cors") generationMeta.connectivityFailure = "cors";
+          if (error.kind === "relay") generationMeta.connectivityFailure = error.apiError?.relayErrorCode ?? "relay";
+          Object.assign(attemptMeta, { networkMode: error.apiError?.networkMode, relayUsed: error.apiError?.relayUsed, relayRequestId: error.apiError?.relayRequestId, relayStatus: error.apiError?.relayStatus, relayErrorCode: error.apiError?.relayErrorCode, relayDurationMs: error.apiError?.relayDurationMs, upstreamHttpStatus: error.apiError?.upstreamHttpStatus, upstreamBytes: error.apiError?.upstreamBytes });
+          Object.assign(generationMeta, { networkMode: error.apiError?.networkMode, relayUsed: error.apiError?.relayUsed, relayRequestId: error.apiError?.relayRequestId, relayStatus: error.apiError?.relayStatus, relayErrorCode: error.apiError?.relayErrorCode, relayDurationMs: error.apiError?.relayDurationMs, upstreamHttpStatus: error.apiError?.upstreamHttpStatus, upstreamBytes: error.apiError?.upstreamBytes });
           if (error.kind === "protocol" || error.apiError?.kind === "protocol") generationMeta.protocolMismatch = true;
           attemptMeta.httpStatus = error.apiError?.httpStatus;
           attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;

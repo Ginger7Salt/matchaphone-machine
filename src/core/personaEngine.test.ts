@@ -28,7 +28,7 @@ import {
 } from "./types";
 
 const primary: ProviderSettings = {
-  ...defaultProvider,
+  ...defaultProvider, networkMode: "direct" as const,
   baseUrl: "https://primary.test/v1",
   apiKey: "primary-key",
   model: "primary-model",

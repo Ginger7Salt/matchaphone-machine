@@ -7,7 +7,7 @@ import {defaultAppearance} from "./appearance";
 describe("data management",()=>{
  beforeEach(async()=>{await db.delete();await db.open()});
  it("excludes all device credentials from backup",async()=>{
-  await setSetting("provider",{...defaultProvider,apiKey:"secret-api"});
+  await setSetting("provider",{...defaultProvider, networkMode: "direct" as const,apiKey:"secret-api"});
   await setSetting("github-backup",{token:"secret-github"});
   await setSetting("speech",{defaultProvider:"minimax",minimax:{enabled:true,apiKey:"secret-minimax",baseUrl:"x",model:"m",defaultVoiceId:"v",speed:1},elevenlabs:{enabled:true,apiKey:"secret-eleven",baseUrl:"x",model:"m",defaultVoiceId:"v",speed:1}});
   await setSetting("image-generation",{provider:"openai",openai:{enabled:true,apiKey:"secret-image-openai",baseUrl:"x",model:"m",size:"1024x1024",quality:"medium"},novelai:{enabled:true,apiKey:"secret-image-novelai",baseUrl:"x",model:"n",width:832,height:1216,sampler:"k_euler",steps:20,scale:5,negativePrompt:""}});
@@ -15,7 +15,7 @@ describe("data management",()=>{
   for(const secret of ["secret-api","secret-github","secret-minimax","secret-eleven","secret-image-openai","secret-image-novelai"])expect(text).not.toContain(secret);
  });
  it("restores product data while preserving provider, github and image generation secrets",async()=>{
-  await setSetting("provider",{...defaultProvider,apiKey:"keep-api"});
+  await setSetting("provider",{...defaultProvider, networkMode: "direct" as const,apiKey:"keep-api"});
   await setSetting("github-backup",{token:"keep-github"});
   await setSetting("image-generation",{...defaultImageGenerationSettings,provider:"novelai",openai:{...defaultImageGenerationSettings.openai,apiKey:"keep-openai"},novelai:{...defaultImageGenerationSettings.novelai,apiKey:"keep-novelai"}});
   const backup={schemaVersion:1,exportedAt:1,data:{characters:[],conversations:[],messages:[],presets:[],loreBooks:[],memories:[],feedPosts:[],imageGenerationSettings:{...defaultImageGenerationSettings,provider:"openai",openai:{...defaultImageGenerationSettings.openai,apiKey:"from-backup",model:"restored-model"},novelai:{...defaultImageGenerationSettings.novelai,apiKey:"from-backup-novel"}},appSettings:{...defaultAppSettings,onboarded:true}}};
@@ -33,7 +33,7 @@ describe("data management",()=>{
   expect(await getImageGenerationSettings()).toEqual(defaultImageGenerationSettings);
  });
  it("clears credentials independently",async()=>{
-  await setSetting("provider",{...defaultProvider,apiKey:"api"});
+  await setSetting("provider",{...defaultProvider, networkMode: "direct" as const,apiKey:"api"});
   await setSetting("github-backup",{token:"gh"});
   await clearProviderKey();
   expect((await getProvider()).apiKey).toBe("");
@@ -43,7 +43,7 @@ describe("data management",()=>{
  });
  it("factory reset clears all data, image settings and returns to onboarding",async()=>{
   await db.characters.add({id:"c",name:"x"} as any);
-  await setSetting("provider",{...defaultProvider,apiKey:"api"});
+  await setSetting("provider",{...defaultProvider, networkMode: "direct" as const,apiKey:"api"});
   await setSetting("github-backup",{token:"gh"});
   await setSetting("image-generation",{...defaultImageGenerationSettings,openai:{...defaultImageGenerationSettings.openai,apiKey:"image-key"}});
   await factoryReset();

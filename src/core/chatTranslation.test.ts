@@ -108,7 +108,7 @@ describe("chat translation", () => {
       secondary: {
         enabled: true,
         provider: {
-          ...defaultProvider,
+          ...defaultProvider, networkMode: "direct" as const,
           baseUrl: "https://secondary.test/v1",
           apiKey: "secondary-key",
           model: "translator",
@@ -122,7 +122,7 @@ describe("chat translation", () => {
       character,
       conversation,
       primaryProvider: {
-        ...defaultProvider,
+        ...defaultProvider, networkMode: "direct" as const,
         apiKey: "main-key",
         model: "main",
       },
@@ -144,7 +144,7 @@ describe("chat translation", () => {
       character,
       conversation,
       primaryProvider: {
-        ...defaultProvider,
+        ...defaultProvider, networkMode: "direct" as const,
         baseUrl: "https://conversation.test/v1",
         apiKey: "main-key",
         model: "conversation-model",
@@ -163,7 +163,7 @@ describe("chat translation", () => {
         .mockResolvedValueOnce(response("old translation"))
         .mockResolvedValueOnce(response("new translation")),
     );
-    const primary = { ...defaultProvider, apiKey: "key", model: "main" };
+    const primary = { ...defaultProvider, networkMode: "direct" as const, apiKey: "key", model: "main" };
     await translateChatMessage({
       messageId: message.id,
       character,
@@ -190,7 +190,7 @@ describe("chat translation", () => {
       messageId: message.id,
       character,
       conversation,
-      primaryProvider: { ...defaultProvider, apiKey: "key" },
+      primaryProvider: { ...defaultProvider, networkMode: "direct" as const, apiKey: "key" },
     });
     const saved = await db.messages.get(message.id);
     expect(saved).toMatchObject({

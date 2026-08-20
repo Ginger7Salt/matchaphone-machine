@@ -4,7 +4,7 @@ import {PHONE_APPS,PHONE_PASSCODE_LOCK_MS,PHONE_PASSCODE_MAX_ATTEMPTS,clearExpir
 import {defaultProvider,type Character,type MallOrder} from "./types";
 
 const makeCharacter=(strategy:boolean,trust=0,intimacy=0):Character=>({id:"c",schemaVersion:1,createdAt:1,updatedAt:1,name:"月白",avatar:"",bio:"旅人",personality:"安静",speakingStyle:"简洁",background:"来自旧城",language:"中文",coreSetting:"来自旧城的安静旅人",persona:"喜欢夜晚和旧书",chatSettings:{language:"中文",contextLimit:30,stream:false,strategyMode:{enabled:strategy}},proactive:{messages:false,timeAware:false,frequency:"medium",quietStart:"23:00",quietEnd:"08:00",catchupLimit:3,dailyLimit:10},relationship:{intimacy,trust,mood:"平静",recentEvents:[]},lastActiveAt:1,phonePrivacy:{passcode:"0427",hint:"离开旧城的日子",createdAt:1}});
-const provider={...defaultProvider,apiKey:"test",stream:false};
+const provider={...defaultProvider, networkMode: "direct" as const,apiKey:"test",stream:false};
 
 beforeEach(async()=>{await db.delete();await db.open();vi.restoreAllMocks()});
 

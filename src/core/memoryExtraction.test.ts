@@ -31,7 +31,7 @@ describe("feed exclusion from memory extraction",()=>{
  it("reports no pending feed content and rejects feed batches before calling a model",async()=>{
   await db.feedPosts.add({id:"post",authorId:"c",content:"不应进入记忆",comments:[],createdAt:1,updatedAt:1} as any);
   expect(await pendingCount(character,"feed")).toBe(0);
-  await expect(createExtractionBatch({...defaultProvider,apiKey:"unused"},character,"feed")).rejects.toThrow("动态内容不参与记忆整理");
+  await expect(createExtractionBatch({...defaultProvider, networkMode: "direct" as const,apiKey:"unused"},character,"feed")).rejects.toThrow("动态内容不参与记忆整理");
   expect(await db.memoryExtractionBatches.count()).toBe(0);
  });
  it("does not confirm a legacy pending feed batch",async()=>{

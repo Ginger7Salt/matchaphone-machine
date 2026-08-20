@@ -5,7 +5,7 @@ import {defaultProvider,type Character,type CharacterPhoneState} from "./types";
 
 const character:Character={id:"c",schemaVersion:1,createdAt:1,updatedAt:1,name:"月白",avatar:"",bio:"旅人",personality:"安静",speakingStyle:"简洁",background:"来自旧城",language:"中文",coreSetting:"来自旧城的安静旅人",persona:"警惕，有自己的安排",chatSettings:{language:"中文",contextLimit:30,stream:false,strategyMode:{enabled:false}},proactive:{messages:false,timeAware:false,frequency:"medium",quietStart:"23:00",quietEnd:"08:00",catchupLimit:3,dailyLimit:10},relationship:{intimacy:20,trust:30,mood:"平静",recentEvents:[]},lastActiveAt:1,phonePrivacy:{passcode:"0427",hint:"旧城",createdAt:1}};
 const baseState:CharacterPhoneState={id:"c",characterId:"c",schemaVersion:1,createdAt:1,updatedAt:1,initializedAt:1,lastSyncedAt:1,contacts:[{id:"p",name:"阿林",relationship:"朋友",persona:"直接，熟悉月白",email:"alin@mail.local",characterKnowledge:[],createdAt:1,updatedAt:1}],talkThreads:[{id:"t",contactId:"p",messages:[],updatedAt:1,unreadCount:0}],mail:{messages:[],unreadCount:0},maps:{savedPlaces:[],recentVisits:[],searches:[]},appContents:{},timeline:[],operationTraces:[],syncCursor:{messagesAt:0,memoriesAt:0,meetAt:0,ordersAt:0,feedAt:0}};
-const provider={...defaultProvider,apiKey:"test",stream:false};
+const provider={...defaultProvider, networkMode: "direct" as const,apiKey:"test",stream:false};
 
 beforeEach(async()=>{await db.delete();await db.open();await db.characters.add(structuredClone(character));await db.characterPhoneStates.add(structuredClone(baseState));vi.restoreAllMocks()});
 

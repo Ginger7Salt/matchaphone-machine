@@ -1,4 +1,5 @@
 import type { ChatItem } from "./context";
+import { executeProviderHttp, ProviderRelayError, type ProviderHttpMetadata } from "./providerHttp";
 import type { ApiErrorInfo, ApiErrorKind, ChatProviderCallPurpose, ChatProviderTailKind, ChatProviderTransportMode, ChatReplyWireFormat, ProviderConnectivityResult, ProviderProtocol, ProviderSettings, ReplyBubbleCountDiagnostics } from "./types";
 import {
   parseStructuredJson,
@@ -42,6 +43,14 @@ export interface ProviderErrorMetadata {
   tailKind?: ChatProviderTailKind;
   finishReason?: string;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  networkMode?: "relay" | "direct";
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
   countMode?: ReplyBubbleCountDiagnostics["countMode"];
   allowedMin?: number;
   allowedMax?: number;
@@ -84,6 +93,14 @@ export interface ProviderChatResult {
   endpointKind?: "base-url" | "full-endpoint";
   requestMode?: ProviderProtocol;
   streamMode?: "sse" | "json" | "not-applicable";
+  networkMode?: "relay" | "direct";
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
 }
 export interface ProviderChatOptions {
   signal?: AbortSignal;
@@ -1160,6 +1177,7 @@ function meaningOf(kind: ApiErrorKind, status?: number, providerCode?: string) {
   if (providerCode === "missing_messages") return "角色回复缺少完整正文消息";
   if (providerCode === "missing_inner_voice") return "角色回复缺少完整心声";
   if (providerCode === "invalid_role_protocol") return "服务返回的 JSON 未通过角色回复协议校验";
+  if (kind === "relay") return "安全 Relay 无法完成本次 Provider 请求";
   if (status === 400 || status === 413 || status === 422) return "请求参数、上下文长度或服务兼容格式不正确";
   if (kind === "context") return "Provider 不接受当前输入长度或上下文窗口配置";
   if (kind === "protocol") return "请求协议与 Provider Endpoint 不匹配";
@@ -1187,6 +1205,7 @@ function troubleshootingOf(kind: ApiErrorKind, status?: number, providerCode?: s
     return ["重新生成完整回复。", "服务返回的 JSON 缺少完整心声结构。", "若问题持续，请复制脱敏诊断信息。"];
   if (providerCode === "invalid_role_protocol")
     return ["重新生成完整回复。", "服务已返回 JSON，但未满足角色回复协议。", "若问题持续，请复制脱敏诊断信息。"];
+  if (kind === "relay") return ["确认茶茶机已激活且 Relay 服务可用。", "检查 Endpoint 是否为不含密钥参数的公网 HTTPS 地址。", "Relay 与浏览器直连不会自动互相重放请求。"];
   if (status === 400 || status === 413 || status === 422)
     return ["确认当前模型支持聊天补全接口和所发送的消息格式。", "若挂载了大量世界书或历史消息，请减少上下文后重试。", "确认中转服务兼容 OpenAI /chat/completions 请求格式。"]; 
   if (kind === "auth") return ["重新检查并保存 API Key。", "确认该 Key 有权访问当前模型。", "检查 Base URL 是否属于该 API Key 对应的服务商。"]; 
@@ -1233,6 +1252,14 @@ export function createApiErrorInfo(kind: ApiErrorKind, meta: ProviderErrorMetada
     tailKind: meta.tailKind,
     finishReason: meta.finishReason,
     failureStage: meta.failureStage,
+    networkMode: meta.networkMode,
+    relayUsed: meta.relayUsed,
+    relayRequestId: meta.relayRequestId,
+    relayStatus: meta.relayStatus,
+    relayErrorCode: meta.relayErrorCode,
+    relayDurationMs: meta.relayDurationMs,
+    upstreamHttpStatus: meta.upstreamHttpStatus,
+    upstreamBytes: meta.upstreamBytes,
     countMode: meta.countMode,
     allowedMin: meta.allowedMin,
     allowedMax: meta.allowedMax,
@@ -1303,8 +1330,19 @@ function endpointPath(protocol: Exclude<ProviderProtocol, "auto">): string {
   return "/chat/completions";
 }
 function appendProviderPath(source: string, path: string): string {
-  const match = source.match(/^([^?#]*)([?#].*)?$/);
-  return (match?.[1] ?? source) + path + (match?.[2] ?? "");
+  try {
+    const url = new URL(source);
+    const [pathname, query] = path.split("?", 2);
+    url.pathname = url.pathname.replace(/\/+$/, "") + (pathname.startsWith("/") ? pathname : "/" + pathname);
+    if (query) {
+      const extra = new URLSearchParams(query);
+      extra.forEach((value, key) => url.searchParams.set(key, value));
+    }
+    return url.toString();
+  } catch {
+    const match = source.match(/^([^?#]*)([?#].*)?$/);
+    return (match?.[1] ?? source) + path + (match?.[2] ?? "");
+  }
 }
 
 export function resolveProviderModelsEndpoint(settings: Pick<ProviderSettings, "baseUrl" | "model" | "protocol" | "apiKey" | "stream">): ProviderEndpoint {
@@ -1348,31 +1386,62 @@ function providerHeaders(settings: ProviderSettings, protocol: Exclude<ProviderP
   return headers;
 }
 
-function providerMessageContent(message: ChatItem): unknown {
-  const urls = [...(message.imageUrls ?? []), ...(message.imageUrl ? [message.imageUrl] : [])];
-  if (!urls.length) return message.content;
-  return [{ type: "text", text: message.content }, ...urls.map(url => ({ type: "image_url", image_url: { url } }))];
+function invalidImageReference(): never {
+  throw new ProviderError("format", "图片必须是有效的 image Data URL 或公网 HTTPS 地址", "", createApiErrorInfo("format", { providerCode: "invalid_image_reference" }));
 }
-function geminiContents(messages: ChatItem[]) {
-  return messages.filter(message => message.role !== "system").map(message => ({
-    role: message.role === "assistant" ? "model" : "user",
-    parts: [{ text: message.content }],
-  }));
+function imageReference(value: string) {
+  const source = value.trim();
+  const data = source.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/]*={0,2})$/i);
+  if (data) {
+    if (!data[2] || data[2].length % 4 !== 0) return invalidImageReference();
+    return { kind: "data" as const, url: source, mimeType: data[1].toLowerCase(), data: data[2] };
+  }
+  let remote: URL;
+  try { remote = new URL(source); } catch { return invalidImageReference(); }
+  if (remote.protocol !== "https:" || remote.username || remote.password) return invalidImageReference();
+  return { kind: "remote" as const, url: remote.toString() };
+}
+function messageImages(message: ChatItem) { return [...(message.imageUrls ?? []), ...(message.imageUrl ? [message.imageUrl] : [])].filter(Boolean).map(imageReference); }
+function providerMessageContent(message: ChatItem): unknown {
+  const images = messageImages(message);
+  if (!images.length) return message.content;
+  return [{ type: "text", text: message.content }, ...images.map(image => ({ type: "image_url", image_url: { url: image.url } }))];
+}
+function geminiParts(message: ChatItem) {
+  const parts: unknown[] = [{ text: message.content }];
+  for (const image of messageImages(message)) {
+    if (image.kind === "data") parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+    else parts.push({ fileData: { mimeType: "application/octet-stream", fileUri: image.url } });
+  }
+  return parts;
+}
+function claudeContent(message: ChatItem) {
+  const content: unknown[] = [{ type: "text", text: message.content }];
+  for (const image of messageImages(message)) {
+    if (image.kind === "data") content.push({ type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } });
+    else content.push({ type: "image", source: { type: "url", url: image.url } });
+  }
+  return content;
+}function geminiContents(messages: ChatItem[]) {
+  return messages.filter(message => message.role !== "system").map(message => ({ role: message.role === "assistant" ? "model" : "user", parts: geminiParts(message) }));
 }
 function claudeMessages(messages: ChatItem[]) {
   const result: Array<{ role: "user" | "assistant"; content: unknown[] }> = [];
   for (const message of messages.filter(item => item.role !== "system")) {
     const role = message.role === "assistant" ? "assistant" : "user";
-    const content = [{ type: "text", text: message.content }];
+    const content = claudeContent(message);
     const previous = result.at(-1);
     if (previous?.role === role) previous.content.push(...content); else result.push({ role, content });
   }
   return result;
 }
 function responsesInput(messages: ChatItem[]) {
-  return messages.map(message => ({ role: message.role, content: [{ type: "input_text", text: message.content }] }));
-}
-function protocolRequestBody(settings: ProviderSettings, messages: ChatItem[], protocol: Exclude<ProviderProtocol, "auto">, stream: boolean, temperature: number): Record<string, unknown> {
+  return messages.map(message => {
+    const content: unknown[] = [{ type: "input_text", text: message.content }];
+    for (const image of messageImages(message)) content.push({ type: "input_image", image_url: image.url });
+    return { role: message.role, content };
+  });
+}function protocolRequestBody(settings: ProviderSettings, messages: ChatItem[], protocol: Exclude<ProviderProtocol, "auto">, stream: boolean, temperature: number): Record<string, unknown> {
   if (protocol === "gemini") {
     const system = messages.filter(message => message.role === "system").map(message => message.content).join("\n\n");
     return { contents: geminiContents(messages), ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}), generationConfig: { temperature }, };
@@ -1385,6 +1454,8 @@ function protocolRequestBody(settings: ProviderSettings, messages: ChatItem[], p
   return { model: settings.model, messages: messages.map(message => ({ role: message.role, content: providerMessageContent(message) })), temperature, ...(stream ? { stream: true } : {}) };
 }
 
+function providerMetadataFields(meta: ProviderHttpMetadata): ProviderErrorMetadata { return { networkMode: meta.networkMode, relayUsed: meta.relayUsed, relayRequestId: meta.relayRequestId, relayStatus: meta.relayStatus, relayErrorCode: meta.relayErrorCode, relayDurationMs: meta.relayDurationMs, upstreamHttpStatus: meta.upstreamHttpStatus, upstreamBytes: meta.upstreamBytes }; }
+
 export class OpenAIProvider {
   constructor(private settings: ProviderSettings) {}
   private endpoint() { return resolveProviderEndpoint(this.settings); }
@@ -1392,14 +1463,14 @@ export class OpenAIProvider {
   private failure(kind: ApiErrorKind, message: string, partial = "", meta: ProviderErrorMetadata = {}) {
     return new ProviderError(kind, message, partial, createApiErrorInfo(kind, meta));
   }
-  private mapStatus(status: number, text = "", retryAfterSeconds?: number) {
+  private mapStatus(status: number, text = "", retryAfterSeconds?: number, transportMeta: ProviderErrorMetadata = {}) {
     const parsed = parsedErrorBody(text, [this.settings.apiKey]);
     const lowered = text.toLowerCase();
     const protocolMismatch = /unsupported.*(endpoint|protocol)|invalid.*(endpoint|protocol)|unknown.*(endpoint|protocol)|chat\/completions.*(not|unsupported)|generatecontent.*(not|unsupported)|messages.*(not|unsupported)|endpoint.*(not|found)|protocol.*(mismatch|invalid)/i.test(lowered);
     const kind: ApiErrorKind = status === 401 || status === 403 ? "auth" : status === 404 && protocolMismatch ? "protocol" : status === 404 ? "model" : status === 408 ? "timeout" : status === 429 ? "rate" : status >= 500 ? "server" : protocolMismatch ? "protocol" : ((status === 400 || status === 413 || status === 422) && /context|token|too long|maximum|length|上下文|令牌|长度|超出/.test(lowered) ? "context" : "format");
     const fallback = status === 401 || status === 403 ? "API Key 无效或无权限" : status === 404 ? "接口或模型不存在" : status === 408 ? "请求超时" : status === 429 ? "调用频率或额度已达上限" : status >= 500 ? `服务暂时不可用 (${status})` : `请求失败 (${status})`;
     const detail = parsed.message && parsed.message !== "error" ? parsed.message : fallback;
-    return this.failure(kind, detail, "", { httpStatus: status, retryAfterSeconds, providerCode: parsed.providerCode, providerType: parsed.providerType, param: parsed.param, detail });
+    return this.failure(kind, detail, "", { ...transportMeta, httpStatus: status, retryAfterSeconds, providerCode: parsed.providerCode, providerType: parsed.providerType, param: parsed.param, detail });
   }
   async chatWithMeta(messages: ChatItem[], opts: ProviderChatOptions = {}): Promise<ProviderChatResult> {
     const controller = new AbortController();
@@ -1412,26 +1483,25 @@ export class OpenAIProvider {
     try {
       const endpoint = resolveProviderEndpoint({ ...this.settings, stream });
       const temperature = opts.temperature ?? this.settings.temperature;
-      const response = await fetch(endpoint.url, {
-        method: "POST",
-        headers: providerHeaders(this.settings, endpoint.protocol),
-        body: JSON.stringify(protocolRequestBody(this.settings, messages, endpoint.protocol, stream, temperature)),
-        signal: controller.signal,
-      });
+      const body = JSON.stringify(protocolRequestBody(this.settings, messages, endpoint.protocol, stream, temperature));
+      const httpResult = await executeProviderHttp({ settings: this.settings, protocol: endpoint.protocol, endpoint: endpoint.url, operation: "chat", method: "POST", headers: providerHeaders(this.settings, endpoint.protocol), body, signal: controller.signal, timeoutMs: timeoutMs ?? this.settings.timeoutMs });
+      const response = httpResult.response;
+      const httpMeta = httpResult.metadata;
       if (!response.ok)
         throw this.mapStatus(
           response.status,
           await response.text(),
           retryAfterSecondsOf(response.headers.get("Retry-After")),
+          providerMetadataFields(httpMeta),
         );
       const contentType = response.headers.get("Content-Type") ?? undefined;
       const parseOrThrow = (raw: string, meta: ResponseTransportMetadata) => {
         try {
           const parsed = parseChatResponse(raw, contentType, [this.settings.apiKey], meta);
-          return { ...parsed, adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (meta.transportMode === "sse" || meta.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
+          return { ...parsed, ...providerMetadataFields(httpMeta), adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (meta.transportMode === "sse" || meta.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
-            throw this.failure(error.kind, error.message, "", error.meta);
+            throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
           throw this.failure("format", "服务返回的数据格式无法识别，缺少可用正文", "", {
             providerCode: "invalid_response",
             detail: `响应结构无法提取正文；长度 ${raw.length}`,
@@ -1446,7 +1516,7 @@ export class OpenAIProvider {
       };
       if (!stream) {
         const raw = await response.text();
-        const result = parseOrThrow(raw, transportMetadataOf(response, raw, "non-stream"));
+        const result = { ...parseOrThrow(raw, transportMetadataOf(response, raw, "non-stream")), ...providerMetadataFields(httpMeta) };
         out = result.text;
         opts.onToken?.(result.text);
         return result;
@@ -1494,7 +1564,7 @@ export class OpenAIProvider {
           result = parseSseOrNdjson(raw, "sse", contentType, [this.settings.apiKey], meta, opts.onToken);
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
-            throw this.failure(error.kind, error.message, "", error.meta);
+            throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
           throw error;
         }
       } else if (looksNdjson) {
@@ -1503,13 +1573,13 @@ export class OpenAIProvider {
           result = parseSseOrNdjson(raw, "ndjson", contentType, [this.settings.apiKey], meta, opts.onToken);
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
-            throw this.failure(error.kind, error.message, "", error.meta);
+            throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
           throw error;
         }
       } else {
         result = parseOrThrow(raw, transportMetadataOf(response, raw, "json-fallback", receivedBytes));
       }
-      if (result) result = { ...result, adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (result.transportMode === "sse" || result.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
+      if (result) result = { ...result, ...providerMetadataFields(httpMeta), adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (result.transportMode === "sse" || result.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
       if (!result)
         throw this.failure("format", "数据流已结束，但没有生成完整正文", "", {
           providerCode: "empty_stream",
@@ -1518,6 +1588,7 @@ export class OpenAIProvider {
           rawLength: raw.length,
           contentType,
           failureStage: "provider-parse",
+          ...providerMetadataFields(httpMeta),
           ...transportMetaFields(
             transportMetadataOf(
               response,
@@ -1531,6 +1602,7 @@ export class OpenAIProvider {
       if (!looksSse && !looksNdjson) opts.onToken?.(result.text);
       return result;
     } catch (error) {
+      if (error instanceof ProviderRelayError) throw this.failure("relay", error.message, "", { providerCode: error.code, httpStatus: error.status, relayUsed: true, relayRequestId: error.relayRequestId, relayDurationMs: error.durationMs, networkMode: "relay", relayErrorCode: error.code, relayStatus: error.status, upstreamHttpStatus: error.upstreamHttpStatus, upstreamBytes: error.upstreamBytes });
       if (error instanceof ProviderError) throw error;
       if (controller.signal.aborted) {
         if (controller.signal.reason === "timeout")
@@ -1558,9 +1630,10 @@ export class OpenAIProvider {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort("timeout"), this.settings.timeoutMs);
     const endpoint = resolveProviderModelsEndpoint(this.settings);
     try {
-      const response = await fetch(endpoint.url, { headers: providerHeaders(this.settings, endpoint.protocol), signal: controller.signal });
+      const httpResult = await executeProviderHttp({ settings: this.settings, protocol: endpoint.protocol, endpoint: endpoint.url, operation: "models", method: "GET", headers: providerHeaders(this.settings, endpoint.protocol), signal: controller.signal, timeoutMs: this.settings.timeoutMs });
+      const response = httpResult.response;
       const responseText = await response.text();
-      if (!response.ok) throw this.mapStatus(response.status, responseText, retryAfterSecondsOf(response.headers.get("Retry-After")));
+      if (!response.ok) throw this.mapStatus(response.status, responseText, retryAfterSecondsOf(response.headers.get("Retry-After")), providerMetadataFields(httpResult.metadata));
       let data: unknown;
       try { data = parseStructuredJson(responseText); } catch { throw this.failure("format", "服务返回了无法识别的模型列表", "", { providerCode: "invalid_model_list" }); }
       const record = data && typeof data === "object" ? data as JsonRecord : {};
@@ -1604,7 +1677,7 @@ export async function discoverProviderModels(settings: ProviderSettings): Promis
   const endpoint = resolveProviderModelsEndpoint(settings);
   if (protocol === "claude" && endpoint.endpointKind !== "full-endpoint") return { supported: false, protocol, endpointKind: endpoint.endpointKind, reason: "unsupported", models: [] };
   try { const models = await new OpenAIProvider(settings).models(); return { supported: true, models, protocol, endpointKind: endpoint.endpointKind }; }
-  catch (error) { const info=apiErrorInfoOf(error); const reason: ProviderModelDiscovery["reason"] = info?.kind === "auth" ? "auth" : info?.kind === "cors" ? "cors" : info?.kind === "server" || info?.kind === "timeout" ? "server" : info?.kind === "network" ? "network" : "invalid-response"; return { supported:false, protocol, endpointKind:endpoint.endpointKind, reason, models:[] }; }
+  catch (error) { const info=apiErrorInfoOf(error); const reason: ProviderModelDiscovery["reason"] = info?.kind === "auth" ? "auth" : info?.kind === "cors" ? "cors" : info?.kind === "server" || info?.kind === "timeout" ? "server" : info?.kind === "network" ? "network" : info?.kind === "relay" ? "server" : "invalid-response"; return { supported:false, protocol, endpointKind:endpoint.endpointKind, reason, models:[] }; }
 }
 
 export function createProviderTransport(settings: ProviderSettings): ProviderTransport {
@@ -1626,6 +1699,7 @@ function connectivityKind(error: unknown): ProviderConnectivityResult["kind"] {
   if (info.kind === "context") return "context";
   if (info.kind === "server" || info.kind === "timeout") return "server";
   if (info.kind === "protocol") return "protocol";
+  if (info.kind === "relay") return "relay";
   return "format";
 }
 
@@ -1634,9 +1708,9 @@ export async function testProviderConnection(settings: ProviderSettings): Promis
   const model = settings.model.trim();
   try {
     const resolvedProtocol = resolveProviderProtocol(settings);
-    await new OpenAIProvider({ ...settings, stream: false }).test();
+    const result = await new OpenAIProvider({ ...settings, stream: false }).chatWithMeta([{ role: "user", content: "只回复 OK" }], { stream: false });
     const endpoint = resolveProviderEndpoint({ ...settings, stream: false });
-    return { ok: true, model, protocol: resolvedProtocol, requestMode: resolvedProtocol, providerAdapter: resolvedProtocol, endpointKind: endpoint.endpointKind, modelDiscoverySupported: resolvedProtocol !== "claude" };
+    return { ok: true, model, protocol: resolvedProtocol, requestMode: resolvedProtocol, providerAdapter: resolvedProtocol, endpointKind: endpoint.endpointKind, modelDiscoverySupported: resolvedProtocol !== "claude", connectivityFailure: undefined, networkMode: result.networkMode, relayUsed: result.relayUsed, relayRequestId: result.relayRequestId, relayStatus: result.relayStatus, relayErrorCode: result.relayErrorCode, relayDurationMs: result.relayDurationMs, upstreamHttpStatus: result.upstreamHttpStatus, upstreamBytes: result.upstreamBytes };
   } catch (error) {
     const info = apiErrorInfoOf(error);
     return {
@@ -1651,6 +1725,14 @@ export async function testProviderConnection(settings: ProviderSettings): Promis
       endpointKind: resolveProviderEndpoint({ ...settings, stream: false }).endpointKind,
       connectivityFailure: info?.kind === "timeout" || info?.kind === "interrupted" ? "server" : info?.kind === "model" ? "protocol" : info?.kind,
       modelDiscoverySupported: resolveProviderProtocol(settings) !== "claude",
+      networkMode: info?.networkMode,
+      relayUsed: info?.relayUsed,
+      relayRequestId: info?.relayRequestId,
+      relayStatus: info?.relayStatus,
+      relayErrorCode: info?.relayErrorCode,
+      relayDurationMs: info?.relayDurationMs,
+      upstreamHttpStatus: info?.upstreamHttpStatus,
+      upstreamBytes: info?.upstreamBytes,
     };
   }
 }

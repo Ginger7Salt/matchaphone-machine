@@ -351,6 +351,14 @@ async function finishProviderCall(
               completeVisibleFieldRecovered: result?.completeVisibleFieldRecovered ?? (error instanceof ProviderError ? error.apiError?.completeVisibleFieldRecovered : undefined),
               tailKind: result?.tailKind ?? (error instanceof ProviderError ? error.apiError?.tailKind : undefined),
               failureStage: error instanceof ProviderError ? error.apiError?.failureStage : undefined,
+              networkMode: result?.networkMode ?? (error instanceof ProviderError ? error.apiError?.networkMode : undefined),
+              relayUsed: result?.relayUsed ?? (error instanceof ProviderError ? error.apiError?.relayUsed : undefined),
+              relayRequestId: result?.relayRequestId ?? (error instanceof ProviderError ? error.apiError?.relayRequestId : undefined),
+              relayStatus: result?.relayStatus ?? (error instanceof ProviderError ? error.apiError?.relayStatus : undefined),
+              relayErrorCode: result?.relayErrorCode ?? (error instanceof ProviderError ? error.apiError?.relayErrorCode : undefined),
+              relayDurationMs: result?.relayDurationMs ?? (error instanceof ProviderError ? error.apiError?.relayDurationMs : undefined),
+              upstreamHttpStatus: result?.upstreamHttpStatus ?? (error instanceof ProviderError ? error.apiError?.upstreamHttpStatus : undefined),
+              upstreamBytes: result?.upstreamBytes ?? (error instanceof ProviderError ? error.apiError?.upstreamBytes : undefined),
             },
       ) satisfies ChatProviderCallTrace[];
     let nextPayload: ChatReplyTaskPayload;

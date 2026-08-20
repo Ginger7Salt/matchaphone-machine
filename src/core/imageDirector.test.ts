@@ -4,7 +4,7 @@ import {saveModelServiceSettings} from "./modelServices";
 import {characterVisualHash,compileImagePromptPlan,ensureCharacterVisualProfile,IMAGE_DIRECTOR_INSTRUCTION,reviewFaceConsistency,validCharacterVisualProfile} from "./imageDirector";
 import {defaultModelServiceSettings,defaultProvider,SCHEMA_VERSION,type Character,type Conversation,type LoreBook,type ProviderSettings} from "./types";
 
-const provider:ProviderSettings={...defaultProvider,apiKey:"key",baseUrl:"https://primary.test/v1",model:"chat",stream:false,timeoutMs:1000};
+const provider:ProviderSettings={...defaultProvider, networkMode: "direct" as const,apiKey:"key",baseUrl:"https://primary.test/v1",model:"chat",stream:false,timeoutMs:1000};
 const character:Character={id:"c",schemaVersion:SCHEMA_VERSION,createdAt:1,updatedAt:1,name:"顾言",avatar:"",bio:"28岁的急诊医生，黑色短发，左眼下有淡痣",personality:"克制冷淡",speakingStyle:"简短",background:"临海市医院",language:"中文",chatSettings:{language:"中文",contextLimit:30,stream:false,feedImage:{enabled:true,appearancePrompt:"黑色短发，窄脸，左眼下淡痣",referenceAssetId:"ref"}},proactive:{messages:false,timeAware:false,frequency:"medium",quietStart:"23:00",quietEnd:"08:00",catchupLimit:1,dailyLimit:3},relationship:{intimacy:20,trust:20,mood:"疲惫",recentEvents:[]},lastActiveAt:1};
 const conversation:Conversation={id:"v",schemaVersion:SCHEMA_VERSION,createdAt:1,updatedAt:1,title:"顾言",type:"private",memberIds:["c"],presetIds:[],loreBookIds:[],lastActivityAt:1};
 const profile={apparentAge:"28岁",faceIdentity:"窄脸、黑眼、薄唇、左眼下淡痣",immutableFeatures:["外观年龄约28岁","左眼下淡痣"],signatureFeatures:["黑色短发"],typicalAppearance:["深色衣服"],photoHabits:["不直视镜头"],forbiddenChanges:["换脸","幼态化"]};

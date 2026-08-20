@@ -7,7 +7,7 @@ import { isStandaloneInvitationCard } from "./messagePresentation";
 import { SCHEMA_VERSION, type Character, type Conversation, type ProviderSettings } from "./types";
 
 const timestamp = 1_700_000_000_000;
-const provider: ProviderSettings = { baseUrl: "https://example.com/v1", apiKey: "test-key", model: "test-model", stream: false, temperature: 0.2, maxTokens: 800, contextLimit: 30, timeoutMs: 60_000 };
+const provider: ProviderSettings = { networkMode: "direct", baseUrl: "https://example.com/v1", apiKey: "test-key", model: "test-model", stream: false, temperature: 0.2, maxTokens: 800, contextLimit: 30, timeoutMs: 60_000 };
 function character(id: string): Character {
   return { id, schemaVersion: SCHEMA_VERSION, createdAt: timestamp, updatedAt: timestamp, name: "茶茶", avatar: "", bio: "", personality: "温柔", speakingStyle: "自然", background: "", language: "中文", coreSetting: "", persona: "", proactive: { messages: false, timeAware: false, frequency: "low", quietStart: "23:00", quietEnd: "08:00", catchupLimit: 0, dailyLimit: 0 }, relationship: { intimacy: 10, trust: 10, mood: "平静", recentEvents: [] }, lastActiveAt: timestamp } as Character;
 }

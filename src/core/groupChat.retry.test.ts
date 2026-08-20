@@ -56,7 +56,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       .mockResolvedValueOnce(result(JSON.stringify({ messages: [{ content: "只有正文" }] })))
       .mockResolvedValueOnce(result(JSON.stringify({ messages: [{ content: "完整回复" }], innerVoice: voice })));
     const turn = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "你好" }],
       character,
       false,
@@ -74,7 +74,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       .mockResolvedValueOnce(incomplete)
       .mockResolvedValueOnce(incomplete);
     const error = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "你好" }],
       character,
       false,
@@ -102,7 +102,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
     };
     const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValueOnce(response);
     const turn = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "你好" }],
       character,
       false,
@@ -136,7 +136,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       return result(JSON.stringify({ messages: [{ content: "完整回复" }], innerVoice: voice }));
     };
     const turn = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "system", content: "core persona" }, { role: "user", content: "最新用户消息" }],
       character,
       false,
@@ -168,7 +168,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       return result(JSON.stringify({ messages: [{ content: "完整回复" }], innerVoice: voice }));
     };
     await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "你好" }],
       character,
       false,
@@ -195,7 +195,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       return result(JSON.stringify({ messages: [{ content: "换一种自然说法" }], innerVoice: voice }));
     };
     await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false, temperature: 0.2 },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false, temperature: 0.2 },
       [
         { role: "system", content: "完整角色设定：说话尖锐但关心用户" },
         { role: "user", content: "最新用户消息" },
@@ -224,7 +224,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       return result(JSON.stringify({ messages: [{ content: "换个角度回应你" }], innerVoice: voice }));
     };
     await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false, temperature: 0.1 },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false, temperature: 0.1 },
       [{ role: "user", content: "你还好吗" }],
       character,
       false,
@@ -257,7 +257,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
       return result(JSON.stringify({ messages: [{ content: "one" }], innerVoice: voice }));
     };
     const turn = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "hello" }],
       character,
       false,
@@ -283,7 +283,7 @@ describe("generateCharacterReplyTurn strict retry", () => {
     })));
     const diagnostics: unknown[] = [];
     const turn = await generateCharacterReplyTurn(
-      { ...defaultProvider, apiKey: "test", stream: false },
+      { ...defaultProvider, networkMode: "direct" as const, apiKey: "test", stream: false },
       [{ role: "user", content: "short" }],
       character,
       false,

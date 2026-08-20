@@ -1,4 +1,4 @@
-﻿import {beforeEach,describe,expect,it,vi} from "vitest";
+import {beforeEach,describe,expect,it,vi} from "vitest";
 import {db} from "./db";
 import {createBackup,factoryReset,restoreBackup} from "./backup";
 import {
@@ -189,7 +189,7 @@ describe("MALL starter catalog",()=>{
 describe("MALL catalog generation",()=>{
   it("parses strict SHOP JSON and persists generated items",async()=>{
     vi.stubGlobal("fetch",vi.fn(async()=>new Response(JSON.stringify({choices:[{message:{content:JSON.stringify({items:[{title:"低饱和针织衫",brand:"Mori Studio",category:"针织",description:"柔软的虚构针织衫",price:129,colors:["燕麦色"],sizes:["S","M"]}]})}}]}),{status:200,headers:{"Content-Type":"application/json"}})));
-    const rows=await generateMallCatalog("shop","针织衫",{...defaultProvider,apiKey:"test",stream:false});
+    const rows=await generateMallCatalog("shop","针织衫",{...defaultProvider, networkMode: "direct" as const,apiKey:"test",stream:false});
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({kind:"shop",title:"低饱和针织衫",priceCents:12900,query:"针织衫"});
     expect(await db.mallCatalogItems.count()).toBe(1);

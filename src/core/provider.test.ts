@@ -1,8 +1,8 @@
-﻿import {describe,expect,it,vi} from "vitest";
+import {describe,expect,it,vi} from "vitest";
 import {OpenAIProvider,ProviderError,createProviderTransport,discoverProviderModels,resolveProviderModelsEndpoint,testProviderConnection} from "./provider";
-import {defaultProvider} from "./types";
+import {defaultProvider,type ProviderSettings} from "./types";
 import {parseReplyTurn,parseStrictReplyTurn} from "./replyBubbles";
-const settings={...defaultProvider,apiKey:"test",baseUrl:"https://api.test/v1",stream:false,timeoutMs:1000};
+const settings:ProviderSettings={...defaultProvider,networkMode:"direct" as const,apiKey:"test",baseUrl:"https://api.test/v1",stream:false,timeoutMs:1000};
 const encoder=new TextEncoder();
 const completeRolePayload=()=>JSON.stringify({
  messages:[{content:"完整回复"}],
@@ -361,7 +361,7 @@ describe("protocol-aware transports", () => {
   it("does not append duplicate paths and builds OpenAI Responses requests", async () => {
     let url = ""; let body: any;
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); return new Response(JSON.stringify({ output_text: "OK" }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
-    const settings = { ...defaultProvider, apiKey: "secret", baseUrl: "https://api.example/v1/responses", protocol: "openai-responses" as const, stream: false };
+    const settings = { ...defaultProvider, networkMode: "direct" as const, apiKey: "secret", baseUrl: "https://api.example/v1/responses", protocol: "openai-responses" as const, stream: false };
     await expect(new OpenAIProvider(settings).chat([{ role: "user", content: "hi" }], { stream: false })).resolves.toBe("OK");
     expect(url).toBe("https://api.example/v1/responses");
     expect(body.input[0].role).toBe("user");
@@ -370,7 +370,7 @@ describe("protocol-aware transports", () => {
   it("builds a native Gemini request without using chat completions", async () => {
     let url = ""; let body: any; let headers: HeadersInit | undefined;
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); headers = options.headers; return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "gemini" }] } }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
-    const settings = { ...defaultProvider, apiKey: "gemini-secret", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.5-flash", protocol: "gemini" as const, stream: false };
+    const settings = { ...defaultProvider, networkMode: "direct" as const, apiKey: "gemini-secret", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-2.5-flash", protocol: "gemini" as const, stream: false };
     await expect(new OpenAIProvider(settings).chat([{ role: "system", content: "system" }, { role: "user", content: "hi" }], { stream: false })).resolves.toBe("gemini");
     expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent");
     expect(url).not.toContain("chat/completions");
@@ -381,7 +381,7 @@ describe("protocol-aware transports", () => {
   it("builds a native Claude request with a separate system instruction", async () => {
     let url = ""; let body: any; let headers: HeadersInit | undefined;
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); headers = options.headers; return new Response(JSON.stringify({ content: [{ type: "text", text: "claude" }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
-    const settings = { ...defaultProvider, apiKey: "claude-secret", baseUrl: "https://api.anthropic.com/v1", model: "claude-sonnet", protocol: "claude" as const, stream: false };
+    const settings = { ...defaultProvider, networkMode: "direct" as const, apiKey: "claude-secret", baseUrl: "https://api.anthropic.com/v1", model: "claude-sonnet", protocol: "claude" as const, stream: false };
     await expect(new OpenAIProvider(settings).chat([{ role: "system", content: "system" }, { role: "user", content: "hi" }], { stream: false })).resolves.toBe("claude");
     expect(url).toBe("https://api.anthropic.com/v1/messages");
     expect(body.system).toBe("system");
@@ -392,7 +392,7 @@ describe("protocol-aware transports", () => {
   it("keeps DeepSeek on the OpenAI-compatible transport and never exposes its key in errors", async () => {
     let url = ""; let body: any;
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async (input: string, options: any) => { url = input; body = JSON.parse(options.body); return new Response(JSON.stringify({ choices: [{ message: { content: "deepseek" } }] }), { status: 200, headers: { "Content-Type": "application/json" } }); }));
-    const settings = { ...defaultProvider, apiKey: "deep-secret", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", protocol: "deepseek-compatible" as const, stream: false };
+    const settings = { ...defaultProvider, networkMode: "direct" as const, apiKey: "deep-secret", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", protocol: "deepseek-compatible" as const, stream: false };
     await expect(new OpenAIProvider(settings).chat([{ role: "user", content: "hi" }], { stream: false })).resolves.toBe("deepseek");
     expect(url).toBe("https://api.deepseek.com/v1/chat/completions");
     expect(body.model).toBe("deepseek-chat");
@@ -414,20 +414,20 @@ describe("protocol-aware model discovery",()=>{
  it("uses Gemini native model listing and strips models/ prefixes",async()=>{
   let url="";let headers:Record<string,string>|undefined;
   vi.stubGlobal("fetch",vi.fn().mockImplementation(async(input:string,options:any)=>{url=input;headers=options.headers;return new Response(JSON.stringify({models:[{name:"models/gemini-2.5-flash"},{name:"models/gemini-2.5-pro"}]}),{status:200,headers:{"Content-Type":"application/json"}})}));
-  const settings={...defaultProvider,apiKey:"gemini-secret",baseUrl:"https://generativelanguage.googleapis.com/v1beta",protocol:"gemini" as const};
+  const settings={...defaultProvider,networkMode:"direct" as const,apiKey:"gemini-secret",baseUrl:"https://generativelanguage.googleapis.com/v1beta",protocol:"gemini" as const};
   await expect(discoverProviderModels(settings)).resolves.toMatchObject({supported:true,models:["gemini-2.5-flash","gemini-2.5-pro"],protocol:"gemini"});
   expect(url).toBe("https://generativelanguage.googleapis.com/v1beta/models");expect(headers?.["x-goog-api-key"]).toBe("gemini-secret");expect(headers?.Authorization).toBeUndefined();
  });
  it("does not probe Claude with a guessed models endpoint",async()=>{
   const fetchMock=vi.fn();vi.stubGlobal("fetch",fetchMock);
-  const settings={...defaultProvider,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1",protocol:"claude" as const};
+  const settings={...defaultProvider,networkMode:"direct" as const,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1",protocol:"claude" as const};
   await expect(createProviderTransport(settings).listModels?.(settings)).resolves.toMatchObject({supported:false,protocol:"claude",reason:"unsupported"});
   expect(fetchMock).not.toHaveBeenCalled();
  });
  it("allows an explicitly supplied Claude models endpoint",async()=>{
   let url="";let headers:Record<string,string>|undefined;
   vi.stubGlobal("fetch",vi.fn().mockImplementation(async(input:string,options:any)=>{url=input;headers=options.headers;return new Response(JSON.stringify({data:[{id:"claude-sonnet"}]}),{status:200,headers:{"Content-Type":"application/json"}})}));
-  const settings={...defaultProvider,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1/models",protocol:"claude" as const};
+  const settings={...defaultProvider,networkMode:"direct" as const,apiKey:"claude-secret",baseUrl:"https://api.anthropic.com/v1/models",protocol:"claude" as const};
   await expect(discoverProviderModels(settings)).resolves.toMatchObject({supported:true,models:["claude-sonnet"],protocol:"claude",endpointKind:"full-endpoint"});
   expect(url).toBe(settings.baseUrl);expect(headers?.["x-api-key"]).toBe("claude-secret");expect(headers?.Authorization).toBeUndefined();
  });
@@ -437,14 +437,61 @@ describe("protocol-aware model discovery",()=>{
 describe("model discovery failure classification",()=>{
  it("returns a sanitized CORS discovery result without throwing",async()=>{
   vi.stubGlobal("fetch",vi.fn().mockRejectedValue(new TypeError("Failed to fetch with secret-model-key")));
-  const result=await discoverProviderModels({...defaultProvider,apiKey:"secret-model-key",baseUrl:"https://api.test/v1"});
+  const result=await discoverProviderModels({...defaultProvider,networkMode:"direct" as const,apiKey:"secret-model-key",baseUrl:"https://api.test/v1"});
   expect(result).toMatchObject({supported:false,protocol:"openai-compatible",reason:"cors",models:[]});
   expect(JSON.stringify(result)).not.toContain("secret-model-key");
  });
  it("reports connection metadata without credentials",async()=>{
   vi.stubGlobal("fetch",vi.fn().mockResolvedValue(new Response(JSON.stringify({choices:[{message:{content:"OK"}}]}),{status:200,headers:{"Content-Type":"application/json"}})));
-  const result=await testProviderConnection({...defaultProvider,apiKey:"connection-secret",baseUrl:"https://api.test/v1",stream:false});
+  const result=await testProviderConnection({...defaultProvider,networkMode:"direct" as const,apiKey:"connection-secret",baseUrl:"https://api.test/v1",stream:false});
   expect(result).toMatchObject({ok:true,protocol:"openai-compatible",requestMode:"openai-compatible",providerAdapter:"openai-compatible",endpointKind:"base-url",modelDiscoverySupported:true});
   expect(JSON.stringify(result)).not.toContain("connection-secret");
  });
+});
+
+describe("native multimodal request adapters", () => {
+  const dataImage = "data:image/png;base64,aGVsbG8=";
+  const message = [{ role: "user" as const, content: "describe", imageUrl: dataImage }];
+  const captureBody = (response: unknown) => {
+    let body: any;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (_input: string, options: RequestInit) => {
+      body = JSON.parse(String(options.body));
+      return new Response(JSON.stringify(response), { status: 200, headers: { "Content-Type": "application/json" } });
+    }));
+    return () => body;
+  };
+
+  it("keeps OpenAI-compatible images as image_url content", async () => {
+    const body = captureBody({ choices: [{ message: { content: "OK" } }] });
+    await new OpenAIProvider({ ...defaultProvider, networkMode: "direct" as const, apiKey: "x", baseUrl: "https://api.example/v1", protocol: "openai-compatible", stream: false }).chat(message, { stream: false });
+    expect(body().messages[0].content[1]).toEqual({ type: "image_url", image_url: { url: dataImage } });
+  });
+
+  it("converts Responses images to input_image", async () => {
+    const body = captureBody({ output_text: "OK" });
+    await new OpenAIProvider({ ...defaultProvider, networkMode: "direct" as const, apiKey: "x", baseUrl: "https://api.example/v1", protocol: "openai-responses", stream: false }).chat(message, { stream: false });
+    expect(body().input[0].content[1]).toEqual({ type: "input_image", image_url: dataImage });
+  });
+
+  it("converts Gemini Data URLs to inlineData", async () => {
+    const body = captureBody({ candidates: [{ content: { parts: [{ text: "OK" }] } }] });
+    await new OpenAIProvider({ ...defaultProvider, networkMode: "direct" as const, apiKey: "x", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-test", protocol: "gemini", stream: false }).chat(message, { stream: false });
+    expect(body().contents[0].parts[1]).toEqual({ inlineData: { mimeType: "image/png", data: "aGVsbG8=" } });
+  });
+
+  it("converts Claude Data URLs to base64 image sources", async () => {
+    const body = captureBody({ content: [{ type: "text", text: "OK" }] });
+    await new OpenAIProvider({ ...defaultProvider, networkMode: "direct" as const, apiKey: "x", baseUrl: "https://api.anthropic.com/v1", model: "claude-test", protocol: "claude", stream: false }).chat(message, { stream: false });
+    expect(body().messages[0].content[1]).toEqual({ type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } });
+  });
+
+  it("keeps safe remote HTTPS images and rejects unsafe references before fetch", async () => {
+    const body = captureBody({ candidates: [{ content: { parts: [{ text: "OK" }] } }] });
+    const provider = new OpenAIProvider({ ...defaultProvider, networkMode: "direct" as const, apiKey: "x", baseUrl: "https://generativelanguage.googleapis.com/v1beta", model: "gemini-test", protocol: "gemini", stream: false });
+    await provider.chat([{ role: "user", content: "describe", imageUrl: "https://images.example/a.png" }], { stream: false });
+    expect(body().contents[0].parts[1]).toEqual({ fileData: { mimeType: "application/octet-stream", fileUri: "https://images.example/a.png" } });
+    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+    await expect(provider.chat([{ role: "user", content: "describe", imageUrl: "http://127.0.0.1/private.png" }], { stream: false })).rejects.toMatchObject({ apiError: { providerCode: "invalid_image_reference" } });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

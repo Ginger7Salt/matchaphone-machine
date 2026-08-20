@@ -688,6 +688,14 @@ export interface ChatProviderCallTrace {
   completeVisibleFieldRecovered?: boolean;
   tailKind?: ChatProviderTailKind;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  networkMode?: ProviderNetworkMode;
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
   countMode?: ReplyBubbleCountMode;
   allowedMin?: number;
   allowedMax?: number;
@@ -734,7 +742,7 @@ export interface ContextSectionDiagnostics {
 }
 export interface ProviderConnectivityResult {
   ok: boolean;
-  kind?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format";
+  kind?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format" | "relay";
   httpStatus?: number;
   providerCode?: string;
   model?: string;
@@ -743,7 +751,15 @@ export interface ProviderConnectivityResult {
   endpointKind?: "base-url" | "full-endpoint";
   requestMode?: ProviderProtocol;
   modelDiscoverySupported?: boolean;
-  connectivityFailure?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format";
+  connectivityFailure?: "auth" | "cors" | "network" | "rate" | "server" | "protocol" | "context" | "format" | "relay";
+  networkMode?: ProviderNetworkMode;
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
 }
 export interface ChatReplyTaskPayload {
   mode: "private" | "group";
@@ -794,6 +810,14 @@ export interface ChatReplyTaskPayload {
   contextDiagnosticsByActor?: Record<string, ContextSectionDiagnostics>;
   /** Last deterministic failure stage, used only for status/diagnostics. */
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  networkMode?: ProviderNetworkMode;
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
   cancelled?: boolean;
 }
 export type InvitationResponseType = "couple-island" | "music";
@@ -1136,7 +1160,8 @@ export type ApiErrorKind =
   | "protocol"
   | "server"
   | "format"
-  | "interrupted";
+  | "interrupted"
+  | "relay";
 export interface ApiErrorInfo {
   source: "api";
   kind: ApiErrorKind;
@@ -1171,6 +1196,14 @@ export interface ApiErrorInfo {
   tailKind?: ChatProviderTailKind;
   finishReason?: string;
   failureStage?: "provider-parse" | "role-protocol" | "inner-voice" | "bubble-count" | "persistence";
+  networkMode?: ProviderNetworkMode;
+  relayUsed?: boolean;
+  relayRequestId?: string;
+  relayStatus?: number;
+  relayErrorCode?: string;
+  relayDurationMs?: number;
+  upstreamHttpStatus?: number;
+  upstreamBytes?: number;
   countMode?: ReplyBubbleCountMode;
   allowedMin?: number;
   allowedMax?: number;
@@ -1703,6 +1736,14 @@ export interface MeetEntry {
     providerAdapter?: string;
     endpointKind?: "base-url" | "full-endpoint";
     requestMode?: ProviderProtocol;
+    networkMode?: ProviderNetworkMode;
+    relayUsed?: boolean;
+    relayRequestId?: string;
+    relayStatus?: number;
+    relayErrorCode?: string;
+    relayDurationMs?: number;
+    upstreamHttpStatus?: number;
+    upstreamBytes?: number;
     connectivityFailure?: string;
     protocolMismatch?: boolean;
     sseMode?: "delta" | "snapshot" | "complete-object" | "not-applicable";
@@ -1745,6 +1786,14 @@ export interface MeetEntry {
       providerProtocol?: ProviderProtocol;
       providerAdapter?: string;
       endpointKind?: "base-url" | "full-endpoint";
+      networkMode?: ProviderNetworkMode;
+      relayUsed?: boolean;
+      relayRequestId?: string;
+      relayStatus?: number;
+      relayErrorCode?: string;
+      relayDurationMs?: number;
+      upstreamHttpStatus?: number;
+      upstreamBytes?: number;
       failureDetailCode?: MeetFailureDetailCode;
       retryDecision?: MeetRetryDecision;
       normalizationPath?: string;
@@ -2002,6 +2051,8 @@ export type ProviderProtocol =
   | "claude"
   | "deepseek-compatible";
 
+export type ProviderNetworkMode = "relay" | "direct";
+
 export interface ProviderSettings {
   baseUrl: string;
   apiKey: string;
@@ -2013,6 +2064,7 @@ export interface ProviderSettings {
   contextBudgetMode?: "auto" | "custom";
   contextWindowTokens?: number;
   protocol?: ProviderProtocol;
+  networkMode?: ProviderNetworkMode;
   timeoutMs: number;
 }
 export interface ProviderPreset {
@@ -2533,6 +2585,7 @@ export const defaultProvider: ProviderSettings = {
   maxTokens: 800,
   contextLimit: 30,
   protocol: "auto",
+  networkMode: "relay",
   timeoutMs: 60000,
 };
 export const defaultEmbeddingServiceSettings: EmbeddingServiceSettings = {

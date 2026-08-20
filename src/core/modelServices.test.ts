@@ -20,20 +20,20 @@ describe("dedicated model services",()=>{
   expect(normalized.vision.instruction).toBe(defaultModelServiceSettings.vision.instruction);
  });
  it("resolves the secondary provider independently and falls back when disabled",async()=>{
-  const secondary={...defaultProvider,baseUrl:"https://secondary.example/v1",apiKey:"secondary-key",model:"helper"};
+  const secondary={...defaultProvider, networkMode: "direct" as const,baseUrl:"https://secondary.example/v1",apiKey:"secondary-key",model:"helper"};
   await saveModelServiceSettings({...defaultModelServiceSettings,secondary:{enabled:true,provider:secondary}});
-  expect(await resolveSecondaryProvider({...defaultProvider,apiKey:"main-key",model:"main"})).toMatchObject({apiKey:"secondary-key",model:"helper"});
+  expect(await resolveSecondaryProvider({...defaultProvider, networkMode: "direct" as const,apiKey:"main-key",model:"main"})).toMatchObject({apiKey:"secondary-key",model:"helper"});
   await setSetting("model-services-v1",{...defaultModelServiceSettings,secondary:{enabled:false,provider:secondary}});
-  expect(await resolveSecondaryProvider({...defaultProvider,apiKey:"main-key",model:"main"})).toMatchObject({apiKey:"main-key",model:"main"});
+  expect(await resolveSecondaryProvider({...defaultProvider, networkMode: "direct" as const,apiKey:"main-key",model:"main"})).toMatchObject({apiKey:"main-key",model:"main"});
  });
  it("clears dedicated keys without removing the service configuration",async()=>{
-  await saveModelServiceSettings({...defaultModelServiceSettings,secondary:{enabled:true,provider:{...defaultProvider,apiKey:"secondary",model:"helper"}},vision:{...defaultModelServiceSettings.vision,enabled:true,provider:{...defaultProvider,apiKey:"vision",model:"vision"}}});
+  await saveModelServiceSettings({...defaultModelServiceSettings,secondary:{enabled:true,provider:{...defaultProvider, networkMode: "direct" as const,apiKey:"secondary",model:"helper"}},vision:{...defaultModelServiceSettings.vision,enabled:true,provider:{...defaultProvider, networkMode: "direct" as const,apiKey:"vision",model:"vision"}}});
   const cleared=await clearModelServiceKeys();
   expect(cleared.secondary).toMatchObject({enabled:true,provider:{apiKey:"",model:"helper"}});
   expect(cleared.vision).toMatchObject({enabled:true,provider:{apiKey:"",model:"vision"}});
  });
  it("uses the configured vision provider and sends the image as vision input",async()=>{
-  await saveModelServiceSettings({...defaultModelServiceSettings,vision:{...defaultModelServiceSettings.vision,enabled:true,provider:{...defaultProvider,baseUrl:"https://vision.example/v1",apiKey:"vision-key",model:"vision-model"}}});
+  await saveModelServiceSettings({...defaultModelServiceSettings,vision:{...defaultModelServiceSettings.vision,enabled:true,provider:{...defaultProvider, networkMode: "direct" as const,baseUrl:"https://vision.example/v1",apiKey:"vision-key",model:"vision-model"}}});
   const fetchMock=vi.fn(async(_input:RequestInfo|URL,_init?:RequestInit)=>new Response(JSON.stringify({choices:[{message:{content:"一只白色杯子放在桌上。"}}]}),{status:200,headers:{"Content-Type":"application/json"}}));
   vi.stubGlobal("fetch",fetchMock);
   await expect(describeImageWithVision("data:image/png;base64,aGVsbG8=","用户说这是礼物")).resolves.toBe("一只白色杯子放在桌上。");

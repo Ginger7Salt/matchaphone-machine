@@ -1,4 +1,4 @@
-﻿import {Component,useEffect,useRef,useState} from "react";
+import {Component,useEffect,useRef,useState} from "react";
 import {
  BellRing,
  BrainCircuit,
@@ -66,7 +66,8 @@ const emptyGitHub:GitHubBackupSettings={owner:"",repo:"",branch:"main",path:"mir
 const counts=(backup:any)=>({角色:backup.data.characters.length,会话:backup.data.conversations.length,消息:backup.data.messages.length,动态:backup.data.feedPosts.length,世界书:backup.data.loreBooks.length,记忆:backup.data.memories.length,待审核:backup.data.memoryExtractionBatches?.length??0,媒体:backup.data.mediaAssets?.length??0,表情分组:backup.data.stickerPacks?.length??0});
 type StatusValue={ok:boolean;text:string};
 type ServiceKind="secondary"|"vision";
-function connectivityErrorText(result:{kind?:string;httpStatus?:number;providerCode?:string;protocol?:string}){
+function connectivityErrorText(result:{kind?:string;httpStatus?:number;providerCode?:string;protocol?:string;relayErrorCode?:string}){
+ if(result.kind==="relay")return result.relayErrorCode==="relay-activation-invalid"?"安全 Relay 需要有效的茶茶机激活许可，请先完成激活。":result.relayErrorCode==="relay-endpoint-blocked"?"该 Provider Endpoint 被安全 Relay 拦截，请使用公网 HTTPS 地址。":result.relayErrorCode==="relay-timeout"?"安全 Relay 等待 Provider 超时，请稍后重试。":result.relayErrorCode==="relay-unavailable"?"安全 Relay 暂时不可用，请稍后重试。":"安全 Relay 请求失败，请查看诊断信息。";
  if(result.kind==="protocol")return "请求协议与 Endpoint 不匹配，请检查协议选择和 Base URL。";
  if(result.kind==="context")return "Provider 不接受当前输入长度，请降低上下文窗口配置或更换模型。";
  if(result.kind==="cors")return "\u5f53\u524d Provider \u4e0d\u652f\u6301\u6d4f\u89c8\u5668\u76f4\u8fde\u6216\u8de8\u57df\u8bbf\u95ee\uff0c\u8bf7\u66f4\u6362\u652f\u6301 CORS \u7684\u5730\u5740\u3002";
@@ -153,7 +154,8 @@ export default function SettingsPage(){
   if(result.reason==="unsupported")return "当前协议（"+(result.protocol??"auto")+"）不提供通用模型列表，请手动填写模型名称。";
   if(result.reason==="auth")return "模型列表认证失败，请检查 API Key 和模型权限。";
   if(result.reason==="cors")return "模型列表请求被浏览器 CORS 拦截，请确认 Provider 允许网页直连。";
-  if(result.reason==="invalid-response")return "Provider 返回的模型列表格式无法识别。";
+  if(result.reason==="network")return "模型列表网络请求失败，请检查网络或安全 Relay。";
+ if(result.reason==="invalid-response")return "Provider 返回的模型列表格式无法识别。";
   return "当前 Provider 不支持自动拉取模型，请手动填写模型名称。";
  };
  const test=async()=>{
@@ -356,7 +358,7 @@ export default function SettingsPage(){
    <section className="main-model-section">
     <small>PRIMARY API</small><h3>主 API 设置</h3>
     <label>Base URL<input value={form.baseUrl} onChange={event=>set("baseUrl",event.target.value)}/></label>
-    <label>请求协议<select value={form.protocol??"auto"} onChange={event=>set("protocol",event.target.value as ProviderSettings["protocol"])}><option value="auto">自动判断</option><option value="openai-compatible">OpenAI 兼容</option><option value="openai-responses">OpenAI Responses</option><option value="gemini">Gemini 原生</option><option value="claude">Claude 原生</option><option value="deepseek-compatible">DeepSeek 兼容</option></select><small className="section-note">官方 Gemini / Claude API 请选择对应原生协议；中转站若提供 /chat/completions，请选择 OpenAI 兼容。</small></label>
+    <label>请求协议<select value={form.protocol??"auto"} onChange={event=>set("protocol",event.target.value as ProviderSettings["protocol"])}><option value="auto">自动判断</option><option value="openai-compatible">OpenAI 兼容</option><option value="openai-responses">OpenAI Responses</option><option value="gemini">Gemini 原生</option><option value="claude">Claude 原生</option><option value="deepseek-compatible">DeepSeek 兼容</option></select><small className="section-note">官方 Gemini / Claude API 请选择对应原生协议；中转站若提供 /chat/completions，请选择 OpenAI 兼容。</small></label><label>请求通道<select value={form.networkMode??"relay"} onChange={event=>set("networkMode",event.target.value as ProviderSettings["networkMode"])}><option value="relay">安全 Relay（默认）</option><option value="direct">浏览器直连（高级）</option></select><small className="section-note">中转站通常不允许网页跨域访问；安全 Relay 不保存 API Key。直连失败不会自动切换通道。</small></label>
    <label>API Key<div className="secret-input"><input type={show?"text":"password"} autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={form.apiKey} onChange={event=>set("apiKey",event.target.value)} placeholder="sk-..."/><button onClick={()=>setShow(!show)}>{show?<EyeOff/>:<Eye/>}</button></div></label>
     <label>模型名称<div className="model-input"><input value={form.model} onFocus={()=>models.length&&setModelPickerOpen(true)} onChange={event=>set("model",event.target.value)}/><button disabled={busy} onClick={fetchModels}><RefreshCw/>拉取模型</button></div></label>
     {modelPickerOpen&&models.length>0&&<ModelPicker models={models} query={query} selected={form.model} onQuery={setQuery} onClose={()=>setModelPickerOpen(false)} onSelect={model=>{set("model",model);setModelPickerOpen(false)}}/>}
@@ -434,7 +436,7 @@ function ServiceSection({kind,title,eyebrow,icon,note,value,showKey,status,busy,
   <p className="section-note">{note}</p>
   <div className="dedicated-api-fields">
    <label>Base URL<input value={value.provider.baseUrl} onChange={event=>onPatch("baseUrl",event.target.value)}/></label>
-   <label>请求协议<select value={value.provider.protocol??"auto"} onChange={event=>onPatch("protocol",event.target.value as ProviderSettings["protocol"])}><option value="auto">自动判断</option><option value="openai-compatible">OpenAI 兼容</option><option value="openai-responses">OpenAI Responses</option><option value="gemini">Gemini 原生</option><option value="claude">Claude 原生</option><option value="deepseek-compatible">DeepSeek 兼容</option></select></label>
+   <label>请求协议<select value={value.provider.protocol??"auto"} onChange={event=>onPatch("protocol",event.target.value as ProviderSettings["protocol"])}><option value="auto">自动判断</option><option value="openai-compatible">OpenAI 兼容</option><option value="openai-responses">OpenAI Responses</option><option value="gemini">Gemini 原生</option><option value="claude">Claude 原生</option><option value="deepseek-compatible">DeepSeek 兼容</option></select></label><label>请求通道<select value={value.provider.networkMode??"relay"} onChange={event=>onPatch("networkMode",event.target.value as ProviderSettings["networkMode"])}><option value="relay">安全 Relay（默认）</option><option value="direct">浏览器直连（高级）</option></select></label>
    <label>API Key<div className="secret-input"><input type={showKey?"text":"password"} autoCapitalize="none" autoCorrect="off" spellCheck={false} autoComplete="off" value={value.provider.apiKey} onChange={event=>onPatch("apiKey",event.target.value)} placeholder="sk-..."/><button type="button" aria-label={showKey?"隐藏密钥":"显示密钥"} onClick={()=>onShowKey(!showKey)}>{showKey?<EyeOff/>:<Eye/>}</button></div></label>
    <label>模型名称<div className="model-input"><input value={value.provider.model} onFocus={()=>models.length&&onPickerOpen()} onChange={event=>onPatch("model",event.target.value)} placeholder={kind==="vision"?"例如 gpt-4.1-mini":"辅助任务模型"}/><button type="button" disabled={busy||!value.provider.apiKey.trim()} onClick={onFetchModels}><RefreshCw/>拉取模型</button></div></label>{pickerOpen&&models.length>0&&<ModelPicker models={models} query={query} selected={value.provider.model} onQuery={onQuery} onClose={onPickerClose} onSelect={model=>{onPatch("model",model);onPickerClose()}}/>} 
    <label>Temperature<input type="number" min="0" max="2" step="0.1" value={value.provider.temperature} onChange={event=>onPatch("temperature",Number(event.target.value))}/></label>

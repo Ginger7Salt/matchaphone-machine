@@ -276,6 +276,11 @@ export async function verifyActivationLicenseSignature(
   }
 }
 
+export async function getStoredActivationLicense() {
+  if (!globalThis.indexedDB) return undefined;
+  return readRecord<StoredActivationLicense>(LICENSE_RECORD_KEY);
+}
+
 export async function verifyStoredActivation(options?: { publicJwk?: JsonWebKey; publicKeyId?: string }) {
   if (!globalThis.crypto?.subtle || !globalThis.indexedDB) return false;
   const [device, license] = await Promise.all([

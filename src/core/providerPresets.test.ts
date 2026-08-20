@@ -4,7 +4,7 @@ import {activateProviderPreset,clearProviderPresetKeys,deleteProviderPreset,getP
 import {defaultModelServiceSettings,defaultProvider,type Conversation} from "./types";
 import {getModelServiceSettings,saveModelServiceSettings} from "./modelServices";
 
-const provider=(model:string,key:string)=>({...defaultProvider,baseUrl:"https://example.com/v1",apiKey:key,model});
+const provider=(model:string,key:string)=>({...defaultProvider, networkMode: "direct" as const,baseUrl:"https://example.com/v1",apiKey:key,model});
 describe("provider presets",()=>{
  beforeEach(async()=>{await db.delete();await db.open()});
  it("saves multiple presets and switches the active provider",async()=>{const first=await saveProviderPreset({name:"快速",provider:provider("fast","key-a")}),second=await saveProviderPreset({name:"高质量",provider:provider("quality","key-b"),activate:false});expect(second.state.items).toHaveLength(2);expect(second.state.activeId).toBe(first.preset.id);const switched=await activateProviderPreset(second.preset.id);expect(switched.state.activeId).toBe(second.preset.id);expect((await getProvider()).model).toBe("quality")});

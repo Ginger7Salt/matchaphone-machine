@@ -193,7 +193,7 @@ describe("couple island domain", () => {  it("supports a character-initiated inv
     const chat = vi.spyOn(OpenAIProvider.prototype, "chat")
       .mockResolvedValueOnce(JSON.stringify({ kind: "diary", text: repeated }))
       .mockResolvedValueOnce(JSON.stringify({ kind: "diary", text: distinct }));
-    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, apiKey: "test" });
+    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, networkMode: "direct" as const, apiKey: "test" });
     expect(chat).toHaveBeenCalledTimes(2);
     expect(saved?.text).toBe(distinct);
     const diaries = await db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "diary" && entry.authorType === "character").toArray();
@@ -206,7 +206,7 @@ describe("couple island domain", () => {  it("supports a character-initiated inv
     await addIslandEntry({ islandId: island.id, kind: "diary", authorType: "character", text: repeated });
     const chat = vi.spyOn(OpenAIProvider.prototype, "chat")
       .mockResolvedValue(JSON.stringify({ kind: "diary", text: repeated }));
-    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, apiKey: "test" });
+    const saved = await runCoupleIslandUpdate(island.id, { ...defaultProvider, networkMode: "direct" as const, apiKey: "test" });
     expect(chat).toHaveBeenCalledTimes(2);
     expect(saved).toBeUndefined();
     const diaries = await db.coupleIslandEntries.where("islandId").equals(island.id).filter((entry) => entry.kind === "diary" && entry.authorType === "character").toArray();

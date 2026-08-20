@@ -110,7 +110,7 @@ async function setup(ids = ["one", "two", "silent"], range?: { minChars: number;
   await db.meetSessions.add(session(ids, range));
   await db.settings.put({
     key: "provider",
-    value: { ...defaultProvider, apiKey: "test-key", model: "test-model" },
+    value: { ...defaultProvider, networkMode: "direct" as const, apiKey: "test-key", model: "test-model" },
   });
 }
 
@@ -122,7 +122,7 @@ async function configureSecondary(overrides: Partial<typeof defaultProvider> = {
       secondary: {
         enabled: true,
         provider: {
-          ...defaultProvider,
+          ...defaultProvider, networkMode: "direct" as const,
           baseUrl: "https://secondary.example/v1",
           apiKey: "secondary-key",
           model: "secondary-model",
