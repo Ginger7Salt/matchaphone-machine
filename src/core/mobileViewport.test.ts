@@ -12,6 +12,8 @@ describe("mobile viewport snapshot",()=>{
   expect(snapshot.keyboardInset).toBe(0);
   expect(snapshot.layoutHeight).toBe(844);
   expect(cssViewportVariablesOf(snapshot)["--app-viewport-height"]).toBe("520px");
+  expect(cssViewportVariablesOf(snapshot)["--app-height"]).toBe("520px");
+  expect(cssViewportVariablesOf(snapshot)["--visible-viewport-height"]).toBe("520px");
  });
  it("uses one overlay inset when the visual viewport stays stable",()=>{
   const snapshot=readMobileViewportSnapshot({innerWidth:390,innerHeight:844,documentClientWidth:390,documentClientHeight:844,visualWidth:390,visualHeight:844,virtualKeyboardInset:280,stableLayoutWidth:390,stableLayoutHeight:844});

@@ -208,8 +208,18 @@ describe("PhoneShell native topbar routes",()=>{
    const {container}=renderShell("/");
    await waitFor(()=>expect(document.documentElement.style.getPropertyValue("--stable-layout-height")).toBe("760px"));
    expect(container.querySelector(".phone")).not.toHaveClass("pwa-home-layout-v3");
+   expect(container.querySelector(".phone")).toHaveClass("mobile-home-layout-v6");
   });
 
+  it("uses the visible browser viewport for an ordinary mobile home", async () => {
+   setTouchViewport(true);
+   setViewportMetrics({innerHeight:844,clientHeight:844,visualHeight:700,screenHeight:844,screenAvailHeight:844});
+   const {container}=renderShell("/");
+   const phone=container.querySelector(".phone") as HTMLElement;
+   await waitFor(()=>expect(phone).toHaveClass("mobile-home-layout-v6"));
+   expect(phone.style.getPropertyValue("--mobile-home-visible-height")).toBe("700px");
+   expect(phone.style.getPropertyValue("--visible-viewport-height")).toBe("700px");
+  });
   it("does not activate for landscape, a desktop phone frame, a short PWA, or a non-home route",async()=>{
    Object.defineProperty(window.navigator,"standalone",{configurable:true,value:true});
    setTouchViewport(true);

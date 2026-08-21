@@ -82,10 +82,20 @@ export interface MobileHomeLayoutMetrics {
   enabled: boolean;
 }
 
+export interface MobileHomeResponsiveLayout extends Omit<MobileHomeLayoutMetrics, "version" | "enabled"> {
+  version: 6;
+  contentScale: number;
+  compact: boolean;
+  scrollable: boolean;
+}
+
 const finiteNonNegative = (value: number | undefined) => Number.isFinite(value) ? Math.max(0, Number(value)) : 0;
 const sum = (values: readonly number[]) => values.reduce((total, value) => total + value, 0);
 const round = (value: number) => Math.round(value * 100) / 100;
 const scaled = (value: number, scale: number) => round(value * scale);
+
+const REFERENCE_TOTAL_HEIGHT = 827.2;
+const MIN_RESPONSIVE_SCALE = 0.76;
 
 function scaleForWidth(width: number) {
   return Math.max(MIN_SCALE, Math.min(MAX_SCALE, width / REFERENCE_WIDTH));
@@ -234,6 +244,74 @@ export function calculateMobileHomeLayout(input: MobileHomeLayoutInput): MobileH
       viewportHeight > viewportWidth &&
       viewportHeight + 0.5 >= minimumRequiredHeight &&
       extraHeight >= MIN_DISTRIBUTABLE_HEIGHT,
+  };
+}
+
+/**
+ * A browser-tab-safe home layout. Unlike the historical v3 contract this is
+ * allowed to run when browser chrome makes the visual viewport shorter than
+ * the device screen. It keeps the Dock in normal layout flow and only enters
+ * scrollable mode when the device is too short to fit the minimum tap targets.
+ */
+export function calculateMobileHomeResponsiveLayout(input: MobileHomeLayoutInput): MobileHomeResponsiveLayout {
+  const viewportWidth = Math.max(1, Math.round(finiteNonNegative(input.viewportWidth)));
+  const viewportHeight = Math.max(1, Math.round(finiteNonNegative(input.viewportHeight)));
+  const safeAreaTop = Math.round(finiteNonNegative(input.safeAreaTop));
+  const safeAreaBottom = Math.round(finiteNonNegative(input.safeAreaBottom));
+  const widthScale = scaleForWidth(viewportWidth);
+  const bottomPadding = Math.max(MIN_BOTTOM_PADDING, safeAreaBottom);
+  const topSafeAreaExtra = Math.max(0, safeAreaTop - scaled(REFERENCE_TOP_PADDING, widthScale));
+  const heightScale = (viewportHeight - bottomPadding - topSafeAreaExtra) / REFERENCE_TOTAL_HEIGHT;
+  const contentScale = round(Math.max(MIN_RESPONSIVE_SCALE, Math.min(widthScale, heightScale)));
+  const rowHeights = REFERENCE_ROW_HEIGHTS.map((value) => scaled(value, contentScale)) as unknown as SixNumbers;
+  const rowGaps = REFERENCE_ROW_GAPS.map((value) => scaled(value, contentScale)) as unknown as FiveNumbers;
+  const topPadding = round(Math.max(scaled(REFERENCE_TOP_PADDING, contentScale), safeAreaTop + 1));
+  const columnGap = scaled(8, Math.max(contentScale, 0.86));
+  const dockHeight = scaled(REFERENCE_DOCK_HEIGHT, contentScale);
+  const pageDotsHeight = Math.max(8, scaled(REFERENCE_PAGE_DOTS_HEIGHT, contentScale));
+  const dotsToDockGap = scaled(REFERENCE_DOTS_TO_DOCK_GAP, contentScale);
+  const contentToDotsGap = scaled(REFERENCE_CONTENT_TO_DOTS_GAP, contentScale);
+  const desktopHeight = round(sum(rowHeights) + sum(rowGaps));
+  const footerHeight = round(contentToDotsGap + pageDotsHeight + dotsToDockGap + dockHeight);
+  const minimumRequiredHeight = round(topPadding + desktopHeight + footerHeight + bottomPadding);
+  const flexibleSpacer = round(Math.max(0, viewportHeight - minimumRequiredHeight));
+  const heroHeight = round(rowHeights[0] + rowGaps[0] + rowHeights[1]);
+  const horizontalScale = Math.max(0.86, Math.min(1, contentScale / Math.max(widthScale, 0.01)));
+  const heroWidth = Math.max(1, viewportWidth - round(36 * horizontalScale));
+  const heroThumbSize = round(heroWidth * (1 - 0.0395 * 2 - 0.0226 * 2) / 3 * horizontalScale);
+  const rowBounds = buildMobileHomeRowBounds(rowHeights, rowGaps);
+  const rowStarts = rowBounds.map((bound) => bound.top) as unknown as SixNumbers;
+  const rowEnds = rowBounds.map((bound) => bound.bottom) as unknown as SixNumbers;
+  return {
+    version: 6,
+    columns: MOBILE_HOME_COLUMNS,
+    logicalRows: MOBILE_HOME_LOGICAL_ROWS,
+    rowHeights,
+    rowGaps,
+    rowStarts,
+    rowEnds,
+    rowBounds,
+    rowGap: rowGaps[0],
+    columnGap,
+    desktopHeight,
+    flexibleSpacer,
+    contentToDotsGap,
+    dotsToDockGap,
+    footerHeight,
+    dockHeight,
+    pageDotsHeight,
+    footerGap: dotsToDockGap,
+    heroHeight,
+    heroThumbSize,
+    topPadding,
+    bottomPadding,
+    safeAreaTop,
+    safeAreaBottom,
+    minimumRequiredHeight,
+    extraHeight: flexibleSpacer,
+    contentScale,
+    compact: contentScale < widthScale - 0.005,
+    scrollable: minimumRequiredHeight > viewportHeight + 1,
   };
 }
 

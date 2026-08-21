@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MOBILE_HOME_LAYOUT_VERSION,
   calculateMobileHomeLayout,
+  calculateMobileHomeResponsiveLayout,
   isMobileHomeFullCanvasEnvironment,
   mobileHomeVisualGridPlacement,
   nearestMobileHomeLogicalRow,
@@ -20,6 +21,35 @@ const fullCanvas = (overrides: Partial<Parameters<typeof isMobileHomeFullCanvasE
   ...overrides,
 });
 
+
+describe("mobile home layout v6 responsive contract", () => {
+  it.each([
+    [320, 568], [360, 640], [360, 800], [390, 760], [390, 844], [412, 915],
+  ])("keeps the footer in normal flow for %ix%i", (width, height) => {
+    const metrics = calculateMobileHomeResponsiveLayout({ viewportWidth: width, viewportHeight: height });
+    expect(metrics.version).toBe(6);
+    expect(metrics.rowHeights).toHaveLength(6);
+    expect(metrics.footerHeight).toBeGreaterThanOrEqual(70);
+    expect(metrics.dockHeight).toBeGreaterThanOrEqual(63);
+    if (metrics.scrollable) expect(metrics.minimumRequiredHeight).toBeGreaterThan(height);
+    else expect(metrics.topPadding + metrics.desktopHeight + metrics.footerHeight + metrics.bottomPadding).toBeLessThanOrEqual(height + 1);
+    expect(metrics.minimumRequiredHeight).toBeGreaterThan(0);
+  });
+
+  it("uses the visible safe area without changing the legacy v3 contract", () => {
+    const metrics = calculateMobileHomeResponsiveLayout({ viewportWidth: 390, viewportHeight: 844, safeAreaTop: 47, safeAreaBottom: 34 });
+    expect(metrics.safeAreaTop).toBe(47);
+    expect(metrics.bottomPadding).toBe(34);
+    expect(metrics.topPadding).toBeGreaterThanOrEqual(48);
+    expect(metrics.minimumRequiredHeight).toBeLessThanOrEqual(844 + 1);
+    expect(calculateMobileHomeLayout({ viewportWidth: 390, viewportHeight: 844 }).version).toBe(MOBILE_HOME_LAYOUT_VERSION);
+  });
+
+  it("marks only extremely short screens as scrollable instead of hiding the Dock", () => {
+    expect(calculateMobileHomeResponsiveLayout({ viewportWidth: 390, viewportHeight: 760 }).scrollable).toBe(false);
+    expect(calculateMobileHomeResponsiveLayout({ viewportWidth: 320, viewportHeight: 568 }).scrollable).toBe(true);
+  });
+});
 describe("mobile PWA home layout contract v3", () => {
   it.each([
     [360, 800], [390, 844], [393, 873], [402, 874],

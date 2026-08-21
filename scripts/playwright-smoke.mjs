@@ -1,12 +1,15 @@
-﻿import { chromium } from '@playwright/test';
+import { chromium } from '@playwright/test';
 
 const baseUrl = process.env.PLAYWRIGHT_BASE_URL ?? 'https://matchaphone-d5gjgy87ybfb50382-1463048417.tcloudbaseapp.com';
 const routes = ['/', '/messages/chats', '/settings', '/meet', '/couple-island', '/messages/browser-test-conversation'];
 const viewports = [
   { name: 'desktop', width: 1280, height: 720 },
+  { name: 'iphone-se', width: 320, height: 568 },
   { name: 'mobile', width: 390, height: 844 },
-  { name: 'narrow', width: 360, height: 800 },
+  { name: 'android-small', width: 360, height: 800 },
+  { name: 'android-tall', width: 412, height: 915 },
   { name: 'landscape', width: 844, height: 390 },
+  { name: 'android-landscape', width: 915, height: 412 },
 ];
 const failures = [];
 const cacheBust = `codex_pw_${Date.now()}`;

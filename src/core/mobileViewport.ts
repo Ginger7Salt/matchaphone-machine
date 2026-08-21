@@ -92,6 +92,10 @@ export function cssViewportVariablesOf(snapshot: MobileViewportSnapshot): Record
   return {
     "--app-viewport-width": `${snapshot.layoutWidth}px`,
     "--app-viewport-height": `${snapshot.keyboardMode === "viewport-shrink" ? snapshot.visualHeight : snapshot.layoutHeight}px`,
+    "--app-height": `${snapshot.keyboardMode === "viewport-shrink" ? snapshot.visualHeight : snapshot.layoutHeight}px`,
+    // Keep the layout viewport stable for keyboard-aware pages, while exposing
+    // the actually visible height for the home canvas and browser chrome.
+    "--visible-viewport-height": `${snapshot.visualHeight}px`,
     "--visual-viewport-width": `${snapshot.visualWidth}px`,
     "--visual-viewport-height": `${snapshot.visualHeight}px`,
     "--visual-viewport-offset-top": `${snapshot.visualOffsetTop}px`,
@@ -99,6 +103,8 @@ export function cssViewportVariablesOf(snapshot: MobileViewportSnapshot): Record
     "--stable-layout-height": `${snapshot.layoutHeight}px`,
     "--safe-area-top": `${snapshot.safeAreaTop}px`,
     "--safe-area-bottom": `${snapshot.safeAreaBottom}px`,
+    "--safe-top": `${snapshot.safeAreaTop}px`,
+    "--safe-bottom": `${snapshot.safeAreaBottom}px`,
     "--keyboard-inset": `${snapshot.keyboardInset}px`,
   };
 }
