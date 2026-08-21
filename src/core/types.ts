@@ -1662,6 +1662,12 @@ export type MeetFailureDetailCode =
   | "missing-dialogue"
   | "unknown-character"
   | "invalid-segment"
+  | "invalid-segment-root"
+  | "invalid-segment-count"
+  | "invalid-segment-type"
+  | "invalid-segment-text"
+  | "invalid-segment-character-id"
+  | "invalid-segment-translation"
   | "invalid-scene-update"
   | "length-out-of-range"
   | "style-invalid";
@@ -1719,6 +1725,10 @@ export interface MeetEntry {
       | "storage-failed"
       | "aborted";
     failureDetailCode?: MeetFailureDetailCode;
+    failureSegmentIndex?: number;
+    failureSegmentType?: string;
+    failureField?: string;
+    segmentCount?: number;
     retryDecision?: MeetRetryDecision;
     normalizationPath?: string;
     sameProviderRetryPrevented?: boolean;
@@ -1795,6 +1805,10 @@ export interface MeetEntry {
       upstreamHttpStatus?: number;
       upstreamBytes?: number;
       failureDetailCode?: MeetFailureDetailCode;
+      failureSegmentIndex?: number;
+      failureSegmentType?: string;
+      failureField?: string;
+      segmentCount?: number;
       retryDecision?: MeetRetryDecision;
       normalizationPath?: string;
     }>;

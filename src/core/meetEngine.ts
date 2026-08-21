@@ -128,6 +128,12 @@ export class MeetProtocolError extends Error {
   constructor(
     message = "见面回复未遵循见面专用协议",
     readonly detailCode: MeetFailureDetailCode = "invalid-segment",
+    readonly diagnostics: {
+      segmentIndex?: number;
+      segmentType?: string;
+      field?: string;
+      segmentCount?: number;
+    } = {},
   ) {
     super(message);
     this.name = "MeetProtocolError";
@@ -239,6 +245,24 @@ export interface MeetRoundParseResult {
   repairApplied: boolean;
 }
 
+function protocolIssueOf(error: z.ZodError, segmentCount?: number) {
+  const issue = error.issues[0];
+  const path = issue?.path ?? [];
+  const segmentIndex = typeof path[1] === "number" ? path[1] : undefined;
+  const field = typeof path.at(-1) === "string" ? String(path.at(-1)) : undefined;
+  let detailCode: MeetFailureDetailCode = "invalid-segment";
+  if (!path.length) detailCode = "invalid-segment-root";
+  else if (path[0] === "segments") {
+    if (path.length === 1 && issue?.code === "too_big") detailCode = "invalid-segment-count";
+    else if (path.length === 1 || typeof path[1] !== "number") detailCode = "invalid-segment-root";
+    else if (field === "type") detailCode = "invalid-segment-type";
+    else if (field === "text") detailCode = "invalid-segment-text";
+    else if (field === "characterId") detailCode = "invalid-segment-character-id";
+    else if (field === "translation") detailCode = "invalid-segment-translation";
+  }
+  return { detailCode, diagnostics: { segmentIndex, field, segmentCount } };
+}
+
 export function parseMeetRoundResponseWithMeta(
   raw: string,
   participantIds: string[],
@@ -259,16 +283,22 @@ export function parseMeetRoundResponseWithMeta(
   const unwrapped = unwrapMeetRoundRoot(value);
   const root = unwrapped?.root;
   if (!root)
-    throw new MeetProtocolError("见面整轮回复必须是 JSON 对象", "invalid-segment");
+    throw new MeetProtocolError("见面整轮回复必须是 JSON 对象", "invalid-segment-root", { field: "root" });
   if (!Array.isArray(root.segments))
-    throw new MeetProtocolError("见面整轮缺少有效的 segments 数组", "invalid-segment");
+    throw new MeetProtocolError("见面整轮缺少有效的 segments 数组", "invalid-segment-root", { field: "segments" });
   if (!root.segments.length)
-    throw new MeetProtocolError("见面整轮没有可保存的场景片段", "empty-segments");
+    throw new MeetProtocolError("见面整轮没有可保存的场景片段", "empty-segments", { field: "segments", segmentCount: 0 });
   let parsed: z.infer<typeof meetRoundCoreSchema>;
   try {
     parsed = meetRoundCoreSchema.parse(root);
-  } catch {
-    throw new MeetProtocolError("见面整轮片段字段不完整或格式不符合要求", "invalid-segment");
+  } catch (error) {
+    if (!(error instanceof z.ZodError)) throw error;
+    const issue = protocolIssueOf(error, root.segments.length);
+    const rawSegment = issue.diagnostics.segmentIndex === undefined ? undefined : meetRecord(root.segments[issue.diagnostics.segmentIndex]);
+    throw new MeetProtocolError("见面整轮片段字段不完整或格式不符合要求", issue.detailCode, {
+      ...issue.diagnostics,
+      segmentType: typeof rawSegment?.type === "string" ? rawSegment.type.slice(0, 80) : undefined,
+    });
   }
   const allowed = new Set(participantIds);
   const dialogueSegments = parsed.segments.filter(
@@ -276,12 +306,18 @@ export function parseMeetRoundResponseWithMeta(
       segment.type === "dialogue",
   );
   if (!dialogueSegments.length)
-    throw new MeetProtocolError("见面整轮至少需要一条角色台词", "missing-dialogue");
+    throw new MeetProtocolError("见面整轮至少需要一条角色台词", "missing-dialogue", { field: "segments", segmentCount: parsed.segments.length });
   const unknownDialogue = dialogueSegments.find(
     (segment) => !allowed.has(segment.characterId),
   );
+  const unknownDialogueIndex = unknownDialogue ? parsed.segments.indexOf(unknownDialogue) : -1;
   if (unknownDialogue)
-    throw new MeetProtocolError("见面整轮包含不在当前场景中的角色 ID", "unknown-character");
+    throw new MeetProtocolError("见面整轮包含不在当前场景中的角色 ID", "unknown-character", {
+      segmentIndex: unknownDialogueIndex,
+      segmentType: "dialogue",
+      field: "characterId",
+      segmentCount: parsed.segments.length,
+    });
 
   const warnings: string[] = [];
   const thoughts: NonNullable<MeetRoundPayload["thoughts"]> = [];

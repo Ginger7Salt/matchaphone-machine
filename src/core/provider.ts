@@ -288,6 +288,19 @@ function meetRoundValueOf(value: unknown): unknown {
   }
   return undefined;
 }
+function completeMeetRoundTextOf(value: unknown) {
+  const candidate = meetRoundValueOf(value);
+  if (!isRecord(candidate) || !Array.isArray(candidate.segments) || !candidate.segments.length || candidate.segments.length > 80)
+    return undefined;
+  for (const segment of candidate.segments) {
+    if (!isRecord(segment) || (segment.type !== "narration" && segment.type !== "dialogue")) return undefined;
+    if (typeof segment.text !== "string" || !segment.text.trim()) return undefined;
+    if (segment.type === "dialogue" && (typeof segment.characterId !== "string" || !segment.characterId.trim())) return undefined;
+    if (segment.translation !== undefined && (typeof segment.translation !== "string" || !segment.translation.trim())) return undefined;
+  }
+  return safeJson(candidate);
+}
+
 function directRoleProtocolText(value: unknown) {
   if (Array.isArray(value)) {
     if (!value.length || !value.every(replyRowLike)) return undefined;
@@ -789,9 +802,9 @@ function parseSseOrNdjson(
   transportMeta?: ResponseTransportMetadata,
   onVisibleChunk?: (value: string) => void,
 ): ProviderChatResult | undefined {
-  const deltaChunks: string[] = [];
-  const genericChunks: string[] = [];
-  const completeObjects: string[] = [];
+  const deltaChunks: Array<{ text: string; path: string }> = [];
+  const genericChunks: Array<{ text: string; path: string }> = [];
+  const completeObjects: Array<{ text: string; path: string }> = [];
   let finishReason: string | undefined;
   let outputTokens: number | undefined;
   let doneMarker = false;
@@ -829,11 +842,11 @@ function parseSseOrNdjson(
       if (visible) {
         const candidatePath = visibleCandidatePaths[pathCount] ?? visibleCandidatePaths.at(-1) ?? "";
         const eventType = isRecord(value) ? cleanScalar(value.type, 120)?.toLowerCase() : undefined;
-        const complete = Boolean(meetRoundValueOf(value)) || Boolean(directMeetRoundText(parseNestedString(visible)));
+        const completeText = completeMeetRoundTextOf(value) ?? completeMeetRoundTextOf(parseNestedString(visible));
         const explicitDelta = candidatePath.includes(".delta") || Boolean(eventType?.includes("delta"));
-        if (complete) completeObjects.push(visible);
-        else if (explicitDelta) deltaChunks.push(visible);
-        else genericChunks.push(visible);
+        if (completeText) completeObjects.push({ text: completeText, path: candidatePath });
+        else if (explicitDelta) deltaChunks.push({ text: visible, path: candidatePath });
+        else genericChunks.push({ text: visible, path: candidatePath });
       }
       finishReason = finishReasonOf(value) ?? finishReason;
       outputTokens = outputTokensOf(value) ?? outputTokens;
@@ -900,16 +913,20 @@ function parseSseOrNdjson(
   if (!parsedCount || (!deltaChunks.length && !genericChunks.length && !completeObjects.length)) return undefined;
   let sseMode: "delta" | "snapshot" | "complete-object" = "delta";
   let combined = "";
+  let selectedPath: string | undefined;
   if (completeObjects.length) {
-    combined = completeObjects.at(-1)!;
+    const selected = completeObjects.at(-1)!;
+    combined = selected.text;
+    selectedPath = selected.path;
     sseMode = "complete-object";
   } else if (deltaChunks.length) {
-    combined = deltaChunks.join("");
+    combined = deltaChunks.map((chunk) => chunk.text).join("");
+    selectedPath = deltaChunks[0]?.path;
   } else {
     for (const chunk of genericChunks) {
-      if (!combined) combined = chunk;
-      else if (chunk.startsWith(combined)) { combined = chunk; sseMode = "snapshot"; }
-      else if (!combined.endsWith(chunk)) combined += chunk;
+      if (!combined) { combined = chunk.text; selectedPath = chunk.path; }
+      else if (chunk.text.startsWith(combined)) { combined = chunk.text; selectedPath = chunk.path; sseMode = "snapshot"; }
+      else if (!combined.endsWith(chunk.text)) combined += chunk.text;
     }
   }
   try {
@@ -920,7 +937,7 @@ function parseSseOrNdjson(
       transportMeta ? { ...transportMeta, transportMode: mode } : undefined,
     );
     if (sseMode === "snapshot" || sseMode === "complete-object") onVisibleChunk?.(combined);
-    else [...deltaChunks, ...genericChunks].forEach((chunk) => onVisibleChunk?.(chunk));
+    else [...deltaChunks, ...genericChunks].forEach((chunk) => onVisibleChunk?.(chunk.text));
     return {
       ...normalized,
       finishReason: finishReason ?? normalized.finishReason,
@@ -934,7 +951,7 @@ function parseSseOrNdjson(
       declaredContentLength: transportMeta?.declaredContentLength,
       contentLengthMatched: transportMeta?.contentLengthMatched,
       tailKind: transportMeta?.tailKind ?? responseTailKind(raw),
-      normalizationPath: visibleCandidatePaths[0] ?? normalized.normalizationPath,
+      normalizationPath: selectedPath ?? normalized.normalizationPath,
       responseAdapter: normalized.responseAdapter ?? (sseMode === "complete-object" ? "direct-meet-object" : "stream-text"),
       sseMode,
     };

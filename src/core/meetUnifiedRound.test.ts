@@ -271,29 +271,25 @@ describe("unified meet round generation", () => {
     expect(user?.generation?.attempts).toHaveLength(2);
   });
 
-  it("keeps a coherent second result with a slight round length deviation", async () => {
+  it("saves a valid round with a length warning", async () => {
     await setup(["one"], { minChars: 100, maxChars: 120 });
-    const short = validRound([
-        { type: "dialogue", characterId: "one", text: "太短。" },
-      ]),
-      slight = validRound([
+    const slight = validRound([
         { type: "narration", text: "景".repeat(84) },
         { type: "dialogue", characterId: "one", text: "我们继续说。" },
       ]),
       chat = vi
         .spyOn(OpenAIProvider.prototype, "chatWithMeta")
-        .mockResolvedValueOnce(response(short))
         .mockResolvedValueOnce(response(slight));
     const result = await generateMeetTurn("meet-unified", "继续");
-    expect(chat).toHaveBeenCalledTimes(2);
-    expect(result.warning).toContain("略偏离");
+    expect(chat).toHaveBeenCalledTimes(1);
+    expect(result.warning).toContain("偏离");
+    expect(result.warning).toContain("已保留完整场景");
     expect(
       (await db.meetSessions.get("meet-unified"))?.entries.some(
         (entry) => entry.dialogue === "我们继续说。",
       ),
     ).toBe(true);
   });
-
   it("ignores invalid optional thoughts and updates without rolling back visible segments", async () => {
     await setup(["one"]);
     const payload = {

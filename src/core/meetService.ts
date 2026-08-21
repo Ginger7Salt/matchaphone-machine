@@ -1,4 +1,4 @@
-import { db, getAppSettings, getProvider } from "./db";
+﻿import { db, getAppSettings, getProvider } from "./db";
 import { enqueueBackgroundTask } from "./backgroundTasks";
 import { rewardIslandMeet } from "./coupleIsland";
 import { memoryExtractionSettingsOf } from "./memoryExtraction";
@@ -11,7 +11,9 @@ import {
   fitPrioritizedPromptSections,
   INTERNAL_CONTEXT_WINDOW_TOKENS,
   MEET_LORE_BUDGET_CHARS,
+  RequiredChatContextTooLargeError,
   type PrioritizedPromptSection,
+  type FittedPromptSections,
 } from "./tokenBudget";
 import {
   chatSettingsOf,
@@ -410,6 +412,40 @@ class StaleMeetRoundError extends Error {
   }
 }
 
+const MEET_SYSTEM_PROMPT = "你是茶茶机的线下连续场景引擎。一次生成整轮共享场景，严格遵守见面整轮 JSON 协议；不要使用普通聊天协议。";
+const MEET_COMPACT_RETRY_SUFFIX = "完整紧凑重新生成：只输出单行 JSON，不得拼接上一次响应。";
+
+export function fitMeetPromptMessages(
+  sections: PrioritizedPromptSection[],
+  effectiveBudget: number,
+  compactRetry: boolean,
+) {
+  const suffix = compactRetry ? `\n\n${MEET_COMPACT_RETRY_SUFFIX}` : "";
+  const fixedTokens = estimateChatTokens([
+    { role: "system", content: MEET_SYSTEM_PROMPT },
+    { role: "user", content: suffix },
+  ]);
+  let promptBudget = effectiveBudget - fixedTokens - 16;
+  if (promptBudget < 1)
+    throw new RequiredChatContextTooLargeError(fixedTokens);
+  let fitted: FittedPromptSections | undefined;
+  for (let pass = 0; pass < 4; pass += 1) {
+    fitted = fitPrioritizedPromptSections(sections, promptBudget);
+    const messages = [
+      { role: "system" as const, content: MEET_SYSTEM_PROMPT },
+      { role: "user" as const, content: `${fitted.text}${suffix}` },
+    ];
+    const inputTokens = estimateChatTokens(messages);
+    if (inputTokens <= effectiveBudget)
+      return { fitted, messages, inputTokens };
+    promptBudget -= inputTokens - effectiveBudget + 16;
+    if (promptBudget < 1) break;
+  }
+  throw new RequiredChatContextTooLargeError(
+    Math.max(effectiveBudget + 1, fixedTokens + (fitted?.requiredTokens ?? 0)),
+  );
+}
+
 export const MEET_ROUND_INPUT_BUDGET = [48_000, 32_000] as const;
 const MEET_OUTPUT_RESERVE_TOKENS = [16_000, 12_000] as const;
 const MEET_CONTEXT_SAFETY_TOKENS = 2_000;
@@ -448,12 +484,23 @@ function meetFailureDetailCodeOf(error: unknown): MeetFailureDetailCode | undefi
   return undefined;
 }
 
+function meetFailureDiagnosticsOf(error: unknown) {
+  if (!(error instanceof MeetProtocolError)) return {};
+  return {
+    failureSegmentIndex: error.diagnostics.segmentIndex,
+    failureSegmentType: error.diagnostics.segmentType,
+    failureField: error.diagnostics.field,
+    segmentCount: error.diagnostics.segmentCount,
+  };
+}
+
 function retryInstructionOf(error: unknown) {
+  const contract = "只输出一个完整单行 JSON 对象；version 必须为数字 1；segments 必须是非空数组；type 只能是 narration 或 dialogue；每个片段必须有非空 text；dialogue 必须使用当前参与角色的稳定 characterId；至少包含一条合法 dialogue；不得使用 speech、action 或其他未知片段类型；不得输出 Markdown、解释、代码块或普通聊天 {m,v}；不得续写或拼接上一次失败响应。";
   if (shouldUseCompactStreamingRetry(error))
-    return "上一次响应未形成完整可解析的正文。本次使用更短上下文重新生成：只输出一个完整单行 JSON；不得续写或拼接上一次响应。";
+    return `上一次响应未形成完整可解析的正文。本次使用更短上下文重新生成。${contract}`;
   if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError)
-    return `上一次完整响应未通过统一见面结构校验（${error.detailCode}）。请重新生成完整对象：version 必须为 1，segments 必须按发生顺序排列并包含至少一条当前角色的 dialogue；不要解释、不要代码块、不要普通聊天 {m,v}。`;
-  return "上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成：只输出一个完整单行 JSON；必须包含 version=1、按顺序的 segments 和至少一条有效角色台词；不要续写、解释、代码块或普通聊天 {m,v}。";
+    return `上一次完整响应未通过统一见面结构校验（${error.detailCode}）。${contract}`;
+  return `上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成。${contract}`;
 }
 
 function retryDecisionOf(error: unknown, hasDistinctSecondary: boolean): MeetRetryDecision {
@@ -945,35 +992,22 @@ async function generateMeetTurnInternal(
         ordinal = (attemptIndex + 1) as 1 | 2,
         retryDecision = attemptIndex ? retryDecisionOf(lastError, hasDistinctSecondary) : undefined,
         budget = meetInputBudgetOf(attemptProvider, attemptIndex),
-        fitResult = (() => {
-          try { return { fitted: fitPrioritizedPromptSections(
-            [
-              ...promptSections,
-              ...(attemptIndex
-                ? [{ id: "retry-contract", content: retryInstructionOf(lastError), required: true } satisfies PrioritizedPromptSection]
-                : []),
-            ],
-            Math.max(2_000, budget.effective - 300),
-          ) }; } catch (error) { return { error }; }
-        })(),
-        fittedPrompt = fitResult.fitted ?? { text: "", estimatedTokens: 0, removedSections: [], requiredTokens: 0, coreTokens: 0, optionalTokens: 0 },
-        fittedPromptError = fitResult.error,
         compactStreamingRetry =
           attemptIndex === 1 && shouldUseCompactStreamingRetry(lastError),
-        messages = [
-          {
-            role: "system" as const,
-            content:
-              "你是茶茶机的线下连续场景引擎。一次生成整轮共享场景，严格遵守见面整轮 JSON 协议；不要使用普通聊天协议。",
-          },
-          {
-            role: "user" as const,
-            content: compactStreamingRetry
-              ? `${fittedPrompt.text}\n\n完整紧凑重生成：只输出单行 JSON，不得拼接上一次响应。`
-              : fittedPrompt.text,
-          },
+        attemptSections = [
+          ...promptSections,
+          ...(attemptIndex
+            ? [{ id: "retry-contract", content: retryInstructionOf(lastError), required: true } satisfies PrioritizedPromptSection]
+            : []),
         ],
-        inputTokens = estimateChatTokens(messages),
+        fitResult = (() => {
+          try { return fitMeetPromptMessages(attemptSections, budget.effective, compactStreamingRetry); }
+          catch (error) { return { error }; }
+        })(),
+        fittedPrompt = "fitted" in fitResult ? fitResult.fitted : { text: "", estimatedTokens: 0, removedSections: [], requiredTokens: 0, coreTokens: 0, optionalTokens: 0 },
+        fittedPromptError = "error" in fitResult ? fitResult.error : undefined,
+        messages = "messages" in fitResult ? fitResult.messages : [],
+        inputTokens = "inputTokens" in fitResult ? fitResult.inputTokens : 0,
         promptWasPruned = fittedPrompt.removedSections.length > 0,
         attemptMeta: NonNullable<
           NonNullable<MeetEntry["generation"]>["attempts"]
@@ -1046,7 +1080,7 @@ async function generateMeetTurnInternal(
       );
       const budgetOverflow = inputTokens > budget.effective;
       if(generationMeta.contextDiagnostics){generationMeta.contextDiagnostics.totalInputTokens=Math.max(generationMeta.contextDiagnostics.totalInputTokens,inputTokens);generationMeta.contextDiagnostics.actualInputTokens=inputTokens;}
-      generationMeta.actualInputTokens = inputTokens;
+      generationMeta.actualInputTokens = Math.max(generationMeta.actualInputTokens ?? 0, inputTokens);
       await safeUpdateGeneration();
       try {
         if (budgetOverflow) throw new MeetContextBudgetError(inputTokens, budget.effective);
@@ -1138,22 +1172,18 @@ async function generateMeetTurnInternal(
         const violation = meetRoundStyleViolation(parsed, settings);
         if (violation.styleInvalid)
           throw new MeetRoundValidationError("见面整轮文风或结构不符合要求", "style-invalid");
-        if (violation.belowMinimum || violation.aboveMaximum) {
-          const slightDeviation =
-            violation.count >= Math.floor(settings.minChars * 0.75) &&
-            violation.count <= Math.ceil(settings.maxChars * 1.25);
-          if (attemptIndex === 0 || !slightDeviation)
-            throw new MeetRoundValidationError(
-              `见面整轮正文篇幅未达到设置范围（需要 ${settings.minChars}-${settings.maxChars} 字，实际 ${violation.count} 字）`,
-              "length-out-of-range",
-            );
-          lengthWarning = `本轮正文为 ${violation.count} 字，略偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
+        if ((violation.belowMinimum || violation.aboveMaximum) && attemptIndex === 0) {
+          lengthWarning = `本轮正文为 ${violation.count} 字，偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
         }
         payload = parsed;
         successfulAttempt = ordinal;
         successfulProvider = attemptProvider;
         generationMeta.failureClass = undefined;
         generationMeta.failureDetailCode = undefined;
+        generationMeta.failureSegmentIndex = undefined;
+        generationMeta.failureSegmentType = undefined;
+        generationMeta.failureField = undefined;
+        generationMeta.segmentCount = undefined;
         lastError = undefined;
         break;
       } catch (error) {
@@ -1188,6 +1218,8 @@ async function generateMeetTurnInternal(
         attemptMeta.failureDetailCode = meetFailureDetailCodeOf(error);
         generationMeta.failureClass = meetFailureClassOf(error);
         generationMeta.failureDetailCode = meetFailureDetailCodeOf(error);
+        Object.assign(attemptMeta, meetFailureDiagnosticsOf(error));
+        Object.assign(generationMeta, meetFailureDiagnosticsOf(error));
         if (error instanceof ProviderError) {
           const resolvedProtocol = resolveProviderProtocol(attemptProvider);
           attemptMeta.providerProtocol ??= resolvedProtocol;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ProviderError } from "./provider";
-import { MEET_ROUND_INPUT_BUDGET, meetInputBudgetOf, shouldUseSecondaryMeetProvider } from "./meetService";
+import { MEET_ROUND_INPUT_BUDGET, fitMeetPromptMessages, meetInputBudgetOf, shouldUseSecondaryMeetProvider } from "./meetService";
 import { defaultProvider } from "./types";
 
 describe("meet context budget",()=>{
@@ -28,5 +28,18 @@ describe("meet provider retry classification", () => {
   it("does not switch providers for ordinary protocol or content retries", () => {
     expect(shouldUseSecondaryMeetProvider(new Error("invalid meet round"))).toBe(false);
     expect(shouldUseSecondaryMeetProvider(new ProviderError("format", "truncated"))).toBe(false);
+  });
+
+  it("fits the final message envelope under the effective budget", () => {
+    const result = fitMeetPromptMessages([
+      { id: "required", content: "LATEST_USER".repeat(30), required: true },
+      { id: "history", content: "OLD_HISTORY".repeat(4000), priority: 0 },
+    ], 500, false);
+    expect(result.inputTokens).toBeLessThanOrEqual(500);
+    expect(result.messages.at(-1)?.content).toContain("LATEST_USER");
+  });
+
+  it("fails before transport when immutable prompt sections exceed the budget", () => {
+    expect(() => fitMeetPromptMessages([{ id: "latest", content: "LATEST".repeat(1000), required: true }], 100, false)).toThrow();
   });
 });
