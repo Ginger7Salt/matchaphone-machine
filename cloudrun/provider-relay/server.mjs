@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import dns from "node:dns/promises";
 import net from "node:net";
 import { Agent } from "undici";
+import { pathToFileURL } from "node:url";
 
 export const MAX_REQUEST_BYTES = 6 * 1024 * 1024;
 export const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
@@ -151,45 +152,79 @@ async function proxy(res, input, requestId, origin, dependencies) {
   const { fetchImpl, resolver, verifyLicenseImpl, limiter, now, responseLimit } = dependencies;
   validateRelayInput(input, verifyLicenseImpl);
   const release = limiter.acquire(rateKey(input.activationLicense));
-  const started = now(); let responseBytes = 0;
+  const started = now();
+  let responseBytes = 0;
   try {
     const url = endpointOf(input.endpoint);
     const addresses = await resolvePublicAddresses(url.hostname, resolver);
     const timeoutMs = Math.max(MIN_TIMEOUT_MS, Math.min(MAX_TIMEOUT_MS, Number(input.timeoutMs) || 60_000));
-    const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const dispatcher = agentFor(addresses);
     let upstream;
     try {
-      upstream = await fetchImpl(url, { method: input.method, headers: headersFor(input.protocol, input.apiKey), body: input.method === "POST" ? input.body : undefined, redirect: "error", signal: controller.signal, dispatcher: agentFor(addresses) });
+      upstream = await fetchImpl(url, {
+        method: input.method,
+        headers: headersFor(input.protocol, input.apiKey),
+        body: input.method === "POST" ? input.body : undefined,
+        redirect: "error",
+        signal: controller.signal,
+        dispatcher,
+      });
     } catch (error) {
-      if (controller.signal.aborted) throw new RelayInputError("relay-timeout", "Provider 请求超时", 504);
-      throw new RelayInputError("relay-unavailable", "无法连接 Provider", 502);
-    } finally { clearTimeout(timer); }
-    const declaredLength = Number(upstream.headers.get("content-length"));
-    if (Number.isFinite(declaredLength) && declaredLength > responseLimit) throw new RelayInputError("relay-response-too-large", "Provider 响应过大", 502);
-    const contentType = upstream.headers.get("content-type") || "application/octet-stream";
-    const streaming = /(?:text\/event-stream|application\/(?:x-)?ndjson|application\/json-seq)/i.test(contentType);
-    const outHeaders = { "Cache-Control": "no-store", "Content-Type": contentType, "X-Relay-Request-Id": requestId, "X-Upstream-Status": String(upstream.status), "X-Relay-Duration-Ms": String(now() - started), ...corsHeaders(origin) };
-    const retryAfter = upstream.headers.get("retry-after"); if (retryAfter) outHeaders["Retry-After"] = retryAfter;
-    if (!streaming) {
-      const body = Buffer.from(await upstream.arrayBuffer());
-      responseBytes = body.byteLength;
-      if (responseBytes > responseLimit) throw new RelayInputError("relay-response-too-large", "Provider 响应过大", 502);
-      outHeaders["X-Upstream-Bytes"] = String(responseBytes);
-      res.writeHead(upstream.status, outHeaders); res.end(body);
-    } else {
-      if (Number.isFinite(declaredLength)) outHeaders["X-Upstream-Bytes"] = String(declaredLength);
-      res.writeHead(upstream.status, outHeaders);
-      if (upstream.body) for await (const chunk of upstream.body) {
-        responseBytes += chunk.byteLength;
-        if (responseBytes > responseLimit) { res.destroy(); throw new RelayInputError("relay-response-too-large", "Provider 响应过大", 502); }
-        res.write(chunk);
-      }
-      res.end();
+      clearTimeout(timer);
+      await dispatcher.close().catch(() => undefined);
+      if (controller.signal.aborted) throw new RelayInputError("relay-timeout", "Provider request timed out", 504);
+      throw new RelayInputError("relay-unavailable", "Unable to connect to Provider", 502);
     }
-    return { status: upstream.status, responseBytes, durationMs: now() - started };
-  } finally { release(); }
+    try {
+      const declaredLength = Number(upstream.headers.get("content-length"));
+      if (Number.isFinite(declaredLength) && declaredLength > responseLimit)
+        throw new RelayInputError("relay-response-too-large", "Provider response too large", 502);
+      const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+      const streaming = /(?:text\/event-stream|application\/(?:x-)?ndjson|application\/json-seq)/i.test(contentType);
+      const outHeaders = {
+        "Cache-Control": "no-store",
+        "Content-Type": contentType,
+        "X-Relay-Request-Id": requestId,
+        "X-Upstream-Status": String(upstream.status),
+        "X-Relay-Duration-Ms": String(now() - started),
+        ...corsHeaders(origin),
+      };
+      const retryAfter = upstream.headers.get("retry-after");
+      if (retryAfter) outHeaders["Retry-After"] = retryAfter;
+      if (!streaming) {
+        const body = Buffer.from(await upstream.arrayBuffer());
+        responseBytes = body.byteLength;
+        if (responseBytes > responseLimit)
+          throw new RelayInputError("relay-response-too-large", "Provider response too large", 502);
+        outHeaders["X-Upstream-Bytes"] = String(responseBytes);
+        res.writeHead(upstream.status, outHeaders);
+        res.end(body);
+      } else {
+        if (Number.isFinite(declaredLength)) outHeaders["X-Upstream-Bytes"] = String(declaredLength);
+        res.writeHead(upstream.status, outHeaders);
+        if (upstream.body) {
+          for await (const chunk of upstream.body) {
+            responseBytes += chunk.byteLength;
+            if (responseBytes > responseLimit) {
+              res.destroy();
+              throw new RelayInputError("relay-response-too-large", "Provider response too large", 502);
+            }
+            res.write(chunk);
+          }
+        }
+        res.end();
+      }
+      return { status: upstream.status, responseBytes, durationMs: now() - started };
+    } finally {
+      clearTimeout(timer);
+      await dispatcher.close().catch(() => undefined);
+    }
+  } finally {
+    release();
+  }
 }
-
 export function createServer(options = {}) {
   const now = options.now ?? Date.now;
   const logger = options.logger ?? console;
@@ -222,4 +257,5 @@ export function createServer(options = {}) {
   });
 }
 
-if (process.env.NODE_ENV !== "test" && !process.env.NODE_TEST_CONTEXT) createServer().listen(Number(process.env.PORT) || 8080, "0.0.0.0");
+const isDirectRun = process.argv[1] ? pathToFileURL(process.argv[1]).href === import.meta.url : false;
+if (isDirectRun && process.env.NODE_ENV !== "test" && !process.env.NODE_TEST_CONTEXT) createServer().listen(Number(process.env.PORT) || 8080, "0.0.0.0");

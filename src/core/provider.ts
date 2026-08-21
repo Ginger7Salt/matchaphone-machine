@@ -109,6 +109,8 @@ export interface ProviderChatOptions {
   temperature?: number;
   /** null disables the provider-owned timeout while preserving caller cancellation. */
   timeoutMs?: number | null;
+  connectTimeoutMs?: number | null;
+  streamIdleTimeoutMs?: number | null;
 }
 export interface ProviderModelDiscovery {
   supported: boolean;
@@ -602,7 +604,9 @@ function kindOfSuccessfulError(value: JsonRecord): ApiErrorKind {
   if (/rate|quota|billing|credit|limit/i.test(text)) return "rate";
   if (/model|not.?found/i.test(text)) return "model";
   if (/timeout|timed.?out/i.test(text)) return "timeout";
-  if (/server|gateway|unavailable|overload/i.test(text)) return "server";
+  if (/context|token|too.?long|maximum|length/i.test(text)) return "context";
+  if (/protocol|endpoint|unsupported.*(?:format|request)|invalid.*(?:format|request)/i.test(text)) return "protocol";
+  if (/server|gateway|unavailable|overload|cloudflare|nginx/i.test(text)) return "server";
   return "format";
 }
 interface ResponseTransportMetadata {
@@ -910,32 +914,75 @@ function parseSseOrNdjson(
     if (parsePayload(carry) === "invalid") malformedCount += 1;
     carry = "";
   }
-  if (!parsedCount || (!deltaChunks.length && !genericChunks.length && !completeObjects.length)) return undefined;
+  if (!parsedCount) return undefined;
+  if (!deltaChunks.length && !genericChunks.length && !completeObjects.length) {
+    const providerCode = signals.refusal ? "provider_refusal" : signals.reasoning ? "reasoning_only" : signals.tool ? "tool_only_response" : "empty_stream";
+    const detail = signals.refusal
+      ? sanitizeApiErrorText(signals.refusal, secrets) || "服务拒绝了本次请求"
+      : signals.reasoning
+        ? "服务只返回了推理内容，没有返回可见正文"
+        : signals.tool
+          ? "服务只返回了工具调用，没有返回可见正文"
+          : "流式响应只有状态、用量或结束事件，没有可见正文";
+    throw new ProviderResponseParseError("format", detail, {
+      providerCode,
+      detail,
+      responseShape: `${mode}-empty`,
+      rawLength: raw.length,
+      contentType,
+      visibleCandidatePaths,
+      failureStage: "provider-parse",
+      ...transportMetaFields(transportMeta),
+    });
+  }
   let sseMode: "delta" | "snapshot" | "complete-object" = "delta";
   let combined = "";
   let selectedPath: string | undefined;
+  let normalized: ProviderChatResult;
+  const parseTransportCandidate = (candidate: string) => parseChatResponse(
+    candidate,
+    "application/json",
+    secrets,
+    transportMeta ? { ...transportMeta, transportMode: mode } : undefined,
+  );
   if (completeObjects.length) {
-    const selected = completeObjects.at(-1)!;
-    combined = selected.text;
-    selectedPath = selected.path;
-    sseMode = "complete-object";
+    let lastError: unknown;
+    // Prefer the last complete visible object that still parses. A provider
+    // may append metadata or a malformed snapshot after a valid full object.
+    for (let index = completeObjects.length - 1; index >= 0; index -= 1) {
+      const candidate = completeObjects[index]!;
+      try {
+        normalized = parseTransportCandidate(candidate.text);
+        combined = candidate.text;
+        selectedPath = candidate.path;
+        sseMode = "complete-object";
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (!normalized!) throw lastError ?? new ProviderResponseParseError("format", "??????????", {
+      providerCode: "invalid_response",
+      responseShape: mode + ":complete-object",
+      rawLength: raw.length,
+      contentType,
+      visibleCandidatePaths,
+      failureStage: "provider-parse",
+      ...transportMetaFields(transportMeta),
+    });
   } else if (deltaChunks.length) {
     combined = deltaChunks.map((chunk) => chunk.text).join("");
     selectedPath = deltaChunks[0]?.path;
+    normalized = parseTransportCandidate(combined);
   } else {
     for (const chunk of genericChunks) {
       if (!combined) { combined = chunk.text; selectedPath = chunk.path; }
       else if (chunk.text.startsWith(combined)) { combined = chunk.text; selectedPath = chunk.path; sseMode = "snapshot"; }
       else if (!combined.endsWith(chunk.text)) combined += chunk.text;
     }
+    normalized = parseTransportCandidate(combined);
   }
   try {
-    const normalized = parseChatResponse(
-      combined,
-      "application/json",
-      secrets,
-      transportMeta ? { ...transportMeta, transportMode: mode } : undefined,
-    );
     if (sseMode === "snapshot" || sseMode === "complete-object") onVisibleChunk?.(combined);
     else [...deltaChunks, ...genericChunks].forEach((chunk) => onVisibleChunk?.(chunk.text));
     return {
@@ -1491,34 +1538,61 @@ export class OpenAIProvider {
   }
   async chatWithMeta(messages: ChatItem[], opts: ProviderChatOptions = {}): Promise<ProviderChatResult> {
     const controller = new AbortController();
-    const timeoutMs = opts.timeoutMs === undefined ? this.settings.timeoutMs : opts.timeoutMs;
-    const timer = timeoutMs === null ? undefined : setTimeout(() => controller.abort("timeout"), timeoutMs);
+    const configuredTotal = opts.timeoutMs === undefined ? this.settings.timeoutMs : opts.timeoutMs;
+    const totalTimeoutMs = configuredTotal === null ? null : Math.max(1, configuredTotal);
+    const connectTimeoutMs = opts.connectTimeoutMs === null || totalTimeoutMs === null
+      ? null
+      : Math.min(totalTimeoutMs, Math.max(1, opts.connectTimeoutMs ?? 30_000));
+    const streamIdleTimeoutMs = opts.streamIdleTimeoutMs === null || totalTimeoutMs === null
+      ? null
+      : Math.min(totalTimeoutMs, Math.max(1, opts.streamIdleTimeoutMs ?? 45_000));
+    let timeoutCode: "connect-timeout" | "stream-idle-timeout" | "total-timeout" | undefined;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const abortForTimeout = (code: NonNullable<typeof timeoutCode>) => {
+      if (controller.signal.aborted) return;
+      timeoutCode = code;
+      controller.abort(code);
+    };
+    const totalTimer = totalTimeoutMs === null ? undefined : setTimeout(() => abortForTimeout("total-timeout"), totalTimeoutMs);
+    const clearConnectTimer = () => { if (connectTimer !== undefined) clearTimeout(connectTimer); connectTimer = undefined; };
+    const clearIdleTimer = () => { if (idleTimer !== undefined) clearTimeout(idleTimer); idleTimer = undefined; };
+    const armIdleTimer = () => {
+      clearIdleTimer();
+      if (streamIdleTimeoutMs !== null) idleTimer = setTimeout(() => abortForTimeout("stream-idle-timeout"), streamIdleTimeoutMs);
+    };
     const abort = () => controller.abort("user");
-    opts.signal?.addEventListener("abort", abort, { once: true });
+    const abortable = <T,>(promise: Promise<T>) => {
+      if (controller.signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+      return new Promise<T>((resolve, reject) => {
+        const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        promise.then(resolve, reject).finally(() => controller.signal.removeEventListener("abort", onAbort));
+      });
+    };
+    if (opts.signal?.aborted) abort();
+    else opts.signal?.addEventListener("abort", abort, { once: true });
     const stream = opts.stream ?? this.settings.stream;
-    let out = "";
+    let httpMeta: ProviderHttpMetadata | undefined;
     try {
       const endpoint = resolveProviderEndpoint({ ...this.settings, stream });
       const temperature = opts.temperature ?? this.settings.temperature;
       const body = JSON.stringify(protocolRequestBody(this.settings, messages, endpoint.protocol, stream, temperature));
-      const httpResult = await executeProviderHttp({ settings: this.settings, protocol: endpoint.protocol, endpoint: endpoint.url, operation: "chat", method: "POST", headers: providerHeaders(this.settings, endpoint.protocol), body, signal: controller.signal, timeoutMs: timeoutMs ?? this.settings.timeoutMs });
+      if (connectTimeoutMs !== null) connectTimer = setTimeout(() => abortForTimeout("connect-timeout"), connectTimeoutMs);
+      const httpResult = await executeProviderHttp({ settings: this.settings, protocol: endpoint.protocol, endpoint: endpoint.url, operation: "chat", method: "POST", headers: providerHeaders(this.settings, endpoint.protocol), body, signal: controller.signal, timeoutMs: totalTimeoutMs ?? this.settings.timeoutMs });
+      clearConnectTimer();
       const response = httpResult.response;
-      const httpMeta = httpResult.metadata;
+      httpMeta = httpResult.metadata;
       if (!response.ok)
-        throw this.mapStatus(
-          response.status,
-          await response.text(),
-          retryAfterSecondsOf(response.headers.get("Retry-After")),
-          providerMetadataFields(httpMeta),
-        );
+        throw this.mapStatus(response.status, await abortable(response.text()), retryAfterSecondsOf(response.headers.get("Retry-After")), providerMetadataFields(httpMeta));
       const contentType = response.headers.get("Content-Type") ?? undefined;
       const parseOrThrow = (raw: string, meta: ResponseTransportMetadata) => {
         try {
           const parsed = parseChatResponse(raw, contentType, [this.settings.apiKey], meta);
-          return { ...parsed, ...providerMetadataFields(httpMeta), adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (meta.transportMode === "sse" || meta.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
+          return { ...parsed, ...providerMetadataFields(httpMeta!), adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: (meta.transportMode === "sse" || meta.transportMode === "ndjson" ? "sse" : "json") as "sse" | "json" };
         } catch (error) {
           if (error instanceof ProviderResponseParseError)
-            throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
+            throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta!) });
           throw this.failure("format", "服务返回的数据格式无法识别，缺少可用正文", "", {
             providerCode: "invalid_response",
             detail: `响应结构无法提取正文；长度 ${raw.length}`,
@@ -1532,26 +1606,47 @@ export class OpenAIProvider {
         }
       };
       if (!stream) {
-        const raw = await response.text();
+        const raw = await abortable(response.text());
         const result = { ...parseOrThrow(raw, transportMetadataOf(response, raw, "non-stream")), ...providerMetadataFields(httpMeta) };
-        out = result.text;
         opts.onToken?.(result.text);
         return result;
       }
       if (!response.body)
-        throw this.failure("format", "服务没有返回数据流", "", {
-          providerCode: "missing_stream_body",
-          transportMode: "sse",
-        });
+        throw this.failure("format", "服务没有返回数据流", "", { providerCode: "empty_stream", transportMode: "sse", ...providerMetadataFields(httpMeta) });
       const reader = response.body.getReader();
+      const readChunk = () => {
+        if (controller.signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+        return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+          const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+          reader.read().then(resolve, reject).finally(() => controller.signal.removeEventListener("abort", onAbort));
+        });
+      };
       const decoder = new TextDecoder();
       let raw = "";
       let receivedBytes = 0;
+      armIdleTimer();
       while (true) {
         let chunk: ReadableStreamReadResult<Uint8Array>;
         try {
-          chunk = await reader.read();
-        } catch {
+          chunk = await readChunk();
+        } catch (readError) {
+          clearIdleTimer();
+          if (timeoutCode && raw.trim()) {
+            const partialContentType = (contentType ?? "").toLowerCase();
+            const partialLooksJson = /^[\[{"']/.test(raw.trim());
+            const partialLooksSse = /^\s*(?:data|event):/m.test(raw) || (/text\/event-stream/.test(partialContentType) && !partialLooksJson);
+            if (partialLooksSse) {
+              try {
+                const recovered = parseSseOrNdjson(raw, "sse", contentType, [this.settings.apiKey], transportMetadataOf(response, raw, "sse", receivedBytes));
+                if (recovered?.sseMode === "complete-object" && recovered.text.trim() && !recovered.truncated) {
+                  opts.onToken?.(recovered.text);
+                  return { ...recovered, ...providerMetadataFields(httpMeta), adapter: endpoint.protocol, endpointKind: endpoint.endpointKind, requestMode: endpoint.protocol, streamMode: "sse" };
+                }
+              } catch {}
+            }
+          }
+          if (controller.signal.aborted) throw readError;
           const meta = transportMetadataOf(response, raw, "sse", receivedBytes);
           throw this.failure("interrupted", "数据流意外中断", "", {
             providerCode: "transport_truncated",
@@ -1560,13 +1655,16 @@ export class OpenAIProvider {
             rawLength: raw.length,
             contentType,
             failureStage: "provider-parse",
+            ...providerMetadataFields(httpMeta),
             ...transportMetaFields({ ...meta, transportMarkedIncomplete: true }),
           });
         }
         if (chunk.done) break;
         receivedBytes += chunk.value.byteLength;
         raw += decoder.decode(chunk.value, { stream: true });
+        armIdleTimer();
       }
+      clearIdleTimer();
       raw += decoder.decode();
       const trimmedStream = raw.replace(/^\uFEFF/, "").trim();
       const contentTypeValue = (contentType ?? "").toLowerCase();
@@ -1577,18 +1675,16 @@ export class OpenAIProvider {
       let result: ProviderChatResult | undefined;
       if (looksSse) {
         const meta = transportMetadataOf(response, raw, "sse", receivedBytes);
-        try {
-          result = parseSseOrNdjson(raw, "sse", contentType, [this.settings.apiKey], meta, opts.onToken);
-        } catch (error) {
+        try { result = parseSseOrNdjson(raw, "sse", contentType, [this.settings.apiKey], meta, opts.onToken); }
+        catch (error) {
           if (error instanceof ProviderResponseParseError)
             throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
           throw error;
         }
       } else if (looksNdjson) {
         const meta = transportMetadataOf(response, raw, "ndjson", receivedBytes);
-        try {
-          result = parseSseOrNdjson(raw, "ndjson", contentType, [this.settings.apiKey], meta, opts.onToken);
-        } catch (error) {
+        try { result = parseSseOrNdjson(raw, "ndjson", contentType, [this.settings.apiKey], meta, opts.onToken); }
+        catch (error) {
           if (error instanceof ProviderResponseParseError)
             throw this.failure(error.kind, error.message, "", { ...error.meta, ...providerMetadataFields(httpMeta) });
           throw error;
@@ -1606,41 +1702,39 @@ export class OpenAIProvider {
           contentType,
           failureStage: "provider-parse",
           ...providerMetadataFields(httpMeta),
-          ...transportMetaFields(
-            transportMetadataOf(
-              response,
-              raw,
-              looksSse ? "sse" : looksNdjson ? "ndjson" : "json-fallback",
-              receivedBytes,
-            ),
-          ),
+          ...transportMetaFields(transportMetadataOf(response, raw, looksSse ? "sse" : looksNdjson ? "ndjson" : "json-fallback", receivedBytes)),
         });
-      out = result.text;
       if (!looksSse && !looksNdjson) opts.onToken?.(result.text);
       return result;
     } catch (error) {
       if (error instanceof ProviderRelayError) throw this.failure("relay", error.message, "", { providerCode: error.code, httpStatus: error.status, relayUsed: true, relayRequestId: error.relayRequestId, relayDurationMs: error.durationMs, networkMode: "relay", relayErrorCode: error.code, relayStatus: error.status, upstreamHttpStatus: error.upstreamHttpStatus, upstreamBytes: error.upstreamBytes });
       if (error instanceof ProviderError) throw error;
       if (controller.signal.aborted) {
-        if (controller.signal.reason === "timeout")
-          throw this.failure("timeout", "请求超时", "", { providerCode: "request_timeout" });
+        if (timeoutCode) {
+          const message = timeoutCode === "connect-timeout" ? "连接 Provider 超时" : timeoutCode === "stream-idle-timeout" ? "Provider 数据流长时间没有新内容" : "Provider 请求超过总等待时间";
+          throw this.failure("timeout", message, "", { providerCode: timeoutCode, detail: message, ...(httpMeta ? providerMetadataFields(httpMeta) : { networkMode: this.settings.networkMode === "direct" ? "direct" : "relay" }) });
+        }
         throw new ProviderError("aborted", "生成已停止", "");
       }
-      if (error instanceof TypeError)
-        throw this.failure("cors", "网络或跨域请求失败，请确认 API 支持浏览器 CORS", "", {
-          providerCode: "cors_or_fetch_failed",
-          detail: error.message,
-        });
+      if (error instanceof TypeError) {
+        const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+        if (this.settings.networkMode === "direct" && !offline)
+          throw this.failure("cors", "网络或跨域请求失败，请确认 API 支持浏览器 CORS", "", { providerCode: "cors_or_fetch_failed", detail: error.message, networkMode: "direct", relayUsed: false });
+        throw this.failure("network", "网络在请求过程中断开，服务商可能已经收到请求", "", { providerCode: "network-unknown-delivery", detail: error.message, networkMode: this.settings.networkMode === "direct" ? "direct" : "relay", relayUsed: this.settings.networkMode !== "direct" });
+      }
       throw this.failure("network", error instanceof Error ? error.message : "网络请求失败", "", {
-        providerCode: "network_error",
+        providerCode: "network-unknown-delivery",
         detail: error instanceof Error ? error.message : undefined,
+        networkMode: this.settings.networkMode === "direct" ? "direct" : "relay",
+        relayUsed: this.settings.networkMode !== "direct",
       });
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      clearConnectTimer();
+      clearIdleTimer();
+      if (totalTimer !== undefined) clearTimeout(totalTimer);
       opts.signal?.removeEventListener("abort", abort);
     }
-  }
-  async chat(messages: ChatItem[], opts: ProviderChatOptions = {}) {
+  }  async chat(messages: ChatItem[], opts: ProviderChatOptions = {}) {
     return (await this.chatWithMeta(messages, opts)).text;
   }
   async models() {

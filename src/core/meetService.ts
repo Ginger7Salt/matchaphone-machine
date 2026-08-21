@@ -1,9 +1,9 @@
-﻿import { db, getAppSettings, getProvider } from "./db";
+import { db, getAppSettings, getProvider } from "./db";
 import { enqueueBackgroundTask } from "./backgroundTasks";
 import { rewardIslandMeet } from "./coupleIsland";
 import { memoryExtractionSettingsOf } from "./memoryExtraction";
 import { userPersonaContext } from "./userPersona";
-import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, isContextOverflowError, resolveProviderProtocol } from "./provider";
+import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, createApiErrorInfo, isContextOverflowError, resolveProviderProtocol } from "./provider";
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
@@ -79,7 +79,7 @@ import {
   meetStyleViolation,
   meetRoundStyleViolation,
   parseMeetRoundResponse,
-  parseMeetRoundResponseWithMeta,
+  parseMeetRoundResponseResilient,
   MeetProtocolError,
 } from "./meetEngine";
 import { resolveSecondaryProvider } from "./modelServices";
@@ -128,6 +128,7 @@ function shouldUseCompactStreamingRetry(error: unknown) {
     "empty_stream",
     "reasoning_only",
     "tool_only_response",
+    "response_truncated",
   ].includes(code ?? "");
 }
 
@@ -144,7 +145,7 @@ function rateLimitFailureOf(error: unknown) {
 }
 export function shouldUseSecondaryMeetProvider(error: unknown) {
   if (!(error instanceof ProviderError)) return false;
-  return error.kind === "rate" || error.kind === "cors" || error.apiError?.providerCode === "prompt_blocked";
+  return error.kind === "rate" || error.kind === "server" || error.apiError?.providerCode === "prompt_blocked";
 }
 function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]>["failureClass"] {
   if (error instanceof MeetContextBudgetError) return "context-overflow";
@@ -153,8 +154,11 @@ function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]
     if (error.kind === "rate") return "provider-rate-limit";
     if (error.kind === "cors") return "provider-cors";
     if (error.kind === "timeout") return "provider-timeout";
+    if (["empty_response", "empty_stream", "reasoning_only", "tool_only_response"].includes(error.apiError?.providerCode ?? "")) return "provider-empty-response";
+    if (error.kind === "network") return "network-unknown-delivery";
+    if (error.apiError?.relayErrorCode === "relay-activation-invalid" || error.apiError?.providerCode === "relay-activation-invalid") return "relay-activation-invalid";
     if (error.apiError?.providerCode === "prompt_blocked") return "provider-prompt-blocked";
-    if (error.apiError?.transportMarkedIncomplete || error.apiError?.providerCode === "transport_truncated" || error.apiError?.providerCode === "truncated_json") return "response-truncated";
+    if (error.apiError?.transportMarkedIncomplete || error.apiError?.providerCode === "transport_truncated" || error.apiError?.providerCode === "truncated_json" || error.apiError?.providerCode === "response_truncated") return "response-truncated";
     return "response-invalid";
   }
   if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError) return "invalid-meet-round";
@@ -327,6 +331,124 @@ export interface MeetTurnResult {
   warning?: string;
 }
 
+export interface PendingMeetSave {
+  version: 1;
+  sessionId: string;
+  roundId: string;
+  userEntryId: string;
+  runId: string;
+  generatedEntries: MeetEntry[];
+  completedGeneration: NonNullable<MeetEntry["generation"]>;
+  narrativeSettings: MeetNarrativeSettings;
+  sceneState: MeetSession["sceneState"];
+  plotState: MeetSession["plotState"];
+  createdAt: number;
+}
+
+const pendingMeetSaveKey = (sessionId: string, userEntryId: string) =>
+  `meet-pending-save:${sessionId}:${userEntryId}`;
+const pendingMeetSaveMemory = new Map<string, PendingMeetSave>();
+
+function sessionStore() {
+  try { return typeof sessionStorage === "undefined" ? undefined : sessionStorage; }
+  catch { return undefined; }
+}
+
+export function getPendingMeetSave(sessionId: string, userEntryId: string): PendingMeetSave | undefined {
+  const key = pendingMeetSaveKey(sessionId, userEntryId);
+  const memory = pendingMeetSaveMemory.get(key);
+  if (memory) return memory;
+  try {
+    const raw = sessionStore()?.getItem(key);
+    if (!raw) return undefined;
+    const value = JSON.parse(raw) as PendingMeetSave;
+    if (value?.version !== 1 || value.sessionId !== sessionId || value.userEntryId !== userEntryId) return undefined;
+    pendingMeetSaveMemory.set(key, value);
+    return value;
+  } catch { return undefined; }
+}
+
+function storePendingMeetSave(value: PendingMeetSave) {
+  const key = pendingMeetSaveKey(value.sessionId, value.userEntryId);
+  pendingMeetSaveMemory.set(key, value);
+  try { sessionStore()?.setItem(key, JSON.stringify(value)); }
+  catch {}
+}
+
+function clearPendingMeetSave(sessionId: string, userEntryId: string) {
+  const key = pendingMeetSaveKey(sessionId, userEntryId);
+  pendingMeetSaveMemory.delete(key);
+  try { sessionStore()?.removeItem(key); }
+  catch {}
+}
+
+export function pendingMeetSavePlainText(value: PendingMeetSave) {
+  return value.generatedEntries.map((entry) => meetEntryPlainText(entry)).filter(Boolean).join("\n\n");
+}
+
+async function persistPendingMeetSave(value: PendingMeetSave) {
+  await db.transaction("rw", db.meetSessions, async () => {
+    const current = await db.meetSessions.get(value.sessionId);
+    if (!current || current.status !== "active") throw new Error("见面状态已经变化");
+    const currentUser = current.entries.find((entry) => entry.id === value.userEntryId);
+    if (currentUser?.generation?.runId !== value.runId) throw new StaleMeetRoundError();
+    const withoutOldRoundOutputs = current.entries.filter(
+      (entry) => entry.roundId !== value.roundId || entry.senderType === "user",
+    );
+    const completedEntries = withoutOldRoundOutputs.map((entry) =>
+      entry.id === value.userEntryId
+        ? { ...entry, generation: { ...value.completedGeneration, status: "complete" as const, saveResult: "saved" as const, pendingSave: false, recoveryAction: undefined, error: undefined } }
+        : entry,
+    );
+    const userIndex = completedEntries.findIndex((entry) => entry.id === value.userEntryId);
+    if (userIndex < 0) throw new Error("没有找到待保存的用户轮次");
+    completedEntries.splice(userIndex + 1, 0, ...value.generatedEntries);
+    await db.meetSessions.put({
+      ...current,
+      entries: completedEntries,
+      narrativeSettings: value.narrativeSettings,
+      sceneState: value.sceneState,
+      plotState: value.plotState,
+      lastActivityAt: value.generatedEntries.at(-1)?.createdAt ?? current.lastActivityAt,
+      updatedAt: now(),
+    });
+  });
+}
+
+async function persistPendingMeetSaveWithRetries(value: PendingMeetSave) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      if (!db.isOpen()) await db.open();
+      await persistPendingMeetSave(value);
+      return;
+    } catch (error) {
+      if (error instanceof StaleMeetRoundError) throw error;
+      lastError = error;
+      if (attempt < 2) {
+        if (!db.isOpen()) await db.open().catch(() => undefined);
+        await new Promise((resolve) => setTimeout(resolve, 120 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError ?? new Error("本地保存失败");
+}
+
+export async function retryPendingMeetSave(sessionId: string, userEntryId: string) {
+  const pending = getPendingMeetSave(sessionId, userEntryId);
+  if (!pending) throw new Error("没有找到待重新保存的场景");
+  await persistPendingMeetSaveWithRetries(pending);
+  clearPendingMeetSave(sessionId, userEntryId);
+  return pending.generatedEntries;
+}
+
+function storageFailureMessage(error: unknown, preservedExistingRound: boolean) {
+  const name = error && typeof error === "object" && "name" in error ? String(error.name) : "UnknownError";
+  if (name === "QuotaExceededError") return "场景已生成，但本地存储空间不足；可以复制本轮内容或清理空间后重新保存";
+  if (name === "DatabaseClosedError") return "场景已生成，但本地数据库连接已关闭；请重新保存";
+  if (name === "TransactionInactiveError") return "场景已生成，但保存事务已失效；请重新保存";
+  return preservedExistingRound ? "新场景保存失败，已保留原场景；可以重新保存新结果" : "场景已经生成，但本地保存失败；可以重新保存或复制本轮内容";
+}
 export async function generateMeetTurn(
   sessionId: string,
   userText: string,
@@ -495,19 +617,30 @@ function meetFailureDiagnosticsOf(error: unknown) {
 }
 
 function retryInstructionOf(error: unknown) {
-  const contract = "只输出一个完整单行 JSON 对象；version 必须为数字 1；segments 必须是非空数组；type 只能是 narration 或 dialogue；每个片段必须有非空 text；dialogue 必须使用当前参与角色的稳定 characterId；至少包含一条合法 dialogue；不得使用 speech、action 或其他未知片段类型；不得输出 Markdown、解释、代码块或普通聊天 {m,v}；不得续写或拼接上一次失败响应。";
+  const contract = "不要输出 JSON、Markdown、解释或代码块。只输出场景正文，每行一个片段：[N] 旁白、环境或动作；[D:角色稳定ID] 角色说出口的话；[T:角色稳定ID] 可展示思想。只能使用当前参与角色稳定ID；优先保证正文和台词完整，不得续写或携带上一次失败响应。";
   if (shouldUseCompactStreamingRetry(error))
-    return `上一次响应未形成完整可解析的正文。本次使用更短上下文重新生成。${contract}`;
-  if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError)
-    return `上一次完整响应未通过统一见面结构校验（${error.detailCode}）。${contract}`;
-  return `上一次未得到完整有效的见面整轮对象。本次使用更短上下文重新生成。${contract}`;
+    return `上一次响应为空、截断或没有形成可见正文。本次使用更短上下文重新生成。${contract}`;
+  return `上一次响应没有形成可安全保存的完整正文。${contract}`;
 }
 
+function shouldRetrySameMeetProvider(error: unknown) {
+  return shouldUseCompactStreamingRetry(error) || error instanceof MeetRoundValidationError || error instanceof MeetProtocolError;
+}
 function retryDecisionOf(error: unknown, hasDistinctSecondary: boolean): MeetRetryDecision {
   if (shouldUseSecondaryMeetProvider(error))
     return hasDistinctSecondary ? "secondary-fallback" : "stop-no-distinct-secondary";
   if (shouldUseCompactStreamingRetry(error)) return "compact-primary-retry";
-  return "structure-primary-retry";
+  if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError) return "structure-primary-retry";
+  return "stop-unsafe-retry";
+}
+function recoveryActionOf(error: unknown): NonNullable<MeetEntry["generation"]>["recoveryAction"] {
+  if (error instanceof ProviderError) {
+    if (error.kind === "cors") return "switch-to-relay";
+    if (error.kind === "auth") return "open-provider-settings";
+    if (error.kind === "model" || error.kind === "protocol") return "select-model";
+    if (error.apiError?.relayErrorCode === "relay-activation-invalid" || error.apiError?.providerCode === "relay-activation-invalid") return "check-activation";
+  }
+  return "retry-generation";
 }
 
 function meetAttemptErrorKind(error: unknown) {
@@ -644,6 +777,7 @@ async function generateMeetTurnInternal(
       stage: "requesting",
       saveResult: "not-attempted",
       attempts: [],
+      requestDeliveryState: "not-sent",
     },
     userEntry: MeetEntry = existingUserEntry
       ? {
@@ -677,6 +811,21 @@ async function generateMeetTurnInternal(
   await db.transaction("rw", db.meetSessions, async () => {
     await db.meetSessions.put(sessionForTurn);
   });
+
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    const offlineGeneration: NonNullable<MeetEntry["generation"]> = {
+      ...initialGeneration,
+      status: "failed",
+      stage: "waiting-network",
+      failureClass: "network-offline",
+      recoveryAction: "retry-generation",
+      requestDeliveryState: "not-sent",
+      error: "当前网络不可用，内容已经保留",
+      saveResult: "not-attempted",
+    };
+    await updateMeetGeneration(session.id, userEntry.id, offlineGeneration, runId);
+    throw new Error(offlineGeneration.error);
+  }
 
   const meetTransport = new BrowserDirectProviderTransport();
   const [provider, memories, loreBooks, conversation, appSettings, onlineMessages] =
@@ -809,7 +958,10 @@ async function generateMeetTurnInternal(
     successfulProvider = provider,
     fallbackUsed = false,
     lastError: unknown,
-    lengthWarning: string | undefined;
+    lengthWarning: string | undefined,
+    partialPayload: MeetRoundPayload | undefined,
+    partialVisibleLength = 0,
+    partialProvider = provider;
   const generationMeta: NonNullable<MeetEntry["generation"]> = {
     ...initialGeneration,
     contextPruned: false,
@@ -854,30 +1006,18 @@ async function generateMeetTurnInternal(
     } catch {}
   };
 
-  if (!provider.apiKey) {
-    const fallback = fallbackReply(
-        characters[0],
-        text,
-        settings.thoughtsEnabled,
-      ).replies[0],
-      segments: MeetRoundPayload["segments"] = [
-        { type: "narration", text: fallback.prose },
-        {
-          type: "dialogue",
-          characterId: fallback.characterId,
-          text: fallback.dialogue,
-        },
-      ];
-    payload = {
-      version: 1,
-      segments,
-      thoughts:
-        settings.thoughtsEnabled && fallback.thought
-          ? [{ characterId: fallback.characterId, text: fallback.thought }]
-          : undefined,
-      suggestions: [],
-    };
-  } else {
+  if (!provider.apiKey.trim()) {
+    generationMeta.status = "failed";
+    generationMeta.stage = "preflight";
+    generationMeta.failureClass = "response-invalid";
+    generationMeta.recoveryAction = "open-provider-settings";
+    generationMeta.requestDeliveryState = "not-sent";
+    generationMeta.saveResult = "not-attempted";
+    generationMeta.error = "请先配置可用的 Provider API Key 和模型";
+    await safeUpdateGeneration();
+    throw new Error(generationMeta.error);
+  }
+  {
     const secondaryProvider = await resolveSecondaryProvider(provider).catch(() => provider),
       hasDistinctSecondary = isDistinctProvider(provider, secondaryProvider),
       promptSections: PrioritizedPromptSection[] = [
@@ -978,6 +1118,15 @@ async function generateMeetTurnInternal(
     ];
 
     for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+      if (attemptIndex === 1 && lastError && !shouldUseSecondaryMeetProvider(lastError) && !shouldRetrySameMeetProvider(lastError)) {
+        generationMeta.retryDecision = "stop-unsafe-retry";
+        generationMeta.recoveryAction = recoveryActionOf(lastError);
+        generationMeta.sameProviderRetryPrevented = true;
+        const previousAttempt = generationMeta.attempts?.at(-1);
+        if (previousAttempt) previousAttempt.retryDecision = "stop-unsafe-retry";
+        await safeUpdateGeneration();
+        break;
+      }
       const fallbackRequested = attemptIndex === 1 && shouldUseSecondaryMeetProvider(lastError);
       if (fallbackRequested && !hasDistinctSecondary) {
         generationMeta.retryDecision = "stop-no-distinct-secondary";
@@ -1084,6 +1233,8 @@ async function generateMeetTurnInternal(
       await safeUpdateGeneration();
       try {
         if (budgetOverflow) throw new MeetContextBudgetError(inputTokens, budget.effective);
+        generationMeta.requestDeliveryState = "possibly-sent";
+        await safeUpdateGeneration();
         const response = await meetTransport.chat({
           ...attemptProvider,
           stream: compactStreamingRetry,
@@ -1095,7 +1246,9 @@ async function generateMeetTurnInternal(
         }, messages, {
           stream: compactStreamingRetry,
           signal,
-          timeoutMs: null,
+          timeoutMs: 180_000,
+          connectTimeoutMs: 30_000,
+          streamIdleTimeoutMs: 45_000,
           temperature: attemptProvider.temperature,
         });
         Object.assign(attemptMeta, {
@@ -1130,6 +1283,7 @@ async function generateMeetTurnInternal(
         }
         Object.assign(generationMeta, {
           stage: "parsing" as const,
+          requestDeliveryState: "responded" as const,
           responseShape: response.responseShape,
           rawLength: response.rawLength,
           outputTokens: response.outputTokens,
@@ -1151,30 +1305,56 @@ async function generateMeetTurnInternal(
         });
         await safeUpdateGeneration();
 
+        if (response.truncated) {
+          throw new ProviderError("format", "Provider 返回的响应被明确截断", response.text, createApiErrorInfo("format", {
+            providerCode: "response_truncated",
+            detail: "Provider 明确返回了长度或 Token 截断状态",
+            responseShape: response.responseShape,
+            rawLength: response.rawLength,
+            finishReason: response.finishReason,
+            transportMarkedIncomplete: true,
+            networkMode: response.networkMode,
+            relayUsed: response.relayUsed,
+            relayRequestId: response.relayRequestId,
+            relayStatus: response.relayStatus,
+            relayErrorCode: response.relayErrorCode,
+            relayDurationMs: response.relayDurationMs,
+            upstreamHttpStatus: response.upstreamHttpStatus,
+            upstreamBytes: response.upstreamBytes,
+          }));
+        }
+
         generationMeta.stage = "normalizing";
         generationMeta.normalizedResponse = true;
         generationMeta.responseNormalized = true;
         await safeUpdateGeneration();
-        const parsedResult = parseMeetRoundResponseWithMeta(
+        const parsedResult = parseMeetRoundResponseResilient(
           response.text,
           characters.map((character) => character.id),
           {
             thoughtsEnabled: settings.thoughtsEnabled,
             bilingualCharacterIds,
+            participantNames: Object.fromEntries(characters.map((character) => [character.id, character.name])),
           },
         );
         generationMeta.repairApplied = Boolean(parsedResult.repairApplied);
         generationMeta.repairRejected = false;
+        generationMeta.meetParseMode = parsedResult.parseMode;
+        generationMeta.visibleContentAccepted = true;
+        generationMeta.visibleSourceLength = parsedResult.visibleSourceLength;
+        generationMeta.salvagedSegmentCount = parsedResult.salvagedSegmentCount;
+        generationMeta.ignoredMetadataCount = parsedResult.ignoredMetadataCount;
+        generationMeta.unknownSpeakerCount = parsedResult.unknownSpeakerCount;
+        generationMeta.plainTextFallbackUsed = parsedResult.parseMode === "plain-visible-text";
         const parsed = parsedResult.payload;
         attemptMeta.stage = "validating";
         generationMeta.stage = "validating";
         await safeUpdateGeneration();
         const violation = meetRoundStyleViolation(parsed, settings);
         if (violation.styleInvalid)
-          throw new MeetRoundValidationError("见面整轮文风或结构不符合要求", "style-invalid");
-        if ((violation.belowMinimum || violation.aboveMaximum) && attemptIndex === 0) {
+          parsed.warnings = [...new Set([...(parsed.warnings ?? []), "本轮文风偏离当前设置，已保留完整场景"])];
+        if (violation.belowMinimum || violation.aboveMaximum)
           lengthWarning = `本轮正文为 ${violation.count} 字，偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
-        }
         payload = parsed;
         successfulAttempt = ordinal;
         successfulProvider = attemptProvider;
@@ -1201,11 +1381,46 @@ async function generateMeetTurnInternal(
           break;
         }
         if (error instanceof ProviderError && error.kind === "aborted") {
+          lastError = error;
           attemptMeta.errorKind = error.kind;
+          attemptMeta.retryDecision = "stop-unsafe-retry";
+          generationMeta.status = "cancelled";
+          generationMeta.failureClass = "aborted";
+          generationMeta.recoveryAction = "retry-generation";
+          generationMeta.retryDecision = "stop-unsafe-retry";
+          generationMeta.saveResult = "not-attempted";
           await safeUpdateGeneration();
-          throw error;
+          break;
         }
         lastError = error;
+        if (error instanceof ProviderError && error.apiError?.providerCode === "response_truncated" && error.partial.trim()) {
+          try {
+            const trimmedPartial = error.partial.trimStart();
+            const lastLineBreak = Math.max(error.partial.lastIndexOf("\n"), error.partial.lastIndexOf("\r"));
+            const completeFragmentSource = /^\{/.test(trimmedPartial) || /^\[\s*(?:\{|\[|\")/.test(trimmedPartial)
+              ? error.partial
+              : lastLineBreak >= 0
+                ? error.partial.slice(0, lastLineBreak)
+                : "";
+            if (!completeFragmentSource.trim()) throw new Error("没有完整片段");
+            const recovered = parseMeetRoundResponseResilient(completeFragmentSource, characters.map((character) => character.id), {
+              thoughtsEnabled: false,
+              bilingualCharacterIds: [],
+              participantNames: Object.fromEntries(characters.map((character) => [character.id, character.name])),
+            });
+            if (recovered.visibleSourceLength > partialVisibleLength) {
+              partialPayload = {
+                ...recovered.payload,
+                thoughts: undefined,
+                updates: undefined,
+                suggestions: undefined,
+                warnings: [...new Set([...(recovered.payload.warnings ?? []), "此场景来自被截断响应中的完整片段"])],
+              };
+              partialVisibleLength = recovered.visibleSourceLength;
+              partialProvider = attemptProvider;
+            }
+          } catch {}
+        }
         if (!(error instanceof ProviderError)) generationMeta.repairRejected = true;
         if (
           error instanceof ProviderError &&
@@ -1232,6 +1447,10 @@ async function generateMeetTurnInternal(
           if (error.kind === "relay") generationMeta.connectivityFailure = error.apiError?.relayErrorCode ?? "relay";
           Object.assign(attemptMeta, { networkMode: error.apiError?.networkMode, relayUsed: error.apiError?.relayUsed, relayRequestId: error.apiError?.relayRequestId, relayStatus: error.apiError?.relayStatus, relayErrorCode: error.apiError?.relayErrorCode, relayDurationMs: error.apiError?.relayDurationMs, upstreamHttpStatus: error.apiError?.upstreamHttpStatus, upstreamBytes: error.apiError?.upstreamBytes });
           Object.assign(generationMeta, { networkMode: error.apiError?.networkMode, relayUsed: error.apiError?.relayUsed, relayRequestId: error.apiError?.relayRequestId, relayStatus: error.apiError?.relayStatus, relayErrorCode: error.apiError?.relayErrorCode, relayDurationMs: error.apiError?.relayDurationMs, upstreamHttpStatus: error.apiError?.upstreamHttpStatus, upstreamBytes: error.apiError?.upstreamBytes });
+          if (error.apiError?.relayErrorCode === "relay-activation-invalid" || error.apiError?.providerCode === "relay-activation-invalid") {
+            generationMeta.stage = "preflight";
+            generationMeta.requestDeliveryState = "not-sent";
+          }
           if (error.kind === "protocol" || error.apiError?.kind === "protocol") generationMeta.protocolMismatch = true;
           attemptMeta.httpStatus = error.apiError?.httpStatus;
           attemptMeta.retryAfterSeconds = error.apiError?.retryAfterSeconds;
@@ -1251,7 +1470,8 @@ async function generateMeetTurnInternal(
             error.apiError?.transportMarkedIncomplete,
           );
         }
-        generationMeta.stage = attemptMeta.stage;
+        if (generationMeta.stage !== "preflight") generationMeta.stage = attemptMeta.stage;
+        generationMeta.recoveryAction = recoveryActionOf(error);
         const nextDecision = retryDecisionOf(error, hasDistinctSecondary);
         attemptMeta.retryDecision = attemptIndex === 1 ? "stop-after-second-attempt" : nextDecision;
         generationMeta.retryDecision = attemptMeta.retryDecision;
@@ -1262,8 +1482,51 @@ async function generateMeetTurnInternal(
     }
   }
 
+  if (!payload && partialPayload && generationMeta.failureClass === "response-truncated") {
+    const fragmentEntries = unifiedRoundEntries({
+      payload: partialPayload,
+      roundId,
+      createdAt: t,
+      model: partialProvider.model,
+      settings,
+      characters,
+      conversation: cv,
+      suggestionsEnabled: false,
+    });
+    if (fragmentEntries.length) {
+      const fragmentGeneration: NonNullable<MeetEntry["generation"]> = {
+        ...generationMeta,
+        status: "complete",
+        stage: "saving",
+        saveResult: "saved",
+        pendingSave: false,
+        recoveryAction: undefined,
+        warnings: [...new Set([...(generationMeta.warnings ?? []), "仅保存了截断响应中已经完整形成的片段"])],
+        error: undefined,
+      };
+      storePendingMeetSave({
+        version: 1,
+        sessionId: session.id,
+        roundId,
+        userEntryId: userEntry.id,
+        runId,
+        generatedEntries: fragmentEntries,
+        completedGeneration: fragmentGeneration,
+        narrativeSettings: settings,
+        sceneState: state,
+        plotState,
+        createdAt: now(),
+      });
+      generationMeta.pendingSave = true;
+      generationMeta.recoveryAction = "keep-complete-segments";
+    }
+  }
+
   if (!payload) {
-    generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
+    const cancelled = lastError instanceof ProviderError && lastError.kind === "aborted";
+    generationMeta.status = cancelled ? "cancelled" : existingRoundOutputs.length ? "complete" : "failed";
+    generationMeta.failureClass = cancelled ? "aborted" : generationMeta.failureClass;
+    generationMeta.recoveryAction ??= "retry-generation";
     generationMeta.saveResult = "not-attempted";
     generationMeta.error = meetFailureMessage(
       lastError,
@@ -1337,69 +1600,50 @@ async function generateMeetTurnInternal(
   generationMeta.characterResults = characterResults;
   await safeUpdateGeneration();
 
+  const completedGeneration: NonNullable<MeetEntry["generation"]> = {
+      ...generationMeta,
+      status: "complete",
+      stage: "saving",
+      saveResult: "saved",
+      pendingSave: false,
+      recoveryAction: undefined,
+      error: undefined,
+    },
+    pendingSave: PendingMeetSave = {
+      version: 1,
+      sessionId: session.id,
+      roundId,
+      userEntryId: userEntry.id,
+      runId,
+      generatedEntries,
+      completedGeneration,
+      narrativeSettings: settings,
+      sceneState: nextState,
+      plotState: nextPlotState,
+      createdAt: now(),
+    };
+
   let saveError: unknown;
-  for (let saveAttempt = 0; saveAttempt < 2; saveAttempt += 1) {
-    try {
-      await db.transaction("rw", db.meetSessions, async () => {
-        const current = await db.meetSessions.get(session.id);
-        if (!current || current.status !== "active")
-          throw new Error("见面状态已经变化");
-        const currentUser = current.entries.find(
-          (entry) => entry.id === userEntry.id,
-        );
-        if (currentUser?.generation?.runId !== runId)
-          throw new StaleMeetRoundError();
-        const completedGeneration: NonNullable<MeetEntry["generation"]> = {
-            ...generationMeta,
-            status: "complete",
-            stage: "saving",
-            saveResult: "saved",
-            error: undefined,
-          },
-          withoutOldRoundOutputs = current.entries.filter(
-            (entry) =>
-              entry.roundId !== roundId || entry.senderType === "user",
-          ),
-          completedEntries = withoutOldRoundOutputs.map((entry) =>
-            entry.id === userEntry.id
-              ? { ...entry, generation: completedGeneration }
-              : entry,
-          ),
-          userIndex = completedEntries.findIndex(
-            (entry) => entry.id === userEntry.id,
-          );
-        completedEntries.splice(userIndex + 1, 0, ...generatedEntries);
-        await db.meetSessions.put({
-          ...current,
-          entries: completedEntries,
-          narrativeSettings: settings,
-          sceneState: nextState,
-          plotState: nextPlotState,
-          lastActivityAt:
-            generatedEntries.at(-1)?.createdAt ?? current.lastActivityAt,
-          updatedAt: now(),
-        });
-      });
-      saveError = undefined;
-      break;
-    } catch (error) {
-      if (error instanceof StaleMeetRoundError) throw error;
-      saveError = error;
-    }
+  try {
+    await persistPendingMeetSaveWithRetries(pendingSave);
+    clearPendingMeetSave(session.id, userEntry.id);
+  } catch (error) {
+    if (error instanceof StaleMeetRoundError) throw error;
+    saveError = error;
   }
 
   if (saveError) {
+    storePendingMeetSave(pendingSave);
     generationMeta.status = existingRoundOutputs.length ? "complete" : "failed";
     generationMeta.failureClass = "storage-failed";
     generationMeta.stage = "saving";
     generationMeta.saveResult = "failed";
-    generationMeta.error = existingRoundOutputs.length
-      ? "新场景保存失败，已保留原场景"
-      : "场景已经生成，但本地保存失败，请重试";
+    generationMeta.pendingSave = true;
+    generationMeta.recoveryAction = "retry-save";
+    generationMeta.error = storageFailureMessage(saveError, existingRoundOutputs.length > 0);
     await safeUpdateGeneration();
     throw new Error(generationMeta.error);
   }
-
   return {
     entries: generatedEntries,
     warning: warnings.length ? [...new Set(warnings)].join("；") : undefined,

@@ -27,6 +27,7 @@ import {
   meetRoundStyleViolation,
   parseMeetRoundResponse,
   parseMeetRoundResponseWithMeta,
+  parseMeetRoundResponseResilient,
 } from "./meetEngine";
 
 describe("unified meet response normalization", () => {
@@ -182,4 +183,64 @@ describe("meet regression validation details", () => {
     expect(result.repairApplied).toBe(true);
   });
 
+});
+
+describe("resilient meet visible-content guarantee", () => {
+  const names = { one: "小一", two: "小二" };
+
+  it("salvages common speech/action aliases without inventing text", () => {
+    const result = parseMeetRoundResponseResilient(JSON.stringify({
+      version: 1,
+      segments: [
+        { type: "action", content: "她走到窗边。" },
+        { type: "speech", characterId: "one", content: "我在这里。" },
+        { type: "speech", characterId: "ghost", text: "无法确认说话人。" },
+      ],
+      updates: [{ characterId: "one", scenePatch: { clothing: [123] } }],
+    }), ["one", "two"], { participantNames: names, thoughtsEnabled: true });
+    expect(result.parseMode).toBe("compatible-json");
+    expect(result.payload.segments).toEqual([
+      { type: "narration", text: "她走到窗边。" },
+      { type: "dialogue", characterId: "one", text: "我在这里。" },
+      { type: "narration", text: "无法确认说话人。" },
+    ]);
+    expect(result.unknownSpeakerCount).toBe(1);
+    expect(result.ignoredMetadataCount).toBe(1);
+  });
+
+  it("accepts narration-only and plain visible text", () => {
+    const narration = parseMeetRoundResponseResilient(JSON.stringify({ version: 1, segments: [{ type: "narration", text: "风吹过走廊。" }] }), ["one"]);
+    expect(narration.payload.segments).toEqual([{ type: "narration", text: "风吹过走廊。" }]);
+    expect(narration.parseMode).toBe("compatible-json");
+
+    const plain = parseMeetRoundResponseResilient("风吹过走廊。\n“你来了。”", ["one"], { participantNames: names });
+    expect(plain.parseMode).toBe("plain-visible-text");
+    expect(plain.payload.segments).toEqual([
+      { type: "narration", text: "风吹过走廊。" },
+      { type: "dialogue", characterId: "one", text: "“你来了。”" },
+    ]);
+  });
+
+  it("maps tagged lines and exact unique names while preserving unknown speakers as narration", () => {
+    const result = parseMeetRoundResponseResilient("[N] 门被推开。\n[D:one] 进来吧。\n小二：我也到了。\n[D:ghost] 不应误认。", ["one", "two"], { participantNames: names });
+    expect(result.parseMode).toBe("tagged-lines");
+    expect(result.payload.segments).toEqual([
+      { type: "narration", text: "门被推开。" },
+      { type: "dialogue", characterId: "one", text: "进来吧。" },
+      { type: "dialogue", characterId: "two", text: "我也到了。" },
+      { type: "narration", text: "不应误认。" },
+    ]);
+    expect(result.unknownSpeakerCount).toBe(1);
+  });
+
+  it("recovers only complete visible strings from malformed JSON-like output", () => {
+    const result = parseMeetRoundResponseResilient('{"version":1,"segments":[{"type":"narration","text":"完整片段"},{"type":"dialogue","text":"未闭合', ["one"]);
+    expect(result.parseMode).toBe("compatible-json");
+    expect(result.payload.segments).toContainEqual({ type: "narration", text: "完整片段" });
+    expect(result.payload.segments.map((segment) => segment.text).join("\n")).not.toContain("未闭合");
+  });
+
+  it("still rejects an actually empty response", () => {
+    expect(() => parseMeetRoundResponseResilient("   ", ["one"])).toThrow(MeetProtocolError);
+  });
 });

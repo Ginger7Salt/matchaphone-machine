@@ -1,7 +1,8 @@
-﻿import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "./db";
+import { OpenAIProvider } from "./provider";
 import { finishMeetSession, generateMeetTurn, refineMeetSessionSummary } from "./meetService";
-import type { Character, Conversation, MeetSession } from "./types";
+import { defaultProvider, type Character, type Conversation, type MeetSession } from "./types";
 
 const conversation: Conversation = {
   id: "conversation",
@@ -91,6 +92,15 @@ describe("meet mode bridge service", () => {
 
   it("resumes a paused meet when the user submits a new offline turn", async () => {
     await db.meetSessions.add(activeSession());
+    await db.settings.put({ key: "provider", value: { ...defaultProvider, networkMode: "direct", apiKey: "test-key", model: "test-model" } });
+    vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValue({
+      text: JSON.stringify({ version: 1, segments: [{ type: "narration", text: "下午的咖啡店安静下来。" }, { type: "dialogue", characterId: "character", text: "那就下午见。" }] }),
+      finishReason: "stop",
+      truncated: false,
+      responseShape: "choices",
+      rawLength: 100,
+      outputTokens: 20,
+    });
     await db.messages.add({
       id: "online",
       schemaVersion: 1,

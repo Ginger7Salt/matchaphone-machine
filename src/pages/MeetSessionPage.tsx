@@ -22,15 +22,19 @@ import {
   editMeetUserEntry,
   finishMeetSession,
   generateMeetTurn,
+  getPendingMeetSave,
   meetEntryPlainText,
   regenerateMeetCharacterEntry,
   regenerateMeetRound,
   retryFailedMeetTurn,
+  retryPendingMeetSave,
+  pendingMeetSavePlainText,
   toggleMeetEntryFavorite,
   updateMeetScene,
 } from "../core/meetService";
 import { lastSuggestions, normalizeNarrativeSettings } from "../core/meet";
 import { useStore } from "../core/store";
+import { getProvider, setSetting } from "../core/db";
 import { autoTranslateCharacter } from "../core/bilingual";
 import { Avatar, Modal } from "../components/ui";
 import type { MeetEntry, MeetNarrativeSettings } from "../core/types";
@@ -64,12 +68,28 @@ const meetFailureDetailText: Record<string, string> = {
 const meetGenerationErrorText = (entry: MeetEntry) => {
   const generation = entry.generation;
   if (generation?.error) return generation.error;
+  if (generation?.status === "cancelled" || generation?.failureClass === "aborted")
+    return "已停止生成，输入内容仍然保留";
+  if (generation?.failureClass === "network-offline")
+    return "当前网络不可用，内容已经保留";
+  if (generation?.failureClass === "network-unknown-delivery")
+    return "网络在请求过程中断开，服务商可能已经收到请求；为避免重复计费，茶茶机没有自动重试";
   if (generation?.failureClass === "provider-cors")
-    return "当前 Provider 不支持浏览器直连或跨域访问，请更换支持 CORS 的接口或配置副 API";
+    return "浏览器直连被跨域策略阻止；茶茶机没有自动切换通道或重放请求";
+  if (generation?.failureClass === "relay-activation-invalid")
+    return "安全 Relay 的激活许可无效，请检查激活状态";
+  if (generation?.failureClass === "provider-empty-response")
+    return "服务返回了空内容，请重新生成或更换模型";
   if (generation?.failureClass === "provider-prompt-blocked")
     return "当前内容被模型安全策略拦截，请缩短上下文或更换模型";
+  if (generation?.failureClass === "provider-timeout") {
+    const code = generation.attempts?.at(-1)?.providerCode;
+    if (code === "connect-timeout") return "连接 Provider 超时，输入内容已保留";
+    if (code === "stream-idle-timeout") return "Provider 数据流长时间没有新内容，输入内容已保留";
+    return "Provider 请求超过总等待时间，输入内容已保留";
+  }
   if (generation?.failureClass === "response-truncated")
-    return "Provider 返回的响应被截断，请重新生成";
+    return "Provider 返回的响应被明确截断，自动流程没有保存半截场景";
   if (generation?.failureDetailCode && meetFailureDetailText[generation.failureDetailCode])
     return meetFailureDetailText[generation.failureDetailCode];
   if (generation?.attempts?.some((attempt) => attempt.errorKind === "rate"))
@@ -102,7 +122,8 @@ export default function MeetSessionPage() {
     [regeneratingId, setRegeneratingId] = useState<string | null>(null),
     [editText, setEditText] = useState(""),
     [toast, setToast] = useState(""),
-    [thoughtEntryId, setThoughtEntryId] = useState<string | null>(null);
+    [thoughtEntryId, setThoughtEntryId] = useState<string | null>(null),
+    [online, setOnline] = useState(() => typeof navigator === "undefined" || navigator.onLine);
   const controller = useRef<AbortController | null>(null),
     bottom = useRef<HTMLDivElement>(null),
     textarea = useRef<HTMLTextAreaElement>(null),
@@ -149,6 +170,15 @@ export default function MeetSessionPage() {
     const timer = window.setTimeout(() => setToast(""), 1800);
     return () => window.clearTimeout(timer);
   }, [toast]);
+  useEffect(() => {
+    const syncOnline = () => setOnline(navigator.onLine);
+    window.addEventListener("online", syncOnline);
+    window.addEventListener("offline", syncOnline);
+    return () => {
+      window.removeEventListener("online", syncOnline);
+      window.removeEventListener("offline", syncOnline);
+    };
+  }, []);
   if (!session)
     return (
       <div className="meet-missing">
@@ -171,6 +201,7 @@ export default function MeetSessionPage() {
           candidate.senderType === "character" &&
           candidate.roundId === entry.roundId,
       ),
+    hasPendingSave = (entry: MeetEntry) => Boolean(entry.generation?.pendingSave && getPendingMeetSave(id, entry.id)),
     isLegacyFalseSavingFailure = (entry: MeetEntry) =>
       entry.generation?.protocol !== "unified-round-v1" &&
       entry.generation?.status === "failed" &&
@@ -341,6 +372,69 @@ export default function MeetSessionPage() {
       controller.current = null;
     }
   };
+  const retryPendingSave = async (entry: MeetEntry) => {
+    if (generating) return;
+    setGenerating(true);
+    try {
+      await retryPendingMeetSave(id, entry.id);
+      await reload();
+      setToast("场景已重新保存");
+    } catch (cause) {
+      setToast(cause instanceof Error ? cause.message : "重新保存失败");
+    } finally {
+      setGenerating(false);
+    }
+  };
+  const copyPendingContent = async (entry: MeetEntry) => {
+    const pending = getPendingMeetSave(id, entry.id);
+    if (!pending) {
+      setToast("没有找到待复制的场景");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(pendingMeetSavePlainText(pending));
+      setToast("已复制本轮内容");
+    } catch {
+      setToast("复制失败");
+    }
+  };
+  const switchToRelay = async () => {
+    try {
+      const provider = await getProvider();
+      await setSetting("provider", { ...provider, networkMode: "relay" });
+      await reload();
+      setToast("已切换安全连接，请确认后重新生成");
+    } catch (cause) {
+      setToast(cause instanceof Error ? cause.message : "切换安全连接失败");
+    }
+  };
+  const runRecoveryAction = async (entry: MeetEntry) => {
+    const action = entry.generation?.recoveryAction;
+    if (action === "retry-save" || action === "keep-complete-segments") return retryPendingSave(entry);
+    if (action === "copy-generated-content") return copyPendingContent(entry);
+    if (action === "switch-to-relay") return switchToRelay();
+    if (action === "open-provider-settings" || action === "select-model") {
+      nav("/settings");
+      return;
+    }
+    if (action === "check-activation") {
+      window.location.reload();
+      return;
+    }
+    return retryFailedTurn(entry.id);
+  };
+  const recoveryLabel = (entry: MeetEntry) => {
+    switch (entry.generation?.recoveryAction) {
+      case "retry-save": return "重新保存";
+      case "copy-generated-content": return "复制本轮内容";
+      case "switch-to-relay": return "使用安全连接";
+      case "open-provider-settings": return "打开 API 设置";
+      case "select-model": return "选择模型";
+      case "check-activation": return "检查激活状态";
+      case "keep-complete-segments": return "保留完整片段";
+      default: return entry.generation?.failureClass === "network-offline" ? "网络恢复后重新发送" : "重新生成";
+    }
+  };
   const copyGenerationDiagnostic = async (entry: MeetEntry) => {
     const generation = entry.generation;
     if (!generation) return;
@@ -373,6 +467,7 @@ export default function MeetSessionPage() {
       `attempt${attempt.ordinal}.relayDurationMs=${attempt.relayDurationMs ?? "unknown"}`,
       `attempt${attempt.ordinal}.upstreamHttpStatus=${attempt.upstreamHttpStatus ?? "unknown"}`,
       `attempt${attempt.ordinal}.upstreamBytes=${attempt.upstreamBytes ?? "unknown"}`,
+      `attempt${attempt.ordinal}.requestDeliveryState=${generation.requestDeliveryState ?? "unknown"}`,
     ]);
     const diagnostic = [
       "feature=meet",
@@ -424,6 +519,16 @@ export default function MeetSessionPage() {
       "loreInjected=" + (generation.injectedLoreEntries ?? "unknown"),
       "loreSkipped=" + (generation.skippedLoreEntries ?? "unknown"),
       "saveResult=" + (generation.saveResult ?? "unknown"),
+      "recoveryAction=" + (generation.recoveryAction ?? "none"),
+      "requestDeliveryState=" + (generation.requestDeliveryState ?? "unknown"),
+      "pendingSave=" + Boolean(generation.pendingSave),
+      "meetParseMode=" + (generation.meetParseMode ?? "unknown"),
+      "visibleContentAccepted=" + Boolean(generation.visibleContentAccepted),
+      "visibleSourceLength=" + (generation.visibleSourceLength ?? "unknown"),
+      "salvagedSegmentCount=" + (generation.salvagedSegmentCount ?? "unknown"),
+      "ignoredMetadataCount=" + (generation.ignoredMetadataCount ?? "unknown"),
+      "unknownSpeakerCount=" + (generation.unknownSpeakerCount ?? "unknown"),
+      "plainTextFallbackUsed=" + Boolean(generation.plainTextFallbackUsed),
       "fallbackUsed=" + Boolean(generation.fallbackUsed),
       ...attemptLines,
     ].join("\n");
@@ -611,16 +716,21 @@ export default function MeetSessionPage() {
                   {entry.generation?.status === "partial" && (
                     <p className="meet-generation-status">部分角色本轮保持安静</p>
                   )}
-                  {entry.generation?.status === "failed" && !hasRoundResponse(entry) && (
+                  {(hasPendingSave(entry) || ((entry.generation?.status === "failed" || entry.generation?.status === "cancelled") && !hasRoundResponse(entry))) && (
                     <div className="meet-generation-failure" role="alert">
                       <span>{isLegacyFalseSavingFailure(entry) ? "旧版生成未完成" : meetGenerationErrorText(entry)}</span>
                       <div>
-                        <button type="button" disabled={generating} onClick={() => void retryFailedTurn(entry.id)}>
-                          {generating ? "\u751f\u6210\u4e2d" : "\u91cd\u65b0\u751f\u6210"}
+                        <button
+                          type="button"
+                          disabled={generating || (entry.generation?.failureClass === "network-offline" && !online)}
+                          onClick={() => void runRecoveryAction(entry)}
+                        >
+                          {generating ? "处理中" : recoveryLabel(entry)}
                         </button>
-                        <button type="button" onClick={() => void copyGenerationDiagnostic(entry)}>
-                          {"\u590d\u5236\u8bca\u65ad"}
-                        </button>
+                        {hasPendingSave(entry) && (
+                          <button type="button" onClick={() => void copyPendingContent(entry)}>复制本轮内容</button>
+                        )}
+                        <button type="button" onClick={() => void copyGenerationDiagnostic(entry)}>复制诊断</button>
                       </div>
                     </div>
                   )}

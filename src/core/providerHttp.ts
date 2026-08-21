@@ -1,4 +1,4 @@
-import { getStoredActivationLicense } from "./activation";
+import { getStoredActivationLicense, verifyStoredActivation } from "./activation";
 import type { ProviderProtocol, ProviderSettings } from "./types";
 
 export type ProviderRelayOperation = "chat" | "models" | "connectivity";
@@ -67,8 +67,12 @@ export async function executeProviderHttp(input: {
     });
     return { response, metadata: { networkMode: "direct", relayUsed: false } };
   }
-  const activationLicense = await getStoredActivationLicense();
-  if (!activationLicense) throw new ProviderRelayError("relay-activation-invalid", "安全 Relay 需要有效的茶茶机激活许可", 401);
+  const [activationLicense, activationValid] = await Promise.all([
+    getStoredActivationLicense(),
+    verifyStoredActivation(),
+  ]);
+  if (!activationLicense || !activationValid)
+    throw new ProviderRelayError("relay-activation-invalid", "Relay activation license is invalid", 401);
   let response: Response;
   try {
     response = await fetch(relayUrl(), {

@@ -397,6 +397,332 @@ export function parseMeetRoundResponseWithMeta(
   };
 }
 
+export interface ResilientMeetRoundParseResult extends MeetRoundParseResult {
+  parseMode: "strict-json" | "compatible-json" | "tagged-lines" | "plain-visible-text";
+  warnings: string[];
+  visibleSourceLength: number;
+  salvagedSegmentCount: number;
+  ignoredMetadataCount: number;
+  unknownSpeakerCount: number;
+}
+
+type ResilientMeetOptions = {
+  thoughtsEnabled?: boolean;
+  bilingualCharacterIds?: string[];
+  participantNames?: Record<string, string>;
+};
+
+const NARRATION_ALIASES = new Set(["narration", "action", "scene", "description", "prose", "n", "旁白", "动作", "场景"]);
+const DIALOGUE_ALIASES = new Set(["dialogue", "speech", "say", "message", "reply", "d", "台词", "对话"]);
+const VISIBLE_TEXT_FIELDS = ["text", "content", "value", "prose", "dialogue", "message", "reply"] as const;
+
+function cleanMeetVisibleText(value: unknown, _max = 16000) {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/^\s*```(?:json|text|markdown)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .replace(/\u0000/g, "")
+    .trim();
+}
+
+function participantResolver(participantIds: string[], names: Record<string, string> = {}) {
+  const allowed = new Set(participantIds);
+  const byName = new Map<string, string | null>();
+  for (const id of participantIds) {
+    const name = names[id]?.trim();
+    if (!name) continue;
+    const key = name.toLocaleLowerCase();
+    byName.set(key, byName.has(key) ? null : id);
+  }
+  return (value: unknown) => {
+    if (typeof value !== "string") return undefined;
+    const text = value.trim();
+    if (allowed.has(text)) return text;
+    return byName.get(text.toLocaleLowerCase()) ?? undefined;
+  };
+}
+
+function visibleTextOfRecord(record: Record<string, unknown>) {
+  for (const key of VISIBLE_TEXT_FIELDS) {
+    const value = cleanMeetVisibleText(record[key], key === "dialogue" ? 12000 : 16000);
+    if (value) return value;
+  }
+  return "";
+}
+
+function compatibleMeetRoot(value: unknown): Record<string, unknown> | undefined {
+  let current = value;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (Array.isArray(current)) return { version: 1, segments: current };
+    const record = meetRecord(current);
+    if (!record) return undefined;
+    if (Array.isArray(record.segments)) return record;
+    const nestedKey = ["data", "result", "response", "body", "payload", "output"].find((key) => record[key] !== undefined);
+    if (!nestedKey) return record;
+    current = record[nestedKey];
+    if (typeof current === "string") {
+      try { current = parseStructuredJsonWithMeta(current).value; }
+      catch { return record; }
+    }
+  }
+  return undefined;
+}
+
+function appendCompatibleSegment(
+  segments: MeetRoundPayload["segments"],
+  input: unknown,
+  resolveParticipant: (value: unknown) => string | undefined,
+  diagnostics: { warnings: string[]; unknownSpeakerCount: number; salvagedSegmentCount: number },
+) {
+  if (typeof input === "string") {
+    const text = cleanMeetVisibleText(input);
+    if (text) {
+      segments.push({ type: "narration", text });
+      diagnostics.salvagedSegmentCount += 1;
+    }
+    return;
+  }
+  const record = meetRecord(input);
+  if (!record) return;
+  const text = visibleTextOfRecord(record);
+  if (!text) return;
+  const rawType = typeof record.type === "string" ? record.type.trim().toLocaleLowerCase() : "";
+  const rawSpeaker = record.characterId ?? record.character_id ?? record.speakerId ?? record.speaker ?? record.character ?? record.name;
+  const characterId = resolveParticipant(rawSpeaker);
+  const dialogueLike = DIALOGUE_ALIASES.has(rawType) || Boolean(characterId && !NARRATION_ALIASES.has(rawType));
+  if (dialogueLike && characterId) {
+    const translation = cleanMeetVisibleText(record.translation, 12000);
+    segments.push({ type: "dialogue", characterId, text, ...(translation ? { translation } : {}) });
+  } else {
+    if (dialogueLike && !characterId) {
+      diagnostics.unknownSpeakerCount += 1;
+      diagnostics.warnings.push("无法确认说话人的片段已作为旁白保留");
+    } else if (rawType && !NARRATION_ALIASES.has(rawType)) {
+      diagnostics.warnings.push(`非标准片段类型 ${rawType.slice(0, 40)} 已作为旁白保留`);
+    }
+    segments.push({ type: "narration", text });
+  }
+  diagnostics.salvagedSegmentCount += 1;
+}
+
+function optionalMetadataOf(
+  root: Record<string, unknown>,
+  participantIds: string[],
+  options: ResilientMeetOptions,
+  dialogueIds: Set<string>,
+  warnings: string[],
+) {
+  const allowed = new Set(participantIds);
+  let ignoredMetadataCount = 0;
+  const thoughts: NonNullable<MeetRoundPayload["thoughts"]> = [];
+  const seenThoughts = new Set<string>();
+  if (options.thoughtsEnabled && Array.isArray(root.thoughts)) {
+    for (const candidate of root.thoughts) {
+      const parsed = meetRoundThoughtSchema.safeParse(candidate);
+      if (!parsed.success || !allowed.has(parsed.data.characterId) || seenThoughts.has(parsed.data.characterId)) {
+        ignoredMetadataCount += 1;
+        continue;
+      }
+      seenThoughts.add(parsed.data.characterId);
+      thoughts.push(parsed.data);
+    }
+  }
+  const updates: NonNullable<MeetRoundPayload["updates"]> = [];
+  const seenUpdates = new Set<string>();
+  if (Array.isArray(root.updates)) {
+    for (const candidate of root.updates) {
+      const parsed = meetRoundUpdateSchema.safeParse(candidate);
+      if (!parsed.success || !allowed.has(parsed.data.characterId) || seenUpdates.has(parsed.data.characterId) || !dialogueIds.has(parsed.data.characterId)) {
+        ignoredMetadataCount += 1;
+        continue;
+      }
+      seenUpdates.add(parsed.data.characterId);
+      updates.push(parsed.data);
+    }
+  }
+  const suggestions = Array.isArray(root.suggestions)
+    ? root.suggestions.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean).slice(0, 3)
+    : [];
+  if (ignoredMetadataCount) warnings.push("已忽略无法安全应用的思想或场景状态元数据");
+  return {
+    thoughts: thoughts.length ? thoughts : undefined,
+    updates: updates.length ? updates : undefined,
+    suggestions: suggestions.length ? suggestions : undefined,
+    ignoredMetadataCount,
+  };
+}
+
+function compatibleJsonMeetRound(
+  value: unknown,
+  participantIds: string[],
+  options: ResilientMeetOptions,
+): ResilientMeetRoundParseResult | undefined {
+  const root = compatibleMeetRoot(value);
+  if (!root || !Array.isArray(root.segments)) return undefined;
+  const resolveParticipant = participantResolver(participantIds, options.participantNames);
+  const warnings: string[] = [];
+  const counters = { warnings, unknownSpeakerCount: 0, salvagedSegmentCount: 0 };
+  const segments: MeetRoundPayload["segments"] = [];
+  for (const candidate of root.segments) appendCompatibleSegment(segments, candidate, resolveParticipant, counters);
+  if (!segments.length) return undefined;
+  const dialogueIds = new Set(segments.flatMap((segment) => segment.type === "dialogue" ? [segment.characterId] : []));
+  const metadata = optionalMetadataOf(root, participantIds, options, dialogueIds, warnings);
+  if (!dialogueIds.size) warnings.push("本轮没有可确认说话人的台词，已按完整旁白场景保留");
+  return {
+    payload: {
+      version: 1,
+      segments,
+      thoughts: metadata.thoughts,
+      updates: metadata.updates,
+      suggestions: metadata.suggestions,
+      warnings: [...new Set(warnings)],
+    },
+    repairApplied: true,
+    parseMode: "compatible-json",
+    warnings: [...new Set(warnings)],
+    visibleSourceLength: segments.reduce((sum, segment) => sum + segment.text.length, 0),
+    salvagedSegmentCount: counters.salvagedSegmentCount,
+    ignoredMetadataCount: metadata.ignoredMetadataCount,
+    unknownSpeakerCount: counters.unknownSpeakerCount,
+  };
+}
+
+function extractCompleteJsonVisibleStrings(raw: string) {
+  const results: Array<{ key: string; text: string }> = [];
+  const pattern = /"(text|content|value|prose|dialogue|message|reply|narration)"\s*:\s*"((?:\\.|[^"\\])*)"/gi;
+  for (const match of raw.matchAll(pattern)) {
+    try {
+      const text = cleanMeetVisibleText(JSON.parse(`"${match[2]}"`));
+      if (text) results.push({ key: match[1].toLocaleLowerCase(), text });
+    } catch {}
+  }
+  return results;
+}
+
+function textMeetRound(
+  raw: string,
+  participantIds: string[],
+  options: ResilientMeetOptions,
+): ResilientMeetRoundParseResult | undefined {
+  const resolveParticipant = participantResolver(participantIds, options.participantNames);
+  const stripped = raw
+    .replace(/^\s*```(?:json|text|markdown)?\s*/i, "")
+    .replace(/\s*```\s*$/i, "")
+    .trim();
+  if (!stripped) return undefined;
+  if (/^\{/.test(stripped) || /^\[\s*(?:\{|\")/.test(stripped)) {
+    const recovered = extractCompleteJsonVisibleStrings(stripped);
+    if (!recovered.length) return undefined;
+    const segments: MeetRoundPayload["segments"] = recovered.map((item) =>
+      item.key === "dialogue" && participantIds.length === 1
+        ? { type: "dialogue" as const, characterId: participantIds[0], text: item.text }
+        : { type: "narration" as const, text: item.text },
+    );
+    const warnings = ["已从非标准JSON中保留完整可见片段"];
+    return {
+      payload: { version: 1, segments, warnings },
+      repairApplied: true,
+      parseMode: "compatible-json",
+      warnings,
+      visibleSourceLength: segments.reduce((sum, segment) => sum + segment.text.length, 0),
+      salvagedSegmentCount: segments.length,
+      ignoredMetadataCount: 0,
+      unknownSpeakerCount: 0,
+    };
+  }
+  const segments: MeetRoundPayload["segments"] = [];
+  const thoughts: NonNullable<MeetRoundPayload["thoughts"]> = [];
+  const warnings: string[] = [];
+  let unknownSpeakerCount = 0;
+  let tagged = false;
+  for (const rawLine of stripped.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line || /^\[DONE\]$/i.test(line) || /^(?:event:|data:|id:|retry:)/i.test(line)) continue;
+    const tag = line.match(/^\[([^\]]+)\]\s*(.*)$/u);
+    if (tag) {
+      tagged = true;
+      const label = tag[1].trim();
+      line = tag[2].trim();
+      if (!line) continue;
+      const taggedDialogue = label.match(/^(?:d|dialogue|speech|台词|对话)\s*[:：|]\s*(.+)$/iu);
+      const taggedThought = label.match(/^(?:t|thought|思想|内心)\s*[:：|]\s*(.+)$/iu);
+      if (taggedDialogue) {
+        const characterId = resolveParticipant(taggedDialogue[1]);
+        if (characterId) segments.push({ type: "dialogue", characterId, text: line });
+        else { segments.push({ type: "narration", text: line }); unknownSpeakerCount += 1; }
+        continue;
+      }
+      if (taggedThought) {
+        const characterId = resolveParticipant(taggedThought[1]);
+        if (characterId && options.thoughtsEnabled) thoughts.push({ characterId, text: line });
+        continue;
+      }
+      const directCharacter = resolveParticipant(label);
+      if (directCharacter) { segments.push({ type: "dialogue", characterId: directCharacter, text: line }); continue; }
+      if (NARRATION_ALIASES.has(label.toLocaleLowerCase())) { segments.push({ type: "narration", text: line }); continue; }
+      warnings.push("未知文本标签已剥离，正文作为旁白保留");
+      segments.push({ type: "narration", text: line });
+      continue;
+    }
+    const speakerLine = line.match(/^([^：:]{1,80})[：:]\s*(.+)$/u);
+    if (speakerLine) {
+      const characterId = resolveParticipant(speakerLine[1]);
+      if (characterId) { segments.push({ type: "dialogue", characterId, text: speakerLine[2].trim() }); tagged = true; continue; }
+    }
+    if (participantIds.length === 1 && /^[“"「『]/u.test(line))
+      segments.push({ type: "dialogue", characterId: participantIds[0], text: line });
+    else segments.push({ type: "narration", text: line });
+  }
+  if (!segments.length) return undefined;
+  if (unknownSpeakerCount) warnings.push("无法确认说话人的文本已作为旁白保留");
+  if (!segments.some((segment) => segment.type === "dialogue")) warnings.push("本轮没有可确认说话人的台词，已按完整旁白场景保留");
+  return {
+    payload: { version: 1, segments, thoughts: thoughts.length ? thoughts : undefined, warnings: [...new Set(warnings)] },
+    repairApplied: true,
+    parseMode: tagged ? "tagged-lines" : "plain-visible-text",
+    warnings: [...new Set(warnings)],
+    visibleSourceLength: segments.reduce((sum, segment) => sum + segment.text.length, 0),
+    salvagedSegmentCount: segments.length,
+    ignoredMetadataCount: 0,
+    unknownSpeakerCount,
+  };
+}
+
+export function parseMeetRoundResponseResilient(
+  raw: string,
+  participantIds: string[],
+  options: ResilientMeetOptions = {},
+): ResilientMeetRoundParseResult {
+  try {
+    const strict = parseMeetRoundResponseWithMeta(raw, participantIds, options);
+    const warnings = strict.payload.warnings ?? [];
+    return {
+      ...strict,
+      parseMode: "strict-json",
+      warnings,
+      visibleSourceLength: strict.payload.segments.reduce((sum, segment) => sum + segment.text.length, 0),
+      salvagedSegmentCount: 0,
+      ignoredMetadataCount: 0,
+      unknownSpeakerCount: 0,
+    };
+  } catch (strictError) {
+    let parsedValue: unknown;
+    try {
+      const parsed = parseStructuredJsonWithMeta(raw);
+      if (
+        parsed.diagnostics.parseStatus === "strict-json" ||
+        (parsed.diagnostics.parseStatus === "repaired-json" &&
+          parsed.diagnostics.outerContainerClosed !== false &&
+          parsed.diagnostics.unterminatedString !== true)
+      ) parsedValue = parsed.value;
+    } catch {}
+    const compatible = parsedValue === undefined ? undefined : compatibleJsonMeetRound(parsedValue, participantIds, options);
+    if (compatible) return compatible;
+    const text = textMeetRound(raw, participantIds, options);
+    if (text) return text;
+    throw strictError;
+  }
+}
 export function parseMeetRoundResponse(
   raw: string,
   participantIds: string[],

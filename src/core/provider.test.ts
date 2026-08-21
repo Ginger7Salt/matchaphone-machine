@@ -329,6 +329,36 @@ describe("chat timeout override",()=>{
  });
 });
 
+describe("provider timeout phases", () => {
+  it("classifies connection timeout before headers arrive", async () => {
+    vi.stubGlobal("fetch", vi.fn((_url, options: any) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    })));
+    await expect(new OpenAIProvider(settings).chatWithMeta([{ role: "user", content: "hi" }], { stream: false, timeoutMs: 100, connectTimeoutMs: 5 })).rejects.toMatchObject({ kind: "timeout", apiError: { providerCode: "connect-timeout" } });
+  });
+
+  it("classifies total timeout while a non-stream body stalls", async () => {
+    const stalled = new ReadableStream<Uint8Array>({ pull() { return new Promise(() => undefined); } });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stalled, { status: 200, headers: { "Content-Type": "application/json" } })));
+    await expect(new OpenAIProvider(settings).chatWithMeta([{ role: "user", content: "hi" }], { stream: false, timeoutMs: 8, connectTimeoutMs: null })).rejects.toMatchObject({ kind: "timeout", apiError: { providerCode: "total-timeout" } });
+  });
+
+  it("classifies stream idle timeout after an incomplete visible delta", async () => {
+    let sent = false;
+    const stalled = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (!sent) {
+          sent = true;
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"部分"}}]}\n\n'));
+          return;
+        }
+        return new Promise(() => undefined);
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stalled, { status: 200, headers: { "Content-Type": "text/event-stream" } })));
+    await expect(new OpenAIProvider({ ...settings, stream: true }).chatWithMeta([{ role: "user", content: "hi" }], { stream: true, timeoutMs: 100, connectTimeoutMs: 50, streamIdleTimeoutMs: 5 })).rejects.toMatchObject({ kind: "timeout", apiError: { providerCode: "stream-idle-timeout" } });
+  });
+});
 describe("meet regression envelopes", () => {
   it("normalizes a string version and null optional arrays without changing visible content", async () => {
     const round = { version: "1", segments: [{ type: "dialogue", characterId: "one", text: "Stable dialogue" }], thoughts: null, updates: null, suggestions: null };

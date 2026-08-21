@@ -1676,6 +1676,7 @@ export type MeetRetryDecision =
   | "compact-primary-retry"
   | "structure-primary-retry"
   | "stop-no-distinct-secondary"
+  | "stop-unsafe-retry"
   | "stop-after-second-attempt";
 
 export interface MeetEntry {
@@ -1702,11 +1703,13 @@ export interface MeetEntry {
   plotProgress?: MeetPlotProgress;
   favoritedAt?: number;
   generation?: {
-    status: "generating" | "complete" | "partial" | "failed";
+    status: "generating" | "complete" | "partial" | "failed" | "cancelled";
     protocol?: "unified-round-v1";
     runId?: string;
     stage?:
       | "building-context"
+      | "preflight"
+      | "waiting-network"
       | "requesting"
       | "normalizing"
       | "parsing"
@@ -1718,12 +1721,26 @@ export interface MeetEntry {
       | "provider-cors"
       | "provider-prompt-blocked"
       | "provider-timeout"
+      | "provider-empty-response"
+      | "network-offline"
+      | "network-unknown-delivery"
+      | "relay-activation-invalid"
       | "context-overflow"
       | "response-truncated"
       | "response-invalid"
       | "invalid-meet-round"
       | "storage-failed"
       | "aborted";
+    recoveryAction?: MeetRecoveryAction;
+    requestDeliveryState?: "not-sent" | "possibly-sent" | "responded";
+    pendingSave?: boolean;
+    meetParseMode?: "strict-json" | "compatible-json" | "tagged-lines" | "plain-visible-text";
+    visibleContentAccepted?: boolean;
+    visibleSourceLength?: number;
+    salvagedSegmentCount?: number;
+    ignoredMetadataCount?: number;
+    unknownSpeakerCount?: number;
+    plainTextFallbackUsed?: boolean;
     failureDetailCode?: MeetFailureDetailCode;
     failureSegmentIndex?: number;
     failureSegmentType?: string;
@@ -1821,6 +1838,15 @@ export interface MeetEntry {
   };
   createdAt: number;
 }
+export type MeetRecoveryAction =
+  | "retry-generation"
+  | "retry-save"
+  | "switch-to-relay"
+  | "open-provider-settings"
+  | "select-model"
+  | "check-activation"
+  | "keep-complete-segments"
+  | "copy-generated-content";
 export type MeetNarrativePerspective = "first" | "second" | "third";
 export type MeetNarrativeStyleMode = "plain" | "custom";
 export interface MeetStyleDefinition {

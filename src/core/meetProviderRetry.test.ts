@@ -9,9 +9,9 @@ describe("meet context budget",()=>{
 });
 
 describe("meet provider retry classification", () => {
-  it("switches providers for rate, CORS, and prompt blocking failures", () => {
+  it("switches providers only for rate and prompt blocking failures; CORS requires an explicit channel switch", () => {
     expect(shouldUseSecondaryMeetProvider(new ProviderError("rate", "rate limited"))).toBe(true);
-    expect(shouldUseSecondaryMeetProvider(new ProviderError("cors", "cors failed"))).toBe(true);
+    expect(shouldUseSecondaryMeetProvider(new ProviderError("cors", "cors failed"))).toBe(false);
     expect(
       shouldUseSecondaryMeetProvider(
         new ProviderError("format", "blocked", "", {

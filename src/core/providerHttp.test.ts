@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getStoredActivationLicense } from "./activation";
+import { getStoredActivationLicense, verifyStoredActivation } from "./activation";
 import { executeProviderHttp, ProviderRelayError } from "./providerHttp";
 import { defaultProvider } from "./types";
 
-vi.mock("./activation", () => ({ getStoredActivationLicense: vi.fn() }));
+vi.mock("./activation", () => ({ getStoredActivationLicense: vi.fn(), verifyStoredActivation: vi.fn() }));
 const license = { payload: { version: 1 as const, environmentId: "matchaphone-d5gjgy87ybfb50382", activationId: "activation", cloudbaseUid: "uid", deviceKeyHash: "device", issuedAt: 1, permanent: true as const }, signature: "signature", publicKeyId: "key" };
 
 beforeEach(() => {
   vi.mocked(getStoredActivationLicense).mockResolvedValue(license);
+  vi.mocked(verifyStoredActivation).mockResolvedValue(true);
   vi.stubGlobal("crypto", { ...globalThis.crypto, randomUUID: () => "relay-client-request" });
 });
 
@@ -42,6 +43,14 @@ describe("provider HTTP network modes", () => {
     vi.stubGlobal("fetch", fetchMock);
     await expect(executeProviderHttp({ settings: { ...defaultProvider, networkMode: "relay", apiKey: "secret" }, protocol: "openai-compatible", endpoint: "https://provider.example/v1/chat/completions", operation: "chat", method: "POST", headers: { Authorization: "Bearer secret" }, body: "{}", timeoutMs: 5000 })).rejects.toMatchObject({ code: "relay-unavailable" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an invalid local activation before contacting Relay", async () => {
+    vi.mocked(verifyStoredActivation).mockResolvedValue(false);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(executeProviderHttp({ settings: { ...defaultProvider, networkMode: "relay", apiKey: "secret" }, protocol: "openai-compatible", endpoint: "https://provider.example/v1/chat/completions", operation: "chat", method: "POST", headers: {}, body: "{}", timeoutMs: 5000 })).rejects.toMatchObject({ code: "relay-activation-invalid", status: 401 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("surfaces sanitized Relay error metadata", async () => {
