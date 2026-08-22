@@ -16,7 +16,7 @@ describe("dedicated model services",()=>{
  it("normalizes legacy partial settings",()=>{
   const normalized=normalizeModelServiceSettings({secondary:{enabled:true,provider:{apiKey:" key ",model:" helper "}},vision:{instruction:""}});
   expect(normalized.secondary.enabled).toBe(true);
-  expect(normalized.secondary.provider).toMatchObject({apiKey:"key",model:"helper",stream:false});
+  expect(normalized.secondary.provider).toMatchObject({apiKey:"key",model:"helper",stream:false,networkMode:"direct"});
   expect(normalized.vision.instruction).toBe(defaultModelServiceSettings.vision.instruction);
  });
  it("resolves the secondary provider independently and falls back when disabled",async()=>{

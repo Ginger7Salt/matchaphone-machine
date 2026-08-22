@@ -57,7 +57,7 @@ export async function executeProviderHttp(input: {
   signal?: AbortSignal;
   timeoutMs: number;
 }): Promise<ProviderHttpResult> {
-  if (input.settings.networkMode === "direct") {
+  if (input.settings.networkMode !== "relay") {
     const response = await fetch(input.endpoint, {
       method: input.method,
       headers: input.headers,

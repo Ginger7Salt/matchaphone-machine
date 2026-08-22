@@ -1725,6 +1725,10 @@ export interface MeetEntry {
       | "network-offline"
       | "network-unknown-delivery"
       | "relay-activation-invalid"
+      | "relay-service-unavailable"
+      | "relay-upstream-unavailable"
+      | "relay-timeout"
+      | "provider-http-error"
       | "context-overflow"
       | "response-truncated"
       | "response-invalid"
@@ -2105,6 +2109,8 @@ export interface ProviderSettings {
   contextWindowTokens?: number;
   protocol?: ProviderProtocol;
   networkMode?: ProviderNetworkMode;
+  /** True only when the user explicitly selected a non-default request channel. */
+  networkModeExplicit?: boolean;
   timeoutMs: number;
 }
 export interface ProviderPreset {
@@ -2625,7 +2631,8 @@ export const defaultProvider: ProviderSettings = {
   maxTokens: 800,
   contextLimit: 30,
   protocol: "auto",
-  networkMode: "relay",
+  networkMode: "direct",
+  networkModeExplicit: false,
   timeoutMs: 60000,
 };
 export const defaultEmbeddingServiceSettings: EmbeddingServiceSettings = {

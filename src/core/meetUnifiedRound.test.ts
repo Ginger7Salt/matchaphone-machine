@@ -673,4 +673,22 @@ describe("meet end-to-end recovery invariants", () => {
     expect(visible).not.toContain("未完成");
     expect(chat).toHaveBeenCalledTimes(2);
   });
+
+  it("shows direct Provider HTTP status in the meet failure", async () => {
+    await setup(["one"]);
+    const failure = new ProviderError("auth", "provider auth failed", "", { kind: "auth", httpStatus: 401, providerCode: "bad_response_status_code" } as any);
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockRejectedValue(failure);
+    await expect(generateMeetTurn("meet-unified", "retry")).rejects.toThrow("Provider HTTP 401");
+    expect(chat).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows Relay HTTP status and preserves the upstream failure class", async () => {
+    await setup(["one"]);
+    const failure = new ProviderError("relay", "relay unavailable", "", { kind: "relay", httpStatus: 502, relayStatus: 502, relayUsed: true, relayErrorCode: "relay-unavailable", upstreamHttpStatus: 0 } as any);
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockRejectedValue(failure);
+    await expect(generateMeetTurn("meet-unified", "retry")).rejects.toThrow("Relay HTTP 502");
+    expect(chat).toHaveBeenCalledTimes(1);
+    const user = (await db.meetSessions.get("meet-unified"))?.entries.find((entry) => entry.senderType === "user");
+    expect(user?.generation).toMatchObject({ failureClass: "relay-upstream-unavailable", relayStatus: 502, relayErrorCode: "relay-unavailable" });
+  });
 });

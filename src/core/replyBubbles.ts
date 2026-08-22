@@ -418,11 +418,11 @@ export function normalizeStrictReplyBubbles(
     translation: item.translation ? stripSequencePrefix(item.translation.trim()) || undefined : undefined,
   }));
   if (!parts.length || parts.some((item) => !item.content))
-    throw new ProviderError("format", "?????????");
+    throw new ProviderError("format", "角色回复必须包含非空消息");
   if (parts.some((item) => visibleCharacterCount(item.content) > 80))
-    throw new ProviderError("format", "?????????? 80 ???");
+    throw new ProviderError("format", "角色回复单条内容不能超过 80 字");
   if (parts.some((item) => item.translation && visibleCharacterCount(item.translation) > 100))
-    throw new ProviderError("format", "?????????? 100 ???");
+    throw new ProviderError("format", "角色回复翻译不能超过 100 字");
   const rawMessageCount = parts.length;
   let countResolution: ReplyBubbleCountDiagnostics["countResolution"] = "unchanged";
   if (parts.length > plan.max) {
@@ -570,7 +570,7 @@ export function parseReplyBubbles(
   for (const item of messages) {
     if (typeof item === "string") {
       if (bilingual)
-        throw new ProviderError("format", "角色回复缺少 messages 数组，请重试????");
+        throw new ProviderError("format", "角色回复缺少 messages 数组，请重试。");
       if (item.trim()) parts.push({ content: item.trim() });
       continue;
     }
@@ -582,7 +582,7 @@ export function parseReplyBubbles(
     if (typeof content !== "string" || !content.trim())
       throw new ProviderError("format", "角色回复包含空气泡");
     if (bilingual && (typeof translation !== "string" || !translation.trim()))
-      throw new ProviderError("format", "角色回复缺少 messages 数组，请重试????");
+      throw new ProviderError("format", "角色回复缺少 messages 数组，请重试。");
     parts.push({
       content: content.trim(),
       translation: typeof translation === "string" ? translation.trim() : undefined,

@@ -961,7 +961,7 @@ function parseSseOrNdjson(
         lastError = error;
       }
     }
-    if (!normalized!) throw lastError ?? new ProviderResponseParseError("format", "??????????", {
+    if (!normalized!) throw lastError ?? new ProviderResponseParseError("format", "响应候选无法解析", {
       providerCode: "invalid_response",
       responseShape: mode + ":complete-object",
       rawLength: raw.length,
@@ -1515,7 +1515,7 @@ function responsesInput(messages: ChatItem[]) {
     return { model: settings.model, messages: claudeMessages(messages), ...(system ? { system } : {}), temperature, max_tokens: settings.maxTokens > 0 ? settings.maxTokens : 8192, ...(stream ? { stream: true } : {}) };
   }
   if (protocol === "openai-responses") return { model: settings.model, input: responsesInput(messages), temperature, ...(stream ? { stream: true } : {}) };
-  return { model: settings.model, messages: messages.map(message => ({ role: message.role, content: providerMessageContent(message) })), temperature, ...(stream ? { stream: true } : {}) };
+  return { model: settings.model, messages: messages.map(message => ({ role: message.role, content: providerMessageContent(message) })), temperature, max_tokens: Math.max(1, Math.trunc(Number(settings.maxTokens) || 8000)), stream };
 }
 
 function providerMetadataFields(meta: ProviderHttpMetadata): ProviderErrorMetadata { return { networkMode: meta.networkMode, relayUsed: meta.relayUsed, relayRequestId: meta.relayRequestId, relayStatus: meta.relayStatus, relayErrorCode: meta.relayErrorCode, relayDurationMs: meta.relayDurationMs, upstreamHttpStatus: meta.upstreamHttpStatus, upstreamBytes: meta.upstreamBytes }; }

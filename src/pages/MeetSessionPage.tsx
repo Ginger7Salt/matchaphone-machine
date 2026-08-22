@@ -401,7 +401,7 @@ export default function MeetSessionPage() {
   const switchToRelay = async () => {
     try {
       const provider = await getProvider();
-      await setSetting("provider", { ...provider, networkMode: "relay" });
+      await setSetting("provider", { ...provider, networkMode: "relay", networkModeExplicit: true });
       await reload();
       setToast("已切换安全连接，请确认后重新生成");
     } catch (cause) {

@@ -3,7 +3,7 @@ import { enqueueBackgroundTask } from "./backgroundTasks";
 import { rewardIslandMeet } from "./coupleIsland";
 import { memoryExtractionSettingsOf } from "./memoryExtraction";
 import { userPersonaContext } from "./userPersona";
-import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, createApiErrorInfo, isContextOverflowError, resolveProviderProtocol } from "./provider";
+import { BrowserDirectProviderTransport, OpenAIProvider, ProviderError, apiErrorInfoOf, createApiErrorInfo, isContextOverflowError, resolveProviderProtocol } from "./provider";
 import { parseStructuredJsonWithMeta } from "./structuredJson";
 import {
   estimateChatTokens,
@@ -153,19 +153,48 @@ function meetFailureClassOf(error: unknown): NonNullable<MeetEntry["generation"]
     if (error.kind === "aborted") return "aborted";
     if (error.kind === "rate") return "provider-rate-limit";
     if (error.kind === "cors") return "provider-cors";
-    if (error.kind === "timeout") return "provider-timeout";
-    if (["empty_response", "empty_stream", "reasoning_only", "tool_only_response"].includes(error.apiError?.providerCode ?? "")) return "provider-empty-response";
+    const info = apiErrorInfoOf(error);
+    if (error.kind === "timeout") return info?.networkMode === "relay" ? "relay-timeout" : "provider-timeout";
+    if (["empty_response", "empty_stream", "reasoning_only", "tool_only_response"].includes(info?.providerCode ?? "")) return "provider-empty-response";
+    if (info?.relayErrorCode === "relay-activation-invalid") return "relay-activation-invalid";
+    if (error.kind === "relay") return info?.relayStatus ? "relay-upstream-unavailable" : "relay-service-unavailable";
+    if (info?.providerCode === "prompt_blocked") return "provider-prompt-blocked";
+    if (info?.transportMarkedIncomplete || ["transport_truncated", "truncated_json", "response_truncated"].includes(info?.providerCode ?? "")) return "response-truncated";
+    if (info?.httpStatus || info?.upstreamHttpStatus) return "provider-http-error";
     if (error.kind === "network") return "network-unknown-delivery";
-    if (error.apiError?.relayErrorCode === "relay-activation-invalid" || error.apiError?.providerCode === "relay-activation-invalid") return "relay-activation-invalid";
-    if (error.apiError?.providerCode === "prompt_blocked") return "provider-prompt-blocked";
-    if (error.apiError?.transportMarkedIncomplete || error.apiError?.providerCode === "transport_truncated" || error.apiError?.providerCode === "truncated_json" || error.apiError?.providerCode === "response_truncated") return "response-truncated";
+
     return "response-invalid";
   }
   if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError) return "invalid-meet-round";
   return undefined;
 }
 
-function meetFailureMessage(
+function visibleHttpFailureMessage(error: unknown) {
+  if (!(error instanceof ProviderError)) return undefined;
+  const info = apiErrorInfoOf(error);
+  const upstreamStatus = info?.upstreamHttpStatus && info.upstreamHttpStatus > 0 ? info.upstreamHttpStatus : undefined;
+  const relayStatus = info?.relayUsed && info.relayStatus && info.relayStatus > 0 ? info.relayStatus : undefined;
+  const providerStatus = !relayStatus && info?.httpStatus && info.httpStatus > 0 ? info.httpStatus : undefined;
+  const status = upstreamStatus ?? relayStatus ?? providerStatus;
+  if (!status) return undefined;
+  const source = upstreamStatus || providerStatus ? "Provider" : "Relay";
+  let reason = source === "Relay" ? "安全 Relay 返回了错误" : "Provider 返回了错误";
+  if (source === "Relay") {
+    if (info?.relayErrorCode === "relay-activation-invalid") reason = "安全 Relay 激活许可无效";
+    else if (info?.relayErrorCode === "relay-unavailable" || info?.relayErrorCode === "relay-upstream-unavailable") reason = "安全 Relay 无法连接当前 Provider，上游没有返回 HTTP 响应";
+    else if (info?.relayErrorCode === "relay-timeout") reason = "安全 Relay 等待 Provider 超时";
+    else if (info?.relayErrorCode === "relay-endpoint-blocked") reason = "Provider Endpoint 未通过安全检查";
+  } else if (status === 401 || status === 403) reason = "API Key 无效或模型没有访问权限";
+  else if (status === 404) reason = "模型或 Provider Endpoint 不存在";
+  else if (status === 429) reason = "Provider 调用频率或额度已达到限制";
+  else if (status >= 500) reason = "Provider 服务暂时不可用";
+  else if (status === 413 || status === 422) reason = "Provider 拒绝了当前请求参数或上下文长度";
+  else reason = source + " HTTP " + status + " 返回了错误";
+  const requestId = info?.relayRequestId ? "（请求 " + info.relayRequestId.slice(0, 8) + "）" : "";
+  return "见面请求失败 · " + source + " HTTP " + status + "：" + reason + requestId;
+}
+
+function legacyMeetFailureMessage(
   error: unknown,
   attempts: NonNullable<MeetEntry["generation"]>["attempts"],
   preservedExistingRound: boolean,
@@ -193,6 +222,22 @@ function meetFailureMessage(
   if (detailCode && detailCode !== "invalid-segment") return `统一见面结构校验失败（${detailCode}），请重新生成`;
   if (error instanceof ProviderError && error.message) return error.message;
   return "本轮场景生成未完成，请重新生成";
+}
+
+function meetFailureMessage(
+  error: unknown,
+  attempts: NonNullable<MeetEntry["generation"]>["attempts"],
+  preservedExistingRound: boolean,
+) {
+  const info = error instanceof ProviderError ? apiErrorInfoOf(error) : undefined;
+  const httpMessage = visibleHttpFailureMessage(error);
+  if (httpMessage) {
+    const legacyMessage = legacyMeetFailureMessage(error, attempts, preservedExistingRound);
+    return legacyMessage ? httpMessage + "; " + legacyMessage : httpMessage;
+  }
+  if (error instanceof ProviderError && info?.relayErrorCode === "relay-activation-invalid") return error.message;
+  if (error instanceof ProviderError && error.kind === "network") return preservedExistingRound ? error.message + "; " + "kept previous scene" : error.message;
+  return legacyMeetFailureMessage(error, attempts, preservedExistingRound);
 }
 
 export async function createMeetSession(input: {
@@ -594,6 +639,7 @@ function meetRoundOutputBudget(
   return Math.min(
     16_000,
     Math.max(
+      8_000,
       provider.maxTokens,
       Math.ceil(settings.maxChars * 2.2) + thoughtReserve + 1_000,
     ),
@@ -638,7 +684,7 @@ function recoveryActionOf(error: unknown): NonNullable<MeetEntry["generation"]>[
     if (error.kind === "cors") return "switch-to-relay";
     if (error.kind === "auth") return "open-provider-settings";
     if (error.kind === "model" || error.kind === "protocol") return "select-model";
-    if (error.apiError?.relayErrorCode === "relay-activation-invalid" || error.apiError?.providerCode === "relay-activation-invalid") return "check-activation";
+    if (apiErrorInfoOf(error)?.relayErrorCode === "relay-activation-invalid") return "check-activation";
   }
   return "retry-generation";
 }
@@ -1237,14 +1283,14 @@ async function generateMeetTurnInternal(
         await safeUpdateGeneration();
         const response = await meetTransport.chat({
           ...attemptProvider,
-          stream: compactStreamingRetry,
+          stream: false,
           maxTokens: meetRoundOutputBudget(
             attemptProvider,
             settings,
             characters.length,
           ),
         }, messages, {
-          stream: compactStreamingRetry,
+          stream: false,
           signal,
           timeoutMs: 180_000,
           connectTimeoutMs: 30_000,
