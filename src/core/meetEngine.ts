@@ -3,7 +3,7 @@ import { db } from "./db";
 import { parseStructuredJsonWithMeta, replyProtocolPresenceOf } from "./structuredJson";
 import { configuredProvider, getModelServiceSettings } from "./modelServices";
 import { OpenAIProvider } from "./provider";
-import { meetLengthRangeViolation, meetVisibleCharacterCount } from "./meet";
+import { meetVisibleCharacterCount } from "./meet";
 import type {
   Character,
   MeetCompiledStyle,
@@ -920,9 +920,8 @@ export function meetStyleViolation(
   settings: MeetNarrativeSettings,
 ) {
   const styled = `${turn.prose}\n${turn.thought}\n${turn.dialogue}`,
-    labels = /(^|\n)\s*(?:\u52a8\u4f5c|\u8868\u60c5|\u73b0\u573a|\u5206\u6790|\u955c\u5934|\u5185\u5fc3\u5206\u6790)\s*[:\uFF1A]/u,
-    length = meetLengthRangeViolation(turn, settings);
-  if (labels.test(styled) || !length.valid) return true;
+    labels = /(^|\n)\s*(?:\u52a8\u4f5c|\u8868\u60c5|\u73b0\u573a|\u5206\u6790|\u955c\u5934|\u5185\u5fc3\u5206\u6790)\s*[:\uFF1A]/u;
+  if (labels.test(styled)) return true;
   const compiled = validMeetCompiledStyle(settings);
   if (
     compiled?.forbiddenTraits.some(

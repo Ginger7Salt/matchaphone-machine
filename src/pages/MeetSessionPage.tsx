@@ -32,12 +32,22 @@ import {
   toggleMeetEntryFavorite,
   updateMeetScene,
 } from "../core/meetService";
-import { lastSuggestions, normalizeNarrativeSettings } from "../core/meet";
+import {
+  MEET_MAX_CHARS,
+  MEET_MIN_CHARS,
+  lastSuggestions,
+  meetNarrativeRangeError,
+  normalizeNarrativeSettings,
+} from "../core/meet";
 import { useStore } from "../core/store";
 import { getProvider, setSetting } from "../core/db";
 import { autoTranslateCharacter } from "../core/bilingual";
 import { Avatar, Modal } from "../components/ui";
 import type { MeetEntry, MeetNarrativeSettings } from "../core/types";
+type MeetNarrativeDraft = Omit<MeetNarrativeSettings, "minChars" | "maxChars"> & {
+  minChars: number | "";
+  maxChars: number | "";
+};
 
 const Paragraphs = ({ text }: { text?: string }) =>
   text ? (
@@ -62,7 +72,6 @@ const meetFailureDetailText: Record<string, string> = {
   "unknown-character": "响应引用了当前场景之外的角色",
   "invalid-segment": "响应中的场景片段结构无法识别",
   "invalid-scene-update": "响应中的场景状态更新无法识别",
-  "length-out-of-range": "响应篇幅不符合见面设置",
   "style-invalid": "响应文风或结构不符合见面设置",
 };
 const meetGenerationErrorText = (entry: MeetEntry) => {
@@ -112,7 +121,7 @@ export default function MeetSessionPage() {
       session?.suggestionsEnabled ?? false,
     ),
     [timeAware, setTimeAware] = useState(session?.timeAware ?? false),
-    [narrative, setNarrative] = useState<MeetNarrativeSettings>(() =>
+    [narrative, setNarrative] = useState<MeetNarrativeDraft>(() =>
       normalizeNarrativeSettings(session?.narrativeSettings),
     ),
     [error, setError] = useState("");
@@ -236,6 +245,11 @@ export default function MeetSessionPage() {
   };
   const saveScene = async () => {
     if (!scene) return;
+    const rangeError = meetNarrativeRangeError(narrative);
+    if (rangeError) {
+      setError(rangeError);
+      return;
+    }
     try {
       const normalized = normalizeNarrativeSettings(narrative);
       await updateMeetScene(
@@ -1066,12 +1080,17 @@ export default function MeetSessionPage() {
                   最少字数
                   <input
                     type="number"
-                    min="80"
+                    min={MEET_MIN_CHARS}
+                    max={MEET_MAX_CHARS}
+                    step="1"
                     value={narrative.minChars}
                     onChange={(e) =>
                       setNarrative({
                         ...narrative,
-                        minChars: Number(e.target.value),
+                        minChars:
+                          e.currentTarget.value === ""
+                            ? ""
+                            : e.currentTarget.valueAsNumber,
                       })
                     }
                   />
@@ -1081,20 +1100,28 @@ export default function MeetSessionPage() {
                   最多字数
                   <input
                     type="number"
-                    min="80"
+                    min={MEET_MIN_CHARS}
+                    max={MEET_MAX_CHARS}
+                    step="1"
                     value={narrative.maxChars}
                     onChange={(e) =>
                       setNarrative({
                         ...narrative,
-                        maxChars: Number(e.target.value),
+                        maxChars:
+                          e.currentTarget.value === ""
+                            ? ""
+                            : e.currentTarget.valueAsNumber,
                       })
                     }
                   />
                 </label>
               </div>
               <small>
-                单人和多人都按本轮共享描写与全部角色台词的可见正文合计；思想、译文和 JSON 字段不计入篇幅。
+                最少字数是生成下限；最多字数仅作为参考，正文可以超过。任一项留空时按约 300 字生成。范围为 80–6000 字。
               </small>
+              {meetNarrativeRangeError(narrative) && (
+                <p className="meet-error">{meetNarrativeRangeError(narrative)}</p>
+              )}
             </fieldset>
             <section className="meet-perspective-settings">
               <b>叙事人称</b>
@@ -1218,7 +1245,11 @@ export default function MeetSessionPage() {
                 onChange={(e) => setSuggestionsEnabled(e.target.checked)}
               />
             </label>
-            <button className="primary" onClick={() => void saveScene()}>
+            <button
+              className="primary"
+              disabled={Boolean(meetNarrativeRangeError(narrative))}
+              onClick={() => void saveScene()}
+            >
               保存线下设置
             </button>
             {!ended && (

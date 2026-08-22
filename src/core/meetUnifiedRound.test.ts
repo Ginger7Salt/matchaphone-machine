@@ -228,25 +228,25 @@ describe("unified meet round generation", () => {
     });
   });
 
-  it("saves plain visible text without a second Provider request", async () => {
+  it("retries short plain visible text once and then saves it", async () => {
     await setup(["one"]);
     const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValue(response("ordinary text"));
     const result = await generateMeetTurn("meet-unified", "继续");
-    expect(chat).toHaveBeenCalledTimes(1);
+    expect(chat).toHaveBeenCalledTimes(2);
     expect(result.entries).toMatchObject([{ senderType: "system", narration: "ordinary text" }]);
     const user = (await db.meetSessions.get("meet-unified"))?.entries.find((entry) => entry.senderType === "user");
     expect(user?.generation).toMatchObject({ status: "complete", meetParseMode: "plain-visible-text", visibleContentAccepted: true, saveResult: "saved" });
   });
-  it("keeps narration-only visible content and warns instead of rejecting", async () => {
+  it("retries short narration-only visible content and keeps it", async () => {
     await setup(["one"]);
     const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValue(response("ordinary text"));
     const result = await generateMeetTurn("meet-unified", "继续");
-    expect(chat).toHaveBeenCalledTimes(1);
+    expect(chat).toHaveBeenCalledTimes(2);
     expect(result.warning).toContain("没有可确认说话人的台词");
     const saved = await db.meetSessions.get("meet-unified");
     expect(saved?.entries.some((entry) => entry.narration === "ordinary text")).toBe(true);
   });
-  it("saves a valid round with a length warning", async () => {
+  it("saves a valid round silently when length differs", async () => {
     await setup(["one"], { minChars: 100, maxChars: 120 });
     const slight = validRound([
         { type: "narration", text: "景".repeat(84) },
@@ -254,16 +254,50 @@ describe("unified meet round generation", () => {
       ]),
       chat = vi
         .spyOn(OpenAIProvider.prototype, "chatWithMeta")
-        .mockResolvedValueOnce(response(slight));
+        .mockResolvedValue(response(slight));
     const result = await generateMeetTurn("meet-unified", "继续");
-    expect(chat).toHaveBeenCalledTimes(1);
-    expect(result.warning).toContain("偏离");
-    expect(result.warning).toContain("已保留完整场景");
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(result.warning ?? "").not.toContain("\u504f\u79bb");
+    expect(result.warning ?? "").not.toContain("\u5df2\u4fdd\u7559\u5b8c\u6574\u573a\u666f");
     expect(
       (await db.meetSessions.get("meet-unified"))?.entries.some(
         (entry) => entry.dialogue === "我们继续说。",
       ),
     ).toBe(true);
+  });
+  it("retries below-minimum content once and saves the second complete result", async () => {
+    await setup(["one"], { minChars: 100, maxChars: 120 });
+    const short = validRound([
+        { type: "narration", text: "短" },
+        { type: "dialogue", characterId: "one", text: "好。" },
+      ]),
+      complete = validRound([
+        { type: "narration", text: "景".repeat(120) },
+        { type: "dialogue", characterId: "one", text: "我们继续把话说完。" },
+      ]),
+      chat = vi
+        .spyOn(OpenAIProvider.prototype, "chatWithMeta")
+        .mockResolvedValueOnce(response(short))
+        .mockResolvedValueOnce(response(complete));
+    await generateMeetTurn("meet-unified", "继续");
+    expect(chat).toHaveBeenCalledTimes(2);
+    const saved = await db.meetSessions.get("meet-unified"),
+      user = saved?.entries.find((entry) => entry.senderType === "user");
+    expect(saved?.entries.some((entry) => entry.dialogue === "我们继续把话说完。")).toBe(true);
+    expect(user?.generation?.failureClass).toBeUndefined();
+    expect(user?.generation?.failureDetailCode).toBeUndefined();
+  });
+  it("allows content above the advisory maximum without retrying or truncating", async () => {
+    await setup(["one"], { minChars: 80, maxChars: 90 });
+    const payload = validRound([
+      { type: "narration", text: "景".repeat(180) },
+      { type: "dialogue", characterId: "one", text: "自然超过参考上限。" },
+    ]);
+    const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValue(response(payload));
+    const result = await generateMeetTurn("meet-unified", "继续");
+    expect(chat).toHaveBeenCalledTimes(1);
+    expect(result.entries.some((entry) => entry.narration?.includes("景".repeat(180)))).toBe(true);
+    expect(result.warning ?? "").not.toContain("偏离");
   });
   it("ignores invalid optional thoughts and updates without rolling back visible segments", async () => {
     await setup(["one"]);
@@ -581,12 +615,12 @@ describe("meet production error closure regressions", () => {
     expect(user?.generation).toMatchObject({ failureClass: "provider-prompt-blocked", retryDecision: "stop-no-distinct-secondary", sameProviderRetryPrevented: true, saveResult: "not-attempted" });
   });
 
-  it("keeps a narration-only structured round without retrying", async () => {
+  it("retries a short narration-only structured round once", async () => {
     await setup(["one"]);
     const visible = { version: 1, segments: [{ type: "narration", text: "only narration" }], debug: "must not be copied" };
     const chat = vi.spyOn(OpenAIProvider.prototype, "chatWithMeta").mockResolvedValue(response(visible));
     const result = await generateMeetTurn("meet-unified", "继续");
-    expect(chat).toHaveBeenCalledTimes(1);
+    expect(chat).toHaveBeenCalledTimes(2);
     expect(result.entries).toMatchObject([{ senderType: "system", narration: "only narration" }]);
     expect(result.warning).toContain("没有可确认说话人的台词");
   });

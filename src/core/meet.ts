@@ -7,10 +7,14 @@ import type {
   MeetSession,
 } from "./types";
 
+export const MEET_MIN_CHARS = 80;
+export const MEET_MAX_CHARS = 6000;
+export const MEET_DEFAULT_TARGET_CHARS = 300;
+
 export const DEFAULT_MEET_NARRATIVE_SETTINGS: MeetNarrativeSettings = {
   version: 3,
-  minChars: 500,
-  maxChars: 800,
+  minChars: MEET_DEFAULT_TARGET_CHARS,
+  maxChars: MEET_DEFAULT_TARGET_CHARS,
   thoughtsEnabled: false,
   perspective: "third",
   styleMode: "plain",
@@ -54,28 +58,40 @@ export function validateMeetScene(scene: Partial<MeetScene>) {
   return normalizeMeetScene(scene);
 }
 export function normalizeNarrativeSettings(
-  value?: Partial<MeetNarrativeSettings>,
+  value?: Omit<Partial<MeetNarrativeSettings>, "minChars" | "maxChars"> & {
+    minChars?: number | "";
+    maxChars?: number | "";
+  },
 ): MeetNarrativeSettings {
-  const legacy = Boolean(value) && value?.version !== 2 && value?.version !== 3,
-    rawMin = Number(
-      legacy
-        ? DEFAULT_MEET_NARRATIVE_SETTINGS.minChars
-        : (value?.minChars ?? DEFAULT_MEET_NARRATIVE_SETTINGS.minChars),
-    ),
-    rawMax = Number(
-      legacy
-        ? DEFAULT_MEET_NARRATIVE_SETTINGS.maxChars
-        : (value?.maxChars ?? DEFAULT_MEET_NARRATIVE_SETTINGS.maxChars),
-    ),
-    minChars = Math.max(
-      80,
-      Number.isFinite(rawMin) ? Math.round(rawMin) : 500,
-    ),
-    maxChars = Math.max(
-      80,
-      Number.isFinite(rawMax) ? Math.round(rawMax) : 800,
-    );
-  if (minChars > maxChars) throw new Error("最少字数不能大于最多字数");
+  const minBlank = value?.minChars === "" || value?.minChars === undefined,
+    maxBlank = value?.maxChars === "" || value?.maxChars === undefined,
+    hasBlankBound = minBlank || maxBlank,
+    rawMin = Number(value?.minChars),
+    rawMax = Number(value?.maxChars),
+    numericRange =
+      Number.isFinite(rawMin) &&
+      Number.isFinite(rawMax) &&
+      Number.isInteger(rawMin) &&
+      Number.isInteger(rawMax);
+  if (!hasBlankBound && numericRange && rawMin > rawMax)
+    throw new Error("\u6700\u5c11\u5b57\u6570\u4e0d\u80fd\u5927\u4e8e\u6700\u591a\u5b57\u6570");
+  const hasValidRange = !hasBlankBound && numericRange && rawMin >= MEET_MIN_CHARS,
+    normalizeBound = (raw: number, fallback: number) =>
+      Number.isFinite(raw)
+        ? Math.min(MEET_MAX_CHARS, Math.max(MEET_MIN_CHARS, Math.round(raw)))
+        : fallback,
+    minChars = hasBlankBound
+      ? MEET_DEFAULT_TARGET_CHARS
+      : hasValidRange
+        ? rawMin
+        : normalizeBound(rawMin, DEFAULT_MEET_NARRATIVE_SETTINGS.minChars),
+    maxChars = hasBlankBound
+      ? MEET_DEFAULT_TARGET_CHARS
+      : hasValidRange
+        ? rawMax
+        : normalizeBound(rawMax, DEFAULT_MEET_NARRATIVE_SETTINGS.maxChars);
+  if (minChars > maxChars)
+    throw new Error("\u6700\u5c11\u5b57\u6570\u4e0d\u80fd\u5927\u4e8e\u6700\u591a\u5b57\u6570");
   const perspective =
       value?.perspective === "first" || value?.perspective === "second"
         ? value.perspective
@@ -100,6 +116,24 @@ export function normalizeNarrativeSettings(
     compiledStyle: value?.compiledStyle,
   };
 }
+
+export function meetNarrativeRangeError(
+  value: { minChars?: number | ""; maxChars?: number | "" },
+) {
+  const minBlank = value.minChars === "" || value.minChars === undefined,
+    maxBlank = value.maxChars === "" || value.maxChars === undefined;
+  if (minBlank || maxBlank) return undefined;
+  const min = Number(value.minChars),
+    max = Number(value.maxChars);
+  if (!Number.isInteger(min) || !Number.isInteger(max))
+    return "\u6700\u5c11\u5b57\u6570\u548c\u6700\u591a\u5b57\u6570\u5fc5\u987b\u662f\u6574\u6570";
+  if (min < MEET_MIN_CHARS || max < MEET_MIN_CHARS)
+    return `\u5b57\u6570\u8303\u56f4\u4e0d\u80fd\u4f4e\u4e8e ${MEET_MIN_CHARS} \u5b57`;
+  if (min > MEET_MAX_CHARS || max > MEET_MAX_CHARS)
+    return `\u5b57\u6570\u8303\u56f4\u4e0d\u80fd\u8d85\u8fc7 ${MEET_MAX_CHARS} \u5b57`;
+  if (min > max) return "\u6700\u5c11\u5b57\u6570\u4e0d\u80fd\u5927\u4e8e\u6700\u591a\u5b57\u6570";
+  return undefined;
+}
 export function migrateMeetSessionNarrative(session: MeetSession): MeetSession {
   if (session.narrativeSettings?.version === 3) return session;
   return {
@@ -107,12 +141,13 @@ export function migrateMeetSessionNarrative(session: MeetSession): MeetSession {
     narrativeSettings: normalizeNarrativeSettings(session.narrativeSettings),
   };
 }
-export function meetVisibleCharacterCount(turn: { prose?: string; thought?: string; dialogue?: string }) {
-  return Array.from(`${turn.prose ?? ""}\n${turn.thought ?? ""}\n${turn.dialogue ?? ""}`)
+export function meetVisibleCharacterCount(
+  turn: { prose?: string; thought?: string; dialogue?: string },
+) {
+  return Array.from(`${turn.prose ?? ""}\n${turn.dialogue ?? ""}`)
     .filter((character) => /[\p{L}\p{N}]/u.test(character))
     .length;
 }
-
 export function meetLengthRangeViolation(
   turn: { prose?: string; thought?: string; dialogue?: string },
   settings: Pick<MeetNarrativeSettings, "minChars" | "maxChars">,

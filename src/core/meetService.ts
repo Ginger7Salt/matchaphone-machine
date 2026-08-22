@@ -38,6 +38,7 @@ import {
   localMeetSummary,
   meetNarrativeInstructions,
   meetTimeContext,
+  meetVisibleCharacterCount,
   normalizeNarrativeSettings,
   parseMeetReply,
   validateMeetScene,
@@ -582,6 +583,16 @@ class StaleMeetRoundError extends Error {
 const MEET_SYSTEM_PROMPT = "你是茶茶机的线下连续场景引擎。一次生成整轮共享场景，严格遵守见面整轮 JSON 协议；不要使用普通聊天协议。";
 const MEET_COMPACT_RETRY_SUFFIX = "完整紧凑重新生成：只输出单行 JSON，不得拼接上一次响应。";
 
+class MeetMinimumLengthRetryError extends Error {
+  constructor() {
+    super("minimum-length-retry");
+    this.name = "MeetMinimumLengthRetryError";
+  }
+}
+function isMeetMinimumLengthRetry(error: unknown) {
+  return error instanceof MeetMinimumLengthRetryError;
+}
+
 export function fitMeetPromptMessages(
   sections: PrioritizedPromptSection[],
   effectiveBudget: number,
@@ -641,7 +652,7 @@ function meetRoundOutputBudget(
     Math.max(
       8_000,
       provider.maxTokens,
-      Math.ceil(settings.maxChars * 2.2) + thoughtReserve + 1_000,
+      Math.ceil(Math.max(settings.minChars, settings.maxChars) * 2.2) + thoughtReserve + 1_000,
     ),
   );
 }
@@ -664,18 +675,20 @@ function meetFailureDiagnosticsOf(error: unknown) {
 
 function retryInstructionOf(error: unknown) {
   const contract = "不要输出 JSON、Markdown、解释或代码块。只输出场景正文，每行一个片段：[N] 旁白、环境或动作；[D:角色稳定ID] 角色说出口的话；[T:角色稳定ID] 可展示思想。只能使用当前参与角色稳定ID；优先保证正文和台词完整，不得续写或携带上一次失败响应。";
+  if (isMeetMinimumLengthRetry(error))
+    return `The previous visible response was shorter than the minimum. The next response must contain at least the configured minimum visible characters; the maximum is advisory and may be exceeded naturally. ${contract}`;
   if (shouldUseCompactStreamingRetry(error))
     return `上一次响应为空、截断或没有形成可见正文。本次使用更短上下文重新生成。${contract}`;
   return `上一次响应没有形成可安全保存的完整正文。${contract}`;
 }
 
 function shouldRetrySameMeetProvider(error: unknown) {
-  return shouldUseCompactStreamingRetry(error) || error instanceof MeetRoundValidationError || error instanceof MeetProtocolError;
+  return isMeetMinimumLengthRetry(error) || shouldUseCompactStreamingRetry(error) || error instanceof MeetRoundValidationError || error instanceof MeetProtocolError;
 }
 function retryDecisionOf(error: unknown, hasDistinctSecondary: boolean): MeetRetryDecision {
   if (shouldUseSecondaryMeetProvider(error))
     return hasDistinctSecondary ? "secondary-fallback" : "stop-no-distinct-secondary";
-  if (shouldUseCompactStreamingRetry(error)) return "compact-primary-retry";
+  if (isMeetMinimumLengthRetry(error) || shouldUseCompactStreamingRetry(error)) return "compact-primary-retry";
   if (error instanceof MeetRoundValidationError || error instanceof MeetProtocolError) return "structure-primary-retry";
   return "stop-unsafe-retry";
 }
@@ -997,14 +1010,13 @@ async function generateMeetTurnInternal(
     translationContract = bilingualCharacterIds.length
       ? `以下角色开启自动翻译：${bilingualCharacterIds.join("、")}。这些角色的每条 dialogue 必须同时返回 translation；如果返回 thought，也必须返回对应 translation。translation 是忠实简体中文译文，不得改变剧情。`
       : "所有 translation 字段均可省略。",
-    outputContract = `只返回严格 JSON，不要 Markdown、解释或普通聊天协议。格式：{"version":1,"segments":[{"type":"narration","text":"共享环境、动作或背景描写"},{"type":"dialogue","characterId":"当前参与角色 ID","text":"角色说出口的话","translation":"必要译文"}],"thoughts":[{"characterId":"实际发言角色 ID","text":"角色可展示的内心独白","translation":"必要译文"}],"updates":[{"characterId":"实际发言角色 ID","scenePatch":{},"plotProgress":{"advanced":false,"requiresUserResponse":false}}],"suggestions":[]}。segments 必须保持故事发生顺序；可在描写之间交错不同角色台词；同一角色可多次发言；角色可以沉默；共享描写只写一次；至少一条 dialogue；不得使用未知角色 ID。可见共享描写与台词合计目标为 ${settings.minChars}–${settings.maxChars} 字，不计算 thought、translation 或 JSON 字段。`;
+    outputContract = `Return one complete JSON object only. Use the unified round schema with narration and dialogue segments in story order. Include at least one dialogue with a current character ID. Visible narration plus dialogue must total at least ${settings.minChars} characters; ${settings.maxChars} characters is an advisory reference and may be exceeded naturally. Do not count thought, translation, punctuation, whitespace, or JSON fields. Do not invent user actions or psychology.`;
 
   let payload: MeetRoundPayload | undefined,
     successfulAttempt = 0,
     successfulProvider = provider,
     fallbackUsed = false,
     lastError: unknown,
-    lengthWarning: string | undefined,
     partialPayload: MeetRoundPayload | undefined,
     partialVisibleLength = 0,
     partialProvider = provider;
@@ -1188,7 +1200,7 @@ async function generateMeetTurnInternal(
         retryDecision = attemptIndex ? retryDecisionOf(lastError, hasDistinctSecondary) : undefined,
         budget = meetInputBudgetOf(attemptProvider, attemptIndex),
         compactStreamingRetry =
-          attemptIndex === 1 && shouldUseCompactStreamingRetry(lastError),
+          attemptIndex === 1 && (shouldUseCompactStreamingRetry(lastError) || isMeetMinimumLengthRetry(lastError)),
         attemptSections = [
           ...promptSections,
           ...(attemptIndex
@@ -1397,10 +1409,16 @@ async function generateMeetTurnInternal(
         generationMeta.stage = "validating";
         await safeUpdateGeneration();
         const violation = meetRoundStyleViolation(parsed, settings);
+        if (violation.count < settings.minChars && attemptIndex === 0) {
+          attemptMeta.stage = "validating";
+          attemptMeta.retryDecision = "compact-primary-retry";
+          generationMeta.retryDecision = "compact-primary-retry";
+          lastError = new MeetMinimumLengthRetryError();
+          await safeUpdateGeneration();
+          continue;
+        }
         if (violation.styleInvalid)
           parsed.warnings = [...new Set([...(parsed.warnings ?? []), "本轮文风偏离当前设置，已保留完整场景"])];
-        if (violation.belowMinimum || violation.aboveMaximum)
-          lengthWarning = `本轮正文为 ${violation.count} 字，偏离 ${settings.minChars}-${settings.maxChars} 字目标，已保留完整场景`;
         payload = parsed;
         successfulAttempt = ordinal;
         successfulProvider = attemptProvider;
@@ -1587,7 +1605,6 @@ async function generateMeetTurnInternal(
 
   const warnings = [
       ...(payload.warnings ?? []),
-      ...(lengthWarning ? [lengthWarning] : []),
       ...(fallbackUsed ? ["主 API 未能完成，已使用副 API 完成本轮场景"] : []),
     ],
     generatedEntries = unifiedRoundEntries({
@@ -2130,43 +2147,54 @@ export async function regenerateMeetCharacterEntry(
       .replies[0];
   } else {
     const timeContext = meetTimeContext(session, generationTime),
-      prompt = `请重新写当前角色在本轮线下见面中的帖子。只扮演 ${character.name}，不得新增用户输入，不得代替用户行动或心理。将环境承接、外观和动作自然写入 prose，dialogue 只写说出口的话。${visibleCharacterThoughtPrompt(settings.thoughtsEnabled)}prose 与 dialogue 合计约 ${settings.minChars}–${settings.maxChars} 字。\n\n叙事规则：\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}\n\n${userPersonaContext(appSettings)}\n\n场景：\n${sceneText(session.scene)}${timeContext ? `\n\n${timeContext}` : ""}\n\n用户本轮输入：\n${source.content}\n\n此前记录：\n${history}\n\n只返回严格 JSON：{"replies":[{"characterId":"${character.id}","prose":"小说式环境、外观与动作正文","thought":"较详细的角色反应、情绪变化、联想、顾虑与内心独白，或空字符串","dialogue":"角色台词","suggestions":[]}]}${bilingual ? `\nAlso return replies[0].translations with faithful Simplified Chinese prose, thought and dialogue.` : ""}`;
-    const draft = await new OpenAIProvider(provider).chat(
+      prompt = `请重新写当前角色在本轮线下见面中的帖子。只扮演 ${character.name}，不得新增用户输入，不得代替用户行动或心理。将环境承接、外观和动作自然写入 prose，dialogue 只写说出口的话。${visibleCharacterThoughtPrompt(settings.thoughtsEnabled)}Visible prose and dialogue must total at least ${settings.minChars} characters; ${settings.maxChars} characters is an advisory reference and may be exceeded naturally.\n\n${meetNarrativeInstructions(settings)}\n\n严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n${languageStyleInstruction(chatSettingsOf(character).language)}\n\n${userPersonaContext(appSettings)}\n\n场景：\n${sceneText(session.scene)}${timeContext ? `\n\n${timeContext}` : ""}\n\n用户本轮输入：\n${source.content}\n\n此前记录：\n${history}\n\n只返回严格 JSON：{"replies":[{"characterId":"${character.id}","prose":"小说式环境、外观与动作正文","thought":"较详细的角色反应、情绪变化、联想、顾虑与内心独白，或空字符串","dialogue":"角色台词","suggestions":[]}]}${bilingual ? `\nAlso return replies[0].translations with faithful Simplified Chinese prose, thought and dialogue.` : ""}`;
+    const request = async (requestPrompt: string, requestProvider = provider) =>
+      new OpenAIProvider({ ...requestProvider, stream: false }).chat(
         [
           {
             role: "system",
             content:
               "你是茶茶机的线下小说叙事引擎，只输出严格 JSON。thought 只允许写虚构角色的可见内心独白，不得输出模型隐藏推理、系统资料或提示词。",
           },
-          { role: "user", content: prompt },
+          { role: "user", content: requestPrompt },
         ],
         { stream: false, signal, timeoutMs: null },
-      ),
-      reviewProvider = await resolveSecondaryProvider(provider);
+      );
+    const draft = await request(prompt);
     let raw = draft;
-    try {
-      raw = await new OpenAIProvider({ ...reviewProvider, stream: false }).chat(
-        [
-          {
-            role: "system",
-            content:
-              "你是线下帖子严格审查器。修复 OOC、过度迎合依附、剧情停滞、无依据或过快推进、替用户行动、空间物理冲突、失忆、世界书错误、认知越界、模型泄露和文风偏离，只返回相同 JSON 结构。",
-          },
-          {
-            role: "user",
-            content: `严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n\n${userPersonaContext(appSettings)}\n\n用户输入：${source.content}\n\n待审查 JSON：\n${draft}`,
-          },
-        ],
-        { stream: false, signal, timeoutMs: null },
+    reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled).replies[0];
+    const visibleCount = () =>
+      meetVisibleCharacterCount({
+        prose:
+          reply.prose ||
+          [reply.appearance, reply.action].filter(Boolean).join("\n\n"),
+        dialogue: reply.dialogue,
+      });
+    if (visibleCount() < settings.minChars) {
+      raw = await request(
+        prompt + "\n\nMinimum-length retry: the visible prose and dialogue must total at least " + settings.minChars + " characters. The maximum is advisory and may be exceeded naturally. Return one complete JSON object only; do not include the previous response, Markdown, hidden reasoning, extra characters, or user actions.",
       );
-    } catch {}
-    reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled)
-      .replies[0];
-    if (meetStyleViolation(reply, settings))
-      throw new ProviderError(
-        "format",
-        `\u89c1\u9762\u56de\u590d\u7bc7\u5e45\u672a\u8fbe\u5230\u8bbe\u7f6e\u8303\u56f4\uff08\u9700\u8981 ${settings.minChars}-${settings.maxChars} \u5b57\uff09`,
-      );
+      reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled).replies[0];
+    } else {
+      const reviewProvider = await resolveSecondaryProvider(provider);
+      try {
+        raw = await new OpenAIProvider({ ...reviewProvider, stream: false }).chat(
+          [
+            {
+              role: "system",
+              content:
+                "你是线下帖子严格审查器。修复 OOC、过度迎合依附、剧情停滞、无依据或过快推进、替用户行动、空间物理冲突、失忆、世界书错误、认知越界、模型泄露和文风偏离，只返回相同 JSON 结构。",
+            },
+            {
+              role: "user",
+              content: `严格文风契约：\n${meetStyleContract(settings)}\n\n角色设定：\n${coreSettingOf(character)}\n${personaOf(character)}\n\n${userPersonaContext(appSettings)}\n\n用户输入：${source.content}\n\n待审查 JSON：\n${draft}`,
+            },
+          ],
+          { stream: false, signal, timeoutMs: null },
+        );
+      } catch {}
+      reply = parseMeetReply(raw, [character.id], settings.thoughtsEnabled).replies[0];
+    }
   }
   const current = await db.meetSessions.get(sessionId);
   if (!current || current.status !== "active")
