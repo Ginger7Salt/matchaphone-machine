@@ -7,7 +7,9 @@
 
 ## 在线使用
 
-官方在线地址：请以项目作者发布的公开链接为准。
+官方在线地址：
+
+<https://matchaphone-d5gjgy87ybfb50382-1463048417.tcloudbaseapp.com/>
 
 > 在线使用茶茶机时，需要用户自行配置可用的 Provider Base URL、API Key 和模型。项目作者不提供模型 API Key，也不建议把任何密钥提交到代码仓库、截图、日志或公开 Issue 中。
 
