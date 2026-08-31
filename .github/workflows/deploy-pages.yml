@@ -41,7 +41,12 @@ jobs:
       - name: Build
         run: pnpm exec vite build
       - name: Prepare SPA fallback
-        run: cp dist/index.html dist/404.html
+        run: |
+          cp dist/index.html dist/404.html
+          for route in messages/chats settings meet couple-island messages/browser-test-conversation; do
+            mkdir -p "dist/$route"
+            cp dist/index.html "dist/$route/index.html"
+          done
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
