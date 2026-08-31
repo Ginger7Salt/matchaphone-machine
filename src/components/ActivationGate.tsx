@@ -1,6 +1,7 @@
 import {useEffect,useState,type FormEvent,type ReactNode} from "react";
 import {KeyRound,LockKeyhole,ShieldCheck,WifiOff} from "lucide-react";
 import {activateDevice,ActivationClientError,formatActivationCode,verifyStoredActivation,type ActivationFailureReason} from "../core/activation";
+import { PUBLIC_DEMO_MODE } from "../core/publicDemo";
 
 type GateState="checking"|"locked"|"activating"|"active";
 const messages:Record<ActivationFailureReason,string>={
@@ -14,6 +15,7 @@ const messages:Record<ActivationFailureReason,string>={
  incompatible:"当前浏览器缺少安全存储能力，暂时无法激活。",
 };
 export default function ActivationGate({children}:{children:ReactNode}){
+ if(PUBLIC_DEMO_MODE)return <>{children}</>;
  const [state,setState]=useState<GateState>("checking"),[code,setCode]=useState(""),[error,setError]=useState("");
  useEffect(()=>{let alive=true;void verifyStoredActivation().then(valid=>{if(alive)setState(valid?"active":"locked")}).catch(()=>{if(alive)setState("locked")});return()=>{alive=false}},[]);
  const submit=async(event:FormEvent)=>{event.preventDefault();if(state==="activating")return;setError("");setState("activating");try{await activateDevice(code);setState("active")}catch(reason){const key=reason instanceof ActivationClientError?reason.reason:"network";setError(messages[key]);setState("locked")}};

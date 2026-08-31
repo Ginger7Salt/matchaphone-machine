@@ -1,4 +1,5 @@
 import { db, getSetting, setSetting } from "./db";
+import { PUBLIC_DEMO_MODE, publicDemoBackendError } from "./publicDemo";
 import { invitationResponseBubbleCountPlan, invitationResponseTask } from "./invitationResponseTaskModel";
 
 import { pauseActiveMeetForOnlineActivity } from "./crossModeContinuity";
@@ -6,7 +7,7 @@ import { rewardIslandListening } from "./coupleIsland";
 import {now,SCHEMA_VERSION,uid,type CharacterMusicAction,type ListeningContext,type ListeningSession,type Message,type MusicAccountProfile,type MusicClientSettings,type MusicEvent,type MusicEventType,type MusicFile,type MusicPlaylist,type MusicTrack} from "./types";
 import { buildMusicDjCandidates, characterDjSettings, createListeningSummary, createMusicControlProposal, normalizeListeningQueueEntries, queueListeningTrack, searchTrackForCharacter } from "./musicDj";
 
-const MUSIC_GATEWAY_ORIGIN = "https://matchaphone-d5gjgy87ybfb50382-1463048417.ap-shanghai.app.tcloudbase.com";
+const MUSIC_GATEWAY_ORIGIN = PUBLIC_DEMO_MODE ? "" : "https://matchaphone-d5gjgy87ybfb50382-1463048417.ap-shanghai.app.tcloudbase.com";
 export const MUSIC_API_BASE = typeof location !== "undefined" && /tcloudbaseapp\.com$/i.test(location.hostname) ? MUSIC_GATEWAY_ORIGIN + "/api/music" : "/api/music";
 export const MAX_MUSIC_FILE_BYTES=200*1024*1024;
 export const defaultMusicClientSettings:MusicClientSettings={backgroundPlayback:true,volume:.85,repeatMode:"off",shuffle:false,lyricsTranslationVisible:true,lyricsFontSize:"medium"};
@@ -18,6 +19,7 @@ export function getMusicSessionHandle(){if(typeof localStorage==="undefined")ret
 export function clearMusicSessionHandle(){if(typeof localStorage==="undefined")return;try{localStorage.removeItem(MUSIC_SESSION_HANDLE_KEY)}catch{}}
 function saveMusicSessionHandle(value:unknown){const handle=validMusicSessionHandle(value);if(!handle||typeof localStorage==="undefined")return;try{localStorage.setItem(MUSIC_SESSION_HANDLE_KEY,handle)}catch{}}
 async function api<T>(path:string,init?:RequestInit):Promise<T>{
+ if(PUBLIC_DEMO_MODE)throw publicDemoBackendError("音乐服务");
  const headers=new Headers(init?.headers);
  if(init?.body&&!headers.has("Content-Type"))headers.set("Content-Type","application/json");
  const sessionHandle=getMusicSessionHandle();

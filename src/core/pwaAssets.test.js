@@ -11,11 +11,11 @@ describe("PWA matcha cup icons",()=>{
   it("declares versioned PNG icons for regular and maskable installs",()=>{
     const manifest=JSON.parse(text("public/manifest.webmanifest"));
     expect(manifest.icons).toEqual([
-      {src:"/icon-192-v2.png",sizes:"192x192",type:"image/png",purpose:"any"},
-      {src:"/icon-512-v2.png",sizes:"512x512",type:"image/png",purpose:"any"},
-      {src:"/icon-maskable-512-v2.png",sizes:"512x512",type:"image/png",purpose:"maskable"},
+      {src:"./icon-192-v2.png",sizes:"192x192",type:"image/png",purpose:"any"},
+      {src:"./icon-512-v2.png",sizes:"512x512",type:"image/png",purpose:"any"},
+      {src:"./icon-maskable-512-v2.png",sizes:"512x512",type:"image/png",purpose:"maskable"},
     ]);
-    for(const icon of manifest.icons)expect(existsSync(path.join(root,"public",icon.src.slice(1)))).toBe(true);
+    for(const icon of manifest.icons)expect(existsSync(path.join(root,"public",icon.src.replace(/^\.\//,"")))).toBe(true);
   });
 
   it("ships PNGs at their declared sizes",()=>{
@@ -34,8 +34,8 @@ describe("PWA matcha cup icons",()=>{
   it("links the same icon family from HTML and notifications",()=>{
     const html=text("index.html");
     const notifications=text("src/core/notifications.ts");
-    expect(html).toContain('rel="apple-touch-icon" href="/apple-touch-icon-v2.png" sizes="180x180"');
-    expect(html).toContain('rel="icon" href="/icon-v2.svg" type="image/svg+xml"');
-    expect(notifications).toContain('icon:payload.icon||"/icon-192-v2.png",badge:"/icon-192-v2.png"');
+    expect(html).toContain('rel="apple-touch-icon" href="%BASE_URL%apple-touch-icon-v2.png" sizes="180x180"');
+    expect(html).toContain('rel="icon" href="%BASE_URL%icon-v2.svg" type="image/svg+xml"');
+    expect(notifications).toContain('icon:payload.icon||appAssetPath("icon-192-v2.png"),badge:appAssetPath("icon-192-v2.png")');
   });
 });

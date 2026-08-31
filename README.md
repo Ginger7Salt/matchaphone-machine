@@ -9,9 +9,13 @@
 
 官方在线地址：
 
+<https://luvfox50.github.io/matchaphone-machine/>
+
+备用在线版本：
+
 <https://matchaphone-d5gjgy87ybfb50382-1463048417.tcloudbaseapp.com/>
 
-> 在线使用茶茶机时，需要用户自行配置可用的 Provider Base URL、API Key 和模型。项目作者不提供模型 API Key，也不建议把任何密钥提交到代码仓库、截图、日志或公开 Issue 中。
+> GitHub Pages 版本是独立的公开演示版，默认免激活，不连接茶茶机的 Activation、Relay、music-gateway 或其他共享后端。数据只保存在用户自己的浏览器中；使用 AI 功能前，需要自行填写 Provider Base URL、API Key 和模型。项目作者不提供共享模型额度、作者 API Key、商业托管或公共 SaaS 服务。请勿在截图、Issue、日志或公共演示中泄露 API Key。GitHub Pages 版本不保证长期可用。
 ## 维护状态
 
 本项目目前处于公开发布但停止主动维护状态。

@@ -1,4 +1,5 @@
 import { getStoredActivationLicense, verifyStoredActivation } from "./activation";
+import { PUBLIC_DEMO_MODE, publicDemoBackendError } from "./publicDemo";
 import type { ProviderProtocol, ProviderSettings } from "./types";
 
 export type ProviderRelayOperation = "chat" | "models" | "connectivity";
@@ -57,7 +58,8 @@ export async function executeProviderHttp(input: {
   signal?: AbortSignal;
   timeoutMs: number;
 }): Promise<ProviderHttpResult> {
-  if (input.settings.networkMode !== "relay") {
+  const useRelay = input.settings.networkMode === "relay" && !PUBLIC_DEMO_MODE;
+  if (!useRelay) {
     const response = await fetch(input.endpoint, {
       method: input.method,
       headers: input.headers,

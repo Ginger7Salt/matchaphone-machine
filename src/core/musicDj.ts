@@ -2,6 +2,7 @@ import { db } from "./db";
 import {localTimeContext} from "./localTime";
 import { addIslandEntry, coupleIslandForConversation } from "./coupleIsland";
 import { enqueueBackgroundTask } from "./backgroundTasks";
+import { PUBLIC_DEMO_MODE, publicDemoBackendError } from "./publicDemo";
 import { OpenAIProvider } from "./provider";
 import { normalizeReplyBubbles } from "./replyBubbles";
 import { commitMoodImprintRecall, createMoodImprintForSession, enrichMoodImprint, moodImprintContext, selectMoodImprintForRecall } from "./musicMoodImprint";
@@ -18,7 +19,7 @@ import {
   type ProviderSettings,
 } from "./types";
 
-const MUSIC_GATEWAY_ORIGIN = "https://matchaphone-d5gjgy87ybfb50382-1463048417.ap-shanghai.app.tcloudbase.com";
+const MUSIC_GATEWAY_ORIGIN = PUBLIC_DEMO_MODE ? "" : "https://matchaphone-d5gjgy87ybfb50382-1463048417.ap-shanghai.app.tcloudbase.com";
 const MUSIC_API_BASE = typeof location !== "undefined" && /tcloudbaseapp\.com$/i.test(location.hostname) ? MUSIC_GATEWAY_ORIGIN + "/api/music" : "/api/music";
 
 export function characterDjSettings(character: Pick<Character, "chatSettings">) {
@@ -125,6 +126,7 @@ function uniqueHighConfidence(query: string, tracks: MusicTrack[]) {
   return exact.length === 1 ? exact[0] : undefined;
 }
 async function gateway<T>(path: string): Promise<T> {
+  if (PUBLIC_DEMO_MODE) throw publicDemoBackendError("音乐服务");
   const response = await fetch(MUSIC_API_BASE + path, { credentials: "include" });
   const raw = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(String(raw?.message ?? `音乐服务请求失败：${response.status}`));
